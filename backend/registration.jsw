@@ -1,0 +1,174 @@
+import wixData from 'wix-data';
+import { currentMember } from 'wix-members-backend';
+
+// 1. Verifies the token securely
+export async function verifyTokenSecurely(token) {
+    try {
+        // suppressAuth bypasses the permission block for anonymous visitors
+        const results = await wixData.query("SignolPlayers")
+            .eq("inviteToken", token)
+            .find({ suppressAuth: true }); 
+
+        if (results.items.length > 0) {
+            return { success: true, player: results.items[0] };
+        }
+        return { success: false };
+    } catch (err) {
+        console.error("Backend token verification error:", err);
+        return { success: false };
+    }
+}
+
+// 2. Handles the linking securely after they log in
+export async function linkParentSecurely(memberId, loginEmail, activePlayerData, parentRoleId) {
+    try {
+        let parentProfileId;
+        // Save the email the manager typed in so we can still find their other kids!
+        const originalManagerEmail = activePlayerData.parentEmail; 
+
+        // Find or create parent
+        const profileResults = await wixData.query("ParentProfiles")
+            .eq("memberId", memberId)
+            .find({ suppressAuth: true });
+
+        if (profileResults.items.length > 0) {
+            parentProfileId = profileResults.items[0]._id;
+        } else {
+            const newProfileData = {
+                PP_fullName: activePlayerData.parentsName,
+                PP_phoneNumber: activePlayerData.parentPhone,
+                // THE FIX: Prioritize their actual Wix login email over the manager's input
+                PP_email: loginEmail || originalManagerEmail, 
+                memberId: memberId,
+                PP_role: parentRoleId
+            };
+            const insertedProfile = await wixData.insert("ParentProfiles", newProfileData, { suppressAuth: true });
+            parentProfileId = insertedProfile._id;
+        }
+
+        // Link this child and sync their email to the official login email
+        activePlayerData.primaryParentId = parentProfileId;
+        activePlayerData.parentEmail = loginEmail || originalManagerEmail;
+        await wixData.update("SignolPlayers", activePlayerData, { suppressAuth: true });
+
+        // Sibling Sweep (using the old manager email to find them)
+        const siblingResults = await wixData.query("SignolPlayers")
+            .eq("parentEmail", originalManagerEmail)
+            .isEmpty("primaryParentId")
+            .find({ suppressAuth: true });
+
+        if (siblingResults.items.length > 0) {
+            let updatePromises = siblingResults.items.map(sibling => {
+                sibling.primaryParentId = parentProfileId;
+                sibling.parentEmail = loginEmail || originalManagerEmail; // Sync sibling email too
+                return wixData.update("SignolPlayers", sibling, { suppressAuth: true });
+            });
+            await Promise.all(updatePromises);
+        }
+
+        return { success: true };
+    } catch (err) {
+        console.error("Backend linking error:", err);
+        return { success: false, error: err.message };
+    }
+}
+// 3. The "Self-Healing" Sweep for the Parent Hub
+export async function hubEmailSweep(memberId, loginEmail, parentRoleId) { 
+    try { 
+        let parentProfileId; 
+        let isNewProfile = false; 
+        
+        let options = { "suppressAuth": true };
+
+        // --- A. FIND OR CREATE PARENT PROFILE ---
+        const profileQuery = await wixData.query("ParentProfiles")
+            .eq("memberId", memberId)
+            .find(options);
+
+        if (profileQuery.items.length > 0) {
+            parentProfileId = profileQuery.items[0]._id;
+        } else {
+            const newProfile = await wixData.insert("ParentProfiles", {
+                title: loginEmail,
+                memberId: memberId,
+                email: loginEmail
+            }, options);
+            parentProfileId = newProfile._id;
+            isNewProfile = true;
+        }
+
+        // --- B. SWEEP FOR PRIMARY PARENT ---
+        const primaryPlayers = await wixData.query("SignolPlayers")
+            .eq("parentEmail", loginEmail)
+            .find(options);
+
+        for (let player of primaryPlayers.items) {
+            // Only update if it isn't already linked
+            if (player.primaryParentId !== parentProfileId) {
+                player.primaryParentId = parentProfileId;
+                await wixData.update("SignolPlayers", player, options);
+            }
+        }
+
+        // --- C. SWEEP FOR SECONDARY PARENT ---
+        const secondaryPlayers = await wixData.query("SignolPlayers")
+            .eq("secondaryParentEmail", loginEmail)
+            .find(options);
+
+        for (let player of secondaryPlayers.items) {
+             // Only update if it isn't already linked
+            if (player.secondaryParentId !== parentProfileId) {
+                player.secondaryParentId = parentProfileId;
+                await wixData.update("SignolPlayers", player, options);
+            }
+        }
+
+        return { success: true, profileId: parentProfileId, isNew: isNewProfile };
+
+    } catch (error) {
+        console.error("Hub Sweep Error:", error);
+        return { success: false, error: error.message };
+    }
+}
+// 4. Securely fetches the Manager Name without exposing the whole staff CMS
+export async function getSecureManagerName(managerId) {
+    try {
+        let options = {
+            "suppressAuth": true // This acts as the bouncer override
+        };
+
+        const manager = await wixData.get("staff", managerId, options);
+        
+        if (manager && manager.SS_name) {
+            return manager.SS_name; 
+        }
+        return "TBD";
+        
+    } catch (error) {
+        console.error("Backend failed to fetch manager:", error);
+        return "TBD";
+    }
+}
+// 5. Securely updates the player record only if the parent owns it
+export async function secureUpdatePlayerRegistration(playerData, parentProfileId) {
+    try {
+        // 1. Verify a real member is logged in
+        const member = await currentMember.getMember();
+        if (!member) throw new Error("Security Block: Not logged in.");
+
+        // 2. Fetch the true database record to check ownership
+        const existingPlayer = await wixData.get("SignolPlayers", playerData._id, { suppressAuth: true });
+        
+        if (!existingPlayer || existingPlayer.primaryParentId !== parentProfileId) {
+             throw new Error("Security Block: Unauthorized access to this player.");
+        }
+
+        // 3. If ownership matches, perform the secure update
+        const updatedPlayer = await wixData.update("SignolPlayers", playerData, { suppressAuth: true });
+        return { success: true, data: updatedPlayer };
+
+    } catch (error) {
+        console.error("Secure Update Error:", error);
+        return { success: false, error: error.message };
+    }
+}

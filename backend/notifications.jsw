@@ -1,0 +1,61 @@
+// backend/notifications.jsw
+import wixData from 'wix-data';
+import { sendTwilioSMS } from 'backend/sms.jsw';
+
+/**
+ * Sends SMS to managers linked to the selected Age Group
+ */
+export async function notifyManagers(ageGroupId, data) {
+    try {
+        // Query Teams that match the selected Age Group
+        const teamResults = await wixData.query("Teams")
+            .eq("AG_ageGroup", ageGroupId) 
+            .include("T_teamManager") 
+            .find({ suppressAuth: true });
+
+        if (teamResults.items.length === 0) {
+            return { success: false, message: "No teams found" };
+        }
+
+        let recipientCount = 0;
+
+        // Construct the full SMS message
+        const message = 
+            `⚽ NEW PLAYER ENQUIRY\n` +
+            `--------------------\n` +
+            `Child: ${data.firstName} ${data.lastName}\n` +
+            `DOB: ${data.dob}\n` +
+            `Age: ${data.ageLabel}\n` +
+            `Exp: ${data.expLabel}\n` +
+            `Pos: ${data.posLabel}\n` +
+            `--------------------\n` +
+            `Parent: ${data.parentsFullName} (${data.relLabel})\n` +
+            `Mob: ${data.parentPhone}\n` +
+            `Email: ${data.parentEmail}`;
+
+        // Loop through teams and their managers
+        for (let team of teamResults.items) {
+            const managers = team.T_teamManager;
+            
+            if (Array.isArray(managers)) {
+                // Handle multiple managers (Multi-Reference)
+                for (let m of managers) {
+                    if (m.mobile) {
+                        await sendTwilioSMS(m.mobile, message);
+                        recipientCount++;
+                    }
+                }
+            } else if (managers && managers.mobile) {
+                // Handle single manager
+                await sendTwilioSMS(managers.mobile, message);
+                recipientCount++;
+            }
+        }
+
+        return { success: true, totalSent: recipientCount };
+
+    } catch (err) {
+        console.error("SMS Backend Error:", err);
+        return { success: false, error: err.message };
+    }
+}

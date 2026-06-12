@@ -1,0 +1,126 @@
+// Filename: backend/staffData.jsw
+import wixData from 'wix-data';
+import { currentMember } from 'wix-members-backend';
+
+export async function getTeamManager(teamId) {
+    // We use suppressAuth and suppressHooks to bypass the "Vault" permissions
+    const options = { 
+        "suppressAuth": true,
+        "suppressHooks": true 
+    };
+
+    try {
+        const results = await wixData.query("Teams")
+            .eq("_id", teamId) 
+            .include("T_teamManager") // DOUBLE CHECK: Is this the field key for the Manager Reference?
+            .find(options);
+
+        if (results.items.length > 0) {
+            const teamItem = results.items[0];
+            const manager = teamItem.T_teamManager;
+
+            if (manager) {
+                return {
+                    "fullName": manager.SS_name || "Manager TBC",
+                    "photo": manager.headshot || "https://static.wixstatic.com/media/your-default-avatar-link.png",
+                    "team": teamItem.T_teamName
+                };
+            }
+        }
+        return null;
+    } catch (error) {
+        console.error("CRITICAL: Manager lookup failed for team " + teamId, error);
+        return null;
+    }
+}
+
+// Keep your existing getTeamManager function above this!
+
+// Filename: backend/staffData.jsw
+
+
+
+export async function getFullTeamStaff(teamId) {
+    const options = { "suppressAuth": true, "suppressHooks": true };
+
+    try {
+        // We add .ascending("siteRank") to the query
+        const staffQuery = await wixData.query("SignolStaff")
+            .hasSome("SS_team", [teamId])
+            .ascending("siteRank") // <--- This handles the hierarchy
+            .find(options);
+
+        if (staffQuery.items.length === 0) return [];
+
+        // Packaging the data into the "Smart Object"
+        const packagedStaff = await Promise.all(staffQuery.items.map(async (item) => {
+            const roleRes = await wixData.queryReferenced("SignolStaff", item._id, "SS_role", options);
+            const qualRes = await wixData.queryReferenced("SignolStaff", item._id, "SS_Qualifications", options);
+
+            return {
+                "_id": item._id,
+                "fullName": item.SS_name || "Staff Member",
+                "photo": item.headshot || "", 
+                "bio": item.bio || "",
+                "rolesDisplay": roleRes.items.map(r => r.CR_role).filter(Boolean).join(" | "),
+                "badgesDisplay": qualRes.items.map(q => ({ 
+                    title: q.Q_badgeName || "", 
+                    src: q.Q_icon?.src || q.Q_icon 
+                })).filter(b => b.src)
+            };
+        }));
+
+        return packagedStaff;
+    } catch (err) {
+        console.error("Vault sorted fetch failed", err);
+        return [];
+    }
+}
+
+
+export async function linkMemberToStaff(memberId, loginEmail) {
+    const options = { "suppressAuth": true, "suppressHooks": true };
+    
+    // 1. Basic Safety Check
+    if (!memberId || !loginEmail) {
+        return { status: "missing-info" };
+    }
+
+    const emailToMatch = loginEmail.trim().toLowerCase();
+    console.log("Vault: Manually matching for " + emailToMatch);
+
+    try {
+        // 2. Check if this Member ID is already linked
+        const idCheck = await wixData.query("SignolStaff")
+            .eq("memberId", memberId)
+            .limit(1)
+            .find(options);
+
+        if (idCheck.items.length > 0) return { status: "already-linked" };
+
+        // 3. Case-Insensitive Search
+        // We fetch all records to ensure we find the email regardless of casing
+        const allStaff = await wixData.query("SignolStaff")
+            .limit(1000) 
+            .find(options);
+
+        const staffItem = allStaff.items.find(item => {
+            const cmsEmail = (item.emailAddress || "").trim().toLowerCase();
+            return cmsEmail === emailToMatch;
+        });
+
+        if (staffItem) {
+            staffItem.memberId = memberId;
+            await wixData.update("SignolStaff", staffItem, options);
+            console.log("Vault: Match found and ID updated for " + emailToMatch);
+            return { status: "success" };
+        }
+
+        console.log("Vault: No staff record found for " + emailToMatch);
+        return { status: "no-match" };
+
+    } catch (err) {
+        console.error("Vault: Sync Error", err);
+        return { status: "error", message: err.message };
+    }
+}

@@ -1,0 +1,30 @@
+import wixData from 'wix-data';
+
+export async function sweepEmailQueue() {
+    try {
+        // 1. Define "stuck": anything older than 30 minutes
+        const thirtyMinutesAgo = new Date();
+        thirtyMinutesAgo.setMinutes(thirtyMinutesAgo.getMinutes() - 30);
+
+        // 2. Search the EmailQueue for items that aren't ticked AND are old
+        const stuckItems = await wixData.query("EmailQueue")
+            .ne("emailSent", true) 
+            .lt("_createdDate", thirtyMinutesAgo) 
+            .find();
+
+        // 3. If we found stuck emails, trigger the SystemAlerts database
+        if (stuckItems.items.length > 0) {
+            console.log(`Found ${stuckItems.items.length} stuck emails. Triggering admin alert.`);
+            
+            await wixData.insert("SystemAlerts", {
+                title: "Email Queue Failure",
+                errorMessage: "One or more parent invites failed to process and require manual checking.",
+                failedCount: stuckItems.items.length
+            });
+        } else {
+            console.log("Email Queue is clean. No alerts sent.");
+        }
+    } catch (err) {
+        console.error("Queue Monitor crashed:", err);
+    }
+}
