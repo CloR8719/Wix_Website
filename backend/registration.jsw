@@ -1,5 +1,5 @@
 import wixData from 'wix-data';
-import { currentMember } from 'wix-members-backend';
+import { currentMember, members } from 'wix-members-backend';
 
 // 1. Verifies the token securely
 export async function verifyTokenSecurely(token) {
@@ -73,11 +73,11 @@ export async function linkParentSecurely(memberId, loginEmail, activePlayerData,
     }
 }
 // 3. The "Self-Healing" Sweep for the Parent Hub
-export async function hubEmailSweep(memberId, loginEmail, parentRoleId) { 
-    try { 
-        let parentProfileId; 
-        let isNewProfile = false; 
-        
+export async function hubEmailSweep(memberId, loginEmail, parentRoleId, firstName, lastName) {
+    try {
+        let parentProfileId;
+        let isNewProfile = false;
+
         let options = { "suppressAuth": true };
 
         // --- A. FIND OR CREATE PARENT PROFILE ---
@@ -88,10 +88,56 @@ export async function hubEmailSweep(memberId, loginEmail, parentRoleId) {
         if (profileQuery.items.length > 0) {
             parentProfileId = profileQuery.items[0]._id;
         } else {
+            // Resolve a display name for the new profile, in priority order:
+            // 1. firstName/lastName passed in directly (signup lightbox)
+            // 2. The member's own Wix profile (set during registration)
+            // 3. The name already on a matching player record (primary, then secondary)
+            // 4. Last resort: the login email
+            let resolvedFirst = (firstName || "").trim();
+            let resolvedLast = (lastName || "").trim();
+
+            if (!resolvedFirst && !resolvedLast) {
+                try {
+                    const memberRecord = await members.getMember(memberId);
+                    resolvedFirst = (memberRecord?.contactDetails?.firstName || "").trim();
+                    resolvedLast = (memberRecord?.contactDetails?.lastName || "").trim();
+                } catch (memberErr) {
+                    console.error("Hub Sweep: could not fetch member contact details:", memberErr);
+                }
+            }
+
+            const resolvedName = `${resolvedFirst} ${resolvedLast}`.trim();
+
+            let fallbackName = "";
+            let fallbackPhone = "";
+
+            if (!resolvedName) {
+                // Try to source the parent's name/phone from a matching player record
+                const primaryMatch = await wixData.query("SignolPlayers")
+                    .eq("parentEmail", loginEmail)
+                    .find(options);
+
+                if (primaryMatch.items.length > 0) {
+                    fallbackName = primaryMatch.items[0].parentsName;
+                    fallbackPhone = primaryMatch.items[0].parentPhone;
+                } else {
+                    const secondaryMatch = await wixData.query("SignolPlayers")
+                        .eq("secondaryParentEmail", loginEmail)
+                        .find(options);
+
+                    if (secondaryMatch.items.length > 0) {
+                        fallbackName = secondaryMatch.items[0].secondaryParentName;
+                        fallbackPhone = secondaryMatch.items[0].secondaryParentMobile;
+                    }
+                }
+            }
+
             const newProfile = await wixData.insert("ParentProfiles", {
-                title: loginEmail,
+                PP_fullName: resolvedName || fallbackName || loginEmail,
+                PP_email: loginEmail,
+                PP_phoneNumber: fallbackPhone || "",
                 memberId: memberId,
-                email: loginEmail
+                PP_role: parentRoleId
             }, options);
             parentProfileId = newProfile._id;
             isNewProfile = true;
