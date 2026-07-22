@@ -1,0 +1,254 @@
+// ==========================================
+// blog.jsw
+// Creates + publishes a Wix Blog post from a ClubNews item.
+// Called from the Manager Hub "Submit News" flow (auto-publish on submit).
+//
+// Uses the Wix Blog SDK (@wix/blog) — the classic `wix-blog-backend` module
+// is read-only and has no draftPosts.createDraftPost.
+// REQUIRES these packages installed via the Velo Packages & Apps panel (npm):
+//   @wix/blog        - createDraftPost / publishDraftPost
+//   @wix/essentials  - auth.elevate
+// ==========================================
+import { draftPosts } from '@wix/blog';
+import { auth } from '@wix/essentials';
+
+// ------------------------------------------
+// PUBLIC: create a live blog post
+// Returns { blogPostId, url } — does NOT touch the CMS (caller owns the row).
+// ------------------------------------------
+export async function createBlogPost({ title, bodyHtml, featuredImage, memberId }) {
+    if (!memberId) {
+        throw new Error("createBlogPost: memberId is required (the author).");
+    }
+
+    // Cover image. The native `wix:image://v1/<id>/...` URI (what the upload
+    // button gives us) is the string both fields want:
+    //   heroImage -> image at the top of the post page
+    //   media     -> cover thumbnail shown on the blog feed / preview cards
+    // A bare id -> "Invalid URL"; an https URL -> "Media image not found".
+    const cover = coverImageRef(featuredImage);
+
+    // Cast to any so the type checker doesn't fight the media/heroImage shapes.
+    const draftPost = /** @type {any} */ ({
+        title: (title && title.trim()) || "Club News",
+        memberId,
+        commentingEnabled: true,
+        richContent: htmlToRicos(bodyHtml || ""),
+        ...(cover ? {
+            heroImage: cover,
+            media: { wixMedia: { image: cover }, displayed: true, custom: true }
+        } : {})
+    });
+
+    // Elevate so a team manager (not an admin) is allowed to create/publish.
+    const elevatedCreate = auth.elevate(draftPosts.createDraftPost);
+
+    // Staged fallback so a picky field never costs us a working one:
+    //   1. heroImage + media (both)
+    //   2. heroImage only  (media is the fussier field for feed thumbnails)
+    //   3. no cover
+    let createRes;
+    try {
+        createRes = await elevatedCreate(draftPost, { fieldsets: ["URL"] });
+    } catch (err1) {
+        if (!cover) throw err1;
+        console.warn("Blog create with heroImage+media failed, retrying heroImage only. err=" + (err1 && err1.message));
+        const { media: _m, ...heroOnly } = draftPost;
+        try {
+            createRes = await elevatedCreate(heroOnly, { fieldsets: ["URL"] });
+        } catch (err2) {
+            console.warn("Blog create with heroImage only failed, publishing without cover. err=" + (err2 && err2.message));
+            const { heroImage: _h, media: _m2, ...noCover } = draftPost;
+            createRes = await elevatedCreate(noCover, { fieldsets: ["URL"] });
+        }
+    }
+
+    // createDraftPost resolves to { draftPost }. Cast to `any` so the type
+    // checker doesn't fight us over the SDK's exact response shape (id is `_id`
+    // in Velo; the URL preview from fieldsets:["URL"] is a { base, path }).
+    const created = /** @type {any} */ (createRes).draftPost || /** @type {any} */ (createRes);
+    if (!created) throw new Error("createDraftPost returned no draftPost");
+    const draftId = created._id || created.id;
+    if (!draftId) throw new Error("createDraftPost returned no id");
+
+    const elevatedPublish = auth.elevate(draftPosts.publishDraftPost);
+    await elevatedPublish(draftId);
+
+    // Build the public post URL from the draft's URL preview ({ base, path }).
+    const pageUrl = created.url;
+    const fullUrl = !pageUrl ? null
+        : (typeof pageUrl === "string" ? pageUrl : (pageUrl.base || "") + (pageUrl.path || ""));
+
+    return {
+        blogPostId: draftId,
+        url: fullUrl || null
+    };
+}
+
+// ==========================================
+// HELPERS
+// ==========================================
+
+// Return a heroImage string: the native `wix:image://v1/<id>/<name>` URI.
+//   wix:image://...                             -> used as-is
+//   https://static.wixstatic.com/media/<id>...  -> rebuilt into a wix:image URI
+// Returns null if there's no usable image.
+function coverImageRef(featuredImage) {
+    if (!featuredImage || typeof featuredImage !== "string") return null;
+    if (/^wix:image:\/\//i.test(featuredImage)) return featuredImage;
+    const m = featuredImage.match(/static\.wixstatic\.com\/media\/([^/?#]+)/i);
+    return m ? "wix:image://v1/" + m[1] + "/cover.jpg" : null;
+}
+
+// --- Ricos node id generator (must be unique per node) ---
+let _idCounter = 0;
+function nid() {
+    _idCounter += 1;
+    return "n" + Date.now().toString(36) + "_" + _idCounter.toString(36);
+}
+
+function makeText(text, decorations) {
+    return {
+        type: "TEXT",
+        id: "",
+        nodes: [],
+        textData: { text: text || "", decorations: decorations || [] }
+    };
+}
+
+function makeParagraph(textNodes) {
+    return { type: "PARAGRAPH", id: nid(), nodes: textNodes, paragraphData: {} };
+}
+
+function makeHeading(level, textNodes) {
+    return { type: "HEADING", id: nid(), nodes: textNodes, headingData: { level } };
+}
+
+function makeList(ordered, innerHtml) {
+    const items = [];
+    const liRegex = /<li[^>]*>([\s\S]*?)<\/li>/gi;
+    let m;
+    while ((m = liRegex.exec(innerHtml)) !== null) {
+        items.push({
+            type: "LIST_ITEM",
+            id: nid(),
+            nodes: [makeParagraph(inlineToTextNodes(m[1]))]
+        });
+    }
+    return {
+        type: ordered ? "ORDERED_LIST" : "BULLETED_LIST",
+        id: nid(),
+        nodes: items
+    };
+}
+
+function decodeEntities(str) {
+    return String(str)
+        .replace(/&nbsp;/g, " ")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+        .replace(/&amp;/g, "&"); // last, so we don't double-decode
+}
+
+// Parse a run of inline HTML into TEXT nodes carrying bold/italic/underline/link decorations.
+function inlineToTextNodes(html) {
+    const textNodes = [];
+    const deco = { bold: 0, italic: 0, underline: 0 };
+    let linkUrl = null;
+    let buffer = "";
+
+    function flush() {
+        if (buffer.length === 0) return;
+        const decorations = [];
+        if (deco.bold > 0) decorations.push({ type: "BOLD", fontWeightValue: 700 });
+        if (deco.italic > 0) decorations.push({ type: "ITALIC", italicData: true });
+        if (deco.underline > 0) decorations.push({ type: "UNDERLINE", underlineData: {} });
+        if (linkUrl) decorations.push({ type: "LINK", linkData: { link: { url: linkUrl } } });
+        textNodes.push(makeText(decodeEntities(buffer), decorations));
+        buffer = "";
+    }
+
+    const tokenRegex = /<\/?([a-z0-9]+)([^>]*)>|([^<]+)/gi;
+    let m;
+    while ((m = tokenRegex.exec(html)) !== null) {
+        if (m[3] !== undefined) { buffer += m[3]; continue; } // plain text run
+
+        const raw = m[0];
+        const tag = m[1].toLowerCase();
+        const closing = raw[1] === "/";
+        const attrs = m[2] || "";
+
+        if (tag === "br") { buffer += "\n"; continue; }
+
+        if (tag === "strong" || tag === "b") {
+            flush(); deco.bold += closing ? -1 : 1;
+        } else if (tag === "em" || tag === "i") {
+            flush(); deco.italic += closing ? -1 : 1;
+        } else if (tag === "u") {
+            flush(); deco.underline += closing ? -1 : 1;
+        } else if (tag === "a") {
+            flush();
+            if (closing) {
+                linkUrl = null;
+            } else {
+                const hm = attrs.match(/href\s*=\s*["']([^"']+)["']/i);
+                linkUrl = hm ? hm[1] : null;
+            }
+        }
+        // span / other inline tags: ignored, their text is still captured
+
+        if (deco.bold < 0) deco.bold = 0;
+        if (deco.italic < 0) deco.italic = 0;
+        if (deco.underline < 0) deco.underline = 0;
+    }
+    flush();
+
+    if (textNodes.length === 0) textNodes.push(makeText(""));
+    return textNodes;
+}
+
+// Convert Wix rich-text HTML (or plain text) into a Ricos richContent object.
+// Supports: <p>, <h1>-<h6>, <ul>/<ol>/<li>, <blockquote>, and inline
+// <b>/<strong>, <i>/<em>, <u>, <a href>, <br>. Nested lists are flattened.
+function htmlToRicos(html) {
+    const nodes = [];
+    let s = String(html || "").replace(/\r/g, "").trim();
+
+    if (!s) {
+        return { nodes: [makeParagraph([makeText("")])] };
+    }
+
+    // No tags at all -> treat as plain text, split on blank lines into paragraphs.
+    if (!/<[a-z][\s\S]*>/i.test(s)) {
+        s.split(/\n{2,}/).forEach(p => {
+            nodes.push(makeParagraph(inlineToTextNodes(p.replace(/\n/g, "<br>"))));
+        });
+        return { nodes: nodes.length ? nodes : [makeParagraph([makeText("")])] };
+    }
+
+    // Block-level pass.
+    const blockRegex = /<(h[1-6]|p|ul|ol|blockquote)([^>]*)>([\s\S]*?)<\/\1>/gi;
+    let match;
+    while ((match = blockRegex.exec(s)) !== null) {
+        const tag = match[1].toLowerCase();
+        const inner = match[3];
+
+        if (tag === "p" || tag === "blockquote") {
+            nodes.push(makeParagraph(inlineToTextNodes(inner)));
+        } else if (/^h[1-6]$/.test(tag)) {
+            nodes.push(makeHeading(parseInt(tag[1], 10), inlineToTextNodes(inner)));
+        } else if (tag === "ul" || tag === "ol") {
+            nodes.push(makeList(tag === "ol", inner));
+        }
+    }
+
+    // Nothing matched (e.g. body was a bare string with only inline tags) -> one paragraph.
+    if (nodes.length === 0) {
+        nodes.push(makeParagraph(inlineToTextNodes(s)));
+    }
+
+    return { nodes };
+}

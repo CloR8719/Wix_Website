@@ -5,6 +5,7 @@ import { currentMember } from 'wix-members-frontend';
 import wixData from 'wix-data';
 import wixWindow from 'wix-window';
 import wixLocationFrontend from 'wix-location-frontend';
+import { createBlogPost } from 'backend/blog.jsw';
 
 // --- CLUB SETTINGS ---
 const JOIN_URL = "https://www.signolathleticjfc.co.uk/playerenquiry";
@@ -19,13 +20,16 @@ const DRAFT_STATUS_ID = "ad6fe8f3-c82e-45ae-b688-89d53c3f0a9f";
 const FA_COMPLETE_ID = "af2bef8c-1caa-4bf8-8dce-321d19723741";
 const Active_ID = "705c0b66-d5d5-47b6-b828-98a94c670f1f";
 const RENEWAL_STATUS_ID = "4d354c43-c893-4bc8-8415-18cfc32b3236";
+// ⚠️ SETUP: paste the ClubDictionary "Action Required" _id here (same GUID as backend).
+const ACTION_REQUIRED_ID = "d5bd1c0f-e19e-4318-a8d3-d5d6fe63b274";
 
 const STATUS_SORT_ORDER = {
     [INVITED_STATUS_ID]: 1,
-    [RENEWAL_STATUS_ID]: 2,
-    [READY_FOR_FA_ID]: 3,
-    [FA_COMPLETE_ID]: 4,
-    [Active_ID]: 5
+    [ACTION_REQUIRED_ID]: 2,
+    [RENEWAL_STATUS_ID]: 3,
+    [READY_FOR_FA_ID]: 4,
+    [FA_COMPLETE_ID]: 5,
+    [Active_ID]: 6
 };
 
 // --- STAFF ACCESS LEVELS ---
@@ -51,9 +55,6 @@ let leaveReasonOptions = [];
 // --- SQUAD STATE LOCALS ---
 let squadActiveTeamId = "";
 let squadActiveAgeGroupId = "";
-let pendingInviteItem = null;
-let selectedProfileItem = null;
-let isConfirmingProfileLeave = false;
 
 // --- TEAM PROFILE STATE LOCALS ---
 let selectedTeamProfileId = "";
@@ -248,6 +249,7 @@ async function loadDashboard() {
             const invitedCount = squad.filter(p => p.SP_status === INVITED_STATUS_ID).length;
             const renewalCount = squad.filter(p => p.SP_status === RENEWAL_STATUS_ID).length;
             const draftCount = squad.filter(p => p.SP_status === DRAFT_STATUS_ID).length;
+            // All three are parent-side actions the manager may need to chase up.
             const actionNeeded = invitedCount + renewalCount + draftCount;
 
             return {
@@ -278,11 +280,11 @@ $w("#repeaterMyTeams").onItemReady(($item, itemData) => {
 
     if (itemData.actionNeeded > 0) {
         const reasons = [];
-        if (itemData.invitedCount > 0) reasons.push(`${itemData.invitedCount} awaiting parent to register`);
-        if (itemData.draftCount > 0) reasons.push(`${itemData.draftCount} registration started but not finished`);
-        if (itemData.renewalCount > 0) reasons.push(`${itemData.renewalCount} need renewal`);
+        if (itemData.invitedCount > 0) reasons.push(`${itemData.invitedCount} registration form${itemData.invitedCount > 1 ? "s" : ""} being completed by parent(s)`);
+        if (itemData.draftCount > 0) reasons.push(`${itemData.draftCount} registration${itemData.draftCount > 1 ? "s" : ""} complete but not submitted`);
+        if (itemData.renewalCount > 0) reasons.push(`${itemData.renewalCount} renewal${itemData.renewalCount > 1 ? "s" : ""} still with parent(s)`);
 
-        $item("#txtActionAlert").text = `⚠️ ${reasons.join(", ")} - tap to review`;
+        $item("#txtActionAlert").text = `⚠️ ${reasons.join(", ")} - tap to follow up`;
         $item("#txtActionAlert").expand();
         $item("#txtActionAlert").onClick(async () => {
             await loadSquadState(itemData._id);
@@ -359,11 +361,6 @@ function showSquadTab(tab) {
     $w("#boxEnquiries").collapse();
     $w("#boxTrials").collapse();
     $w("#boxSquadList").collapse();
-
-    $w("#playerProfileModal").collapse();
-    $w("#inviteModal").collapse();
-    selectedProfileItem = null;
-    pendingInviteItem = null;
 
     if (tab === "enquiries") $w("#boxEnquiries").expand();
     else if (tab === "trials") $w("#boxTrials").expand();
@@ -466,19 +463,56 @@ $w("#repeaterTrials").onItemReady(($item, itemData) => {
     $item("#leaveReasonDropdown").options = leaveReasonOptions;
     let isConfirmingLeave = false;
 
-    $item("#invite").onClick(() => {
-        pendingInviteItem = itemData;
+    $item("#invite").onClick(async () => {
+        const result = await wixWindow.openLightbox("InviteRegistration", {
+            firstName: itemData.SP_firstName,
+            lastName: itemData.SP_lastName,
+            parentName: itemData.parentsName,
+            parentEmail: itemData.parentEmail
+        });
 
-        $w("#reviewPlayerName").text = `${itemData.SP_firstName || ""} ${itemData.SP_lastName || ""}`;
-        $w("#reviewParentName").text = itemData.parentsName || "No Parent Name Found";
-        $w("#reviewParentEmail").text = itemData.parentEmail || "No Email Found";
+        if (!result) return;
 
-        $w("#tasterDate").value = null;
-        $w("#regDate").value = null;
-        $w("#regPlayertype").value = null;
+        $item("#invite").disable();
+        $item("#invite").label = "Saving & Sending...";
 
-        $w("#inviteModal").expand();
-        wixWindow.scrollTo(0, 0);
+        try {
+            let updateData = cleanItemForUpdate(itemData);
+
+            updateData.firstTasterDate = formatDateStr(result.tasterDate);
+            updateData.registrationDate = formatDateStr(result.regDate);
+            updateData.SP_status = INVITED_STATUS_ID;
+            updateData.SP_trainingOnly = (result.playerType === "true");
+
+            const token = generateRandomToken(16);
+            updateData.inviteToken = token;
+            updateData.registrationLink = `https://www.signolathleticjfc.co.uk/secure-registration?token=${token}`;
+
+            await wixData.update("SignolPlayers", updateData);
+
+            const queuePayload = {
+                parentEmail: updateData.parentEmail,
+                parentName: updateData.parentsName,
+                childName: updateData.SP_firstName,
+                registrationLink: updateData.registrationLink
+            };
+            await wixData.insert("EmailQueue", queuePayload);
+
+            const sentFirstName = updateData.SP_firstName;
+
+            await loadTrials();
+            await loadSquadList();
+
+            // IMPROVED FLOW: invited players move into the Squad (onboarding) list - jump there
+            $w("#squadPipelineTabs").value = "squad";
+            showSquadTab("squad");
+            flashTabMessage("#tabSquadHighlight", `${sentFirstName} sent a registration link ✓`);
+
+        } catch (err) {
+            console.error("Failed to process invite:", err);
+            $item("#invite").enable();
+            $item("#invite").label = "Error - Try Again";
+        }
     });
 
     $item("#return").onClick(async () => {
@@ -541,73 +575,6 @@ $w("#repeaterTrials").onItemReady(($item, itemData) => {
     });
 });
 
-// --- INVITE MODAL ---
-$w("#btnCancelInvite").onClick(() => {
-    pendingInviteItem = null;
-    $w("#inviteModal").collapse();
-    wixWindow.scrollTo(0, 0);
-});
-
-$w("#btnSendInvite").onClick(async () => {
-    const tasterPicker = $w("#tasterDate").value;
-    const regPicker = $w("#regDate").value;
-    const playerType = $w("#regPlayertype").value;
-
-    if (!tasterPicker || !regPicker || !playerType) {
-        $w("#btnSendInvite").label = "Fill all fields!";
-        setTimeout(() => $w("#btnSendInvite").label = "Send Registration Link", 2000);
-        return;
-    }
-
-    $w("#btnSendInvite").disable();
-    $w("#btnSendInvite").label = "Saving & Sending...";
-
-    try {
-        let updateData = cleanItemForUpdate(pendingInviteItem);
-
-        updateData.firstTasterDate = formatDateStr(tasterPicker);
-        updateData.registrationDate = formatDateStr(regPicker);
-        updateData.SP_status = INVITED_STATUS_ID;
-        updateData.SP_trainingOnly = (playerType === "true");
-
-        const token = generateRandomToken(16);
-        updateData.inviteToken = token;
-        updateData.registrationLink = `https://www.signolathleticjfc.co.uk/secure-registration?token=${token}`;
-
-        await wixData.update("SignolPlayers", updateData);
-
-        const queuePayload = {
-            parentEmail: updateData.parentEmail,
-            parentName: updateData.parentsName,
-            childName: updateData.SP_firstName,
-            registrationLink: updateData.registrationLink
-        };
-        await wixData.insert("EmailQueue", queuePayload);
-
-        const sentFirstName = updateData.SP_firstName;
-
-        pendingInviteItem = null;
-        $w("#inviteModal").collapse();
-        $w("#btnSendInvite").enable();
-        $w("#btnSendInvite").label = "Send Registration Link";
-
-        await loadTrials();
-        await loadSquadList();
-
-        // IMPROVED FLOW: invited players move into the Squad (onboarding) list - jump there
-        $w("#squadPipelineTabs").value = "squad";
-        showSquadTab("squad");
-        flashTabMessage("#tabSquadHighlight", `${sentFirstName} sent a registration link ✓`);
-
-        wixWindow.scrollTo(0, 0);
-
-    } catch (err) {
-        console.error("Failed to process invite:", err);
-        $w("#btnSendInvite").enable();
-        $w("#btnSendInvite").label = "Error. Try Again.";
-    }
-});
-
 // --- PIPELINE 3: ACTIVE SQUAD & PROFILE MODAL ---
 async function loadSquadList() {
     try {
@@ -643,8 +610,7 @@ async function loadSquadList() {
 
 $w("#repeaterSquad").onItemReady(($item, itemData) => {
     $item("#rowFirstName").text = itemData.SP_firstName || "N/A";
-    $item("#rowParentName").text = itemData.parentsName || "N/A";
-    $item("#rowParentMobile").text = itemData.parentPhone || "N/A";
+    $item("#rowLastName").text = itemData.SP_lastName || "N/A";
     $item("#kitnumDisplay").text = itemData.kitNumber ? `#${itemData.kitNumber}` : "-";
 
     // Medical badge
@@ -681,163 +647,60 @@ $w("#repeaterSquad").onItemReady(($item, itemData) => {
         statusBadge.style.backgroundColor = "#22C55E";
         statusBadge.style.color = "#22C55E";
     } else {
-        if (itemData.SP_status === INVITED_STATUS_ID) statusBadge.text = "Awaiting Parent (New)";
-        else if (itemData.SP_status === RENEWAL_STATUS_ID) statusBadge.text = "Renewal Required";
-        else if (itemData.SP_status === READY_FOR_FA_ID) statusBadge.text = "Pending FA Reg";
-        else if (itemData.SP_status === DRAFT_STATUS_ID) statusBadge.text = "Registration In Progress";
-        else if (itemData.SP_status === FA_COMPLETE_ID) statusBadge.text = "FA Cleared";
+        if (itemData.SP_status === INVITED_STATUS_ID) statusBadge.text = "Registration With Parent";
+        else if (itemData.SP_status === ACTION_REQUIRED_ID) statusBadge.text = "Sent Back to Parent";
+        else if (itemData.SP_status === RENEWAL_STATUS_ID) statusBadge.text = "Renewal With Parent";
+        else if (itemData.SP_status === DRAFT_STATUS_ID) statusBadge.text = "Form Ready - Not Submitted";
+        else if (itemData.SP_status === READY_FOR_FA_ID) statusBadge.text = "With Club Secretary (FA Reg)";
+        else if (itemData.SP_status === FA_COMPLETE_ID) statusBadge.text = "FA Cleared - Final Checks";
         else statusBadge.text = "ONBOARDING";
 
-        statusBadge.style.backgroundColor = "#F59E0B";
-        statusBadge.style.color = "#F59E0B";
+        // Action Required is the one onboarding state that's stuck pending a parent fix — flag it red.
+        const onboardColor = itemData.SP_status === ACTION_REQUIRED_ID ? "#FF4D4D" : "#F59E0B";
+        statusBadge.style.backgroundColor = onboardColor;
+        statusBadge.style.color = onboardColor;
     }
 
-    // Next-step guidance for onboarding statuses
+    // Next-step guidance for onboarding statuses - action-first, consistent icon
+    // so "needs you" vs "just FYI" rows are scannable without reading every word.
     const nextStep = $item("#rowNextStep");
     if (nextStep) {
         if (itemData.SP_status === INVITED_STATUS_ID) {
-            nextStep.text = "Action: Parent hasn't started the registration form yet - send them a reminder.";
-            nextStep.expand();
-        } else if (itemData.SP_status === DRAFT_STATUS_ID) {
-            nextStep.text = `Action: Parent started the form (${itemData.registrationProgress || 0}% complete) - nudge them to finish.`;
+            nextStep.text = `⚠️ Follow up - registration form with parent (${itemData.registrationProgress || 0}% complete)`;
             nextStep.expand();
         } else if (itemData.SP_status === RENEWAL_STATUS_ID) {
-            nextStep.text = "Action: Returning player needs to complete renewal registration for this season.";
+            nextStep.text = `⚠️ Follow up - renewal form with parent (${itemData.registrationProgress || 0}% complete)`;
+            nextStep.expand();
+        } else if (itemData.SP_status === DRAFT_STATUS_ID) {
+            nextStep.text = "⚠️ Nudge parent - form complete but not submitted yet";
+            nextStep.expand();
+        } else if (itemData.SP_status === ACTION_REQUIRED_ID) {
+            nextStep.text = "⚠️ With parent - club secretary returned the form for a fix";
             nextStep.expand();
         } else if (itemData.SP_status === READY_FOR_FA_ID) {
-            nextStep.text = "Action: Registration complete - submit this player to the FA for clearance.";
+            nextStep.text = "ℹ️ No action - with club secretary for FA registration";
             nextStep.expand();
         } else if (itemData.SP_status === FA_COMPLETE_ID) {
-            nextStep.text = "Action: FA clearance received - confirm and move player to Active squad.";
+            nextStep.text = "ℹ️ No action - final club checks before going Active";
             nextStep.expand();
         } else {
             nextStep.collapse();
         }
     }
 
-    $item("#btnOpenProfile").onClick(() => {
-        selectedProfileItem = itemData;
+    $item("#btnOpenProfile").onClick(async () => {
+        const result = await wixWindow.openLightbox("PlayerProfile", { player: itemData, defaultSeason: statsSelectedSeason });
 
-        $w("#detailFirstName").text = itemData.SP_firstName || "N/A";
-        $w("#detailLastName").text = itemData.SP_lastName || "N/A";
-        $w("#detailFAN").text = itemData.fanNumber || "Pending";
-        $w("#detailDOB").text = itemData.SP_dob || "N/A";
-
-        $w("#detailParentName").text = itemData.parentsName || "N/A";
-        $w("#detailParentMobile").text = itemData.parentPhone || "N/A";
-        $w("#detailParentEmail").text = itemData.parentEmail || "N/A";
-        $w("#detailParentRelation").text = itemData.SP_relationship ? itemData.SP_relationship.label || "N/A" : "N/A";
-
-        $w("#detailEmergencyName").text = itemData.SP_emergContactName || "N/A";
-        $w("#detailEmergencyMobile").text = itemData.SP_emergContactNumber || "N/A";
-        $w("#detailEmergencyRelation").text = itemData.SP_emergContactRelationship ? itemData.SP_emergContactRelationship.label || "N/A" : "N/A";
-
-        $w("#detailMedicalBox").text = cleanMedical || "No medical conditions declared.";
-        $w("#detailSocialMedia").text = itemData.socialMedia === true ? "Consent Given" : "Declined";
-        $w("#detailPlayertype").text = itemData.SP_trainingOnly === true ? "Training Only" : "Playing";
-        $w("#detailStatusDisplay").text = statusBadge.text;
-
-        if (itemData.SP_status === Active_ID) {
-            $w("#detailRegProgress").collapse();
-        } else {
-            $w("#detailRegProgress").text = `Registration: ${itemData.registrationProgress || 0}% complete`;
-            $w("#detailRegProgress").expand();
+        if (result && result.archived) {
+            // Player left the squad entirely - needs a full re-fetch.
+            await loadSquadList();
+        } else if (result && typeof result.kitNumber !== "undefined") {
+            // Patch the known-good value directly rather than re-querying,
+            // which can race Wix's eventual consistency right after a write.
+            itemData.kitNumber = result.kitNumber;
+            $item("#kitnumDisplay").text = result.kitNumber ? `#${result.kitNumber}` : "-";
         }
-
-        $w("#inputKitNumber").value = itemData.kitNumber || null;
-
-        isConfirmingProfileLeave = false;
-        $w("#dropdownLeaveReason").collapse();
-        $w("#dropdownLeaveReason").value = null;
-        $w("#datePickerLeave").collapse();
-        $w("#datePickerLeave").value = null;
-
-        $w("#btnMakeLeaver").label = "MAKE A LEAVER >";
-        $w("#btnMakeLeaver").enable();
-        $w("#dropdownLeaveReason").options = leaveReasonOptions;
-
-        $w("#playerProfileModal").expand();
-        wixWindow.scrollTo(0, 0);
     });
-});
-
-$w("#btnSaveKit").onClick(async () => {
-    if (!selectedProfileItem) return;
-
-    $w("#btnSaveKit").label = "Saving...";
-
-    try {
-        let updateData = cleanItemForUpdate(selectedProfileItem);
-        updateData.kitNumber = Number($w("#inputKitNumber").value) || null;
-
-        await wixData.update("SignolPlayers", updateData);
-        selectedProfileItem.kitNumber = updateData.kitNumber;
-
-        $w("#btnSaveKit").label = "Saved! ✓";
-        await loadSquadList();
-    } catch (err) {
-        console.error("Kit Number Save Error:", err);
-        $w("#btnSaveKit").label = "Error!";
-    } finally {
-        setTimeout(() => { $w("#btnSaveKit").label = "Save Kit Number"; }, 2000);
-    }
-});
-
-$w("#btnCloseProfile").onClick(() => {
-    selectedProfileItem = null;
-    $w("#playerProfileModal").collapse();
-    wixWindow.scrollTo(0, 0);
-});
-
-$w("#btnMakeLeaver").onClick(async () => {
-    if (!isConfirmingProfileLeave) {
-        isConfirmingProfileLeave = true;
-        $w("#dropdownLeaveReason").expand();
-        $w("#datePickerLeave").expand();
-        $w("#btnMakeLeaver").label = "CONFIRM ARCHIVE";
-        return;
-    }
-
-    const reason = $w("#dropdownLeaveReason").value;
-    const leaveDatePicker = $w("#datePickerLeave").value;
-
-    if (!reason || !leaveDatePicker) {
-        $w("#btnMakeLeaver").label = "Select Reason & Date!";
-        setTimeout(() => $w("#btnMakeLeaver").label = "CONFIRM ARCHIVE", 2000);
-        return;
-    }
-
-    $w("#btnMakeLeaver").disable();
-    $w("#btnMakeLeaver").label = "Archiving Player...";
-
-    try {
-        let updateData = cleanItemForUpdate(selectedProfileItem);
-
-        updateData.SP_status = LEFT_STATUS_ID;
-        updateData.SP_team = null;
-        updateData.leaveReason = reason;
-        updateData.SPleavingDate = formatDateStr(leaveDatePicker);
-
-        await wixData.update("SignolPlayers", updateData);
-
-        isConfirmingProfileLeave = false;
-        $w("#dropdownLeaveReason").collapse();
-        $w("#datePickerLeave").collapse();
-
-        $w("#btnMakeLeaver").enable();
-        $w("#btnMakeLeaver").label = "MAKE A LEAVER >";
-
-        selectedProfileItem = null;
-        $w("#playerProfileModal").collapse();
-
-        await loadSquadList();
-        wixWindow.scrollTo(0, 0);
-
-    } catch (err) {
-        console.error("Failed to archive player from profile:", err);
-        $w("#btnMakeLeaver").enable();
-        $w("#btnMakeLeaver").label = "Error. Try Again.";
-    }
 });
 
 // ==========================================
@@ -1151,21 +1014,48 @@ $w("#btnAddNews").onClick(async () => {
     dateObj.setDate(dateObj.getDate() + 60);
     dateObj.setHours(0, 0, 0, 0);
 
-    const newsData = {
-        headline: $w("#headlineInput").value,
-        articleBody: $w("#articleBodyInput").value,
-        type: $w("#typeDropdown").value,
-        team: $w("#teamDropdown").value,
-        posted: false,
-        expire: dateObj
-    };
-
     try {
-        await wixData.insert("ClubNews", newsData);
+        // 1. Upload the featured image (if the manager chose one).
+        let featuredImage = "";
+        if ($w("#uploadNewsImage").value.length > 0) {
+            const uploaded = await $w("#uploadNewsImage").uploadFiles();
+            if (uploaded.length > 0) featuredImage = uploaded[0].fileUrl;
+        }
 
-        $w("#btnAddNews").label = "Submitted!";
+        const headline = $w("#headlineInput").value;
+        const articleBody = $w("#articleBodyInput").value;
+
+        const newsData = {
+            headline,
+            articleBody,
+            type: $w("#typeDropdown").value,
+            team: $w("#teamDropdown").value,
+            featuredImage,
+            posted: false,
+            expire: dateObj
+        };
+
+        // 2. Save the CMS row first (source of record).
+        const inserted = await wixData.insert("ClubNews", newsData);
+
+        // 3. Auto-publish a live blog post from it.
+        $w("#btnAddNews").label = "Publishing...";
+        const { blogPostId } = await createBlogPost({
+            title: headline,
+            bodyHtml: articleBody,
+            featuredImage,
+            memberId: managerContext.memberId
+        });
+
+        // 4. Flag the row as posted and store the blog link (patch known fields only).
+        inserted.posted = true;
+        inserted.blogPostId = blogPostId;
+        await wixData.update("ClubNews", inserted);
+
+        $w("#btnAddNews").label = "Published!";
         $w("#headlineInput").value = "";
         $w("#articleBodyInput").value = "";
+        $w("#uploadNewsImage").reset();
 
         setTimeout(() => {
             $w("#btnAddNews").label = "Submit News";
@@ -1175,7 +1065,7 @@ $w("#btnAddNews").onClick(async () => {
     } catch (err) {
         $w("#btnAddNews").label = "Error - Try again";
         $w("#btnAddNews").enable();
-        console.error("Direct Insert Failed:", err);
+        console.error("News publish failed:", err);
     }
 });
 
@@ -1787,11 +1677,15 @@ async function savePotmUpdate() {
 // ==========================================
 // SHARED HELPERS
 // ==========================================
+// Formats a DatePicker value into a "YYYY-MM-DD" string for a CMS Date field.
+// Built from local date parts (not toISOString) so the calendar day can't shift
+// by a timezone offset — same approach the DOB handling uses elsewhere. The old
+// "05 Jul 2026" style output was a display string that Date fields can't store.
 function formatDateStr(d) {
-    if (!d) return "";
+    if (!d) return null;
     const date = new Date(d);
-    if (isNaN(date.getTime())) return "";
-    return date.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+    if (isNaN(date.getTime())) return null;
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
 
 function generateRandomToken(length = 24) {
