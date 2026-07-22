@@ -80,39 +80,52 @@ export async function hubEmailSweep(memberId, loginEmail, parentRoleId, firstNam
 
         let options = { "suppressAuth": true };
 
+        console.log("[hubEmailSweep] called with", { memberId, loginEmail, firstName, lastName });
+
+        // Resolve a display name for this member, in priority order:
+        // 1. firstName/lastName passed in directly (the member's Wix profile,
+        //    fetched on the frontend via currentMember.getMember())
+        // 2. The member's own Wix profile, fetched server-side as a fallback
+        let resolvedFirst = (firstName || "").trim();
+        let resolvedLast = (lastName || "").trim();
+
+        if (!resolvedFirst && !resolvedLast) {
+            try {
+                const memberRecord = await members.getMember(memberId, { fieldsets: ["FULL"] });
+                resolvedFirst = (memberRecord?.contactDetails?.firstName || "").trim();
+                resolvedLast = (memberRecord?.contactDetails?.lastName || "").trim();
+            } catch (memberErr) {
+                console.error("Hub Sweep: could not fetch member contact details:", memberErr);
+            }
+        }
+
+        let resolvedName = `${resolvedFirst} ${resolvedLast}`.trim();
+
         // --- A. FIND OR CREATE PARENT PROFILE ---
         const profileQuery = await wixData.query("ParentProfiles")
             .eq("memberId", memberId)
             .find(options);
 
         if (profileQuery.items.length > 0) {
-            parentProfileId = profileQuery.items[0]._id;
-        } else {
-            // Resolve a display name for the new profile, in priority order:
-            // 1. firstName/lastName passed in directly (signup lightbox)
-            // 2. The member's own Wix profile (set during registration)
-            // 3. The name already on a matching player record (primary, then secondary)
-            // 4. Last resort: the login email
-            let resolvedFirst = (firstName || "").trim();
-            let resolvedLast = (lastName || "").trim();
+            const existingProfile = profileQuery.items[0];
+            parentProfileId = existingProfile._id;
 
-            if (!resolvedFirst && !resolvedLast) {
-                try {
-                    const memberRecord = await members.getMember(memberId);
-                    resolvedFirst = (memberRecord?.contactDetails?.firstName || "").trim();
-                    resolvedLast = (memberRecord?.contactDetails?.lastName || "").trim();
-                } catch (memberErr) {
-                    console.error("Hub Sweep: could not fetch member contact details:", memberErr);
-                }
+            // Backfill a missing name on an existing profile
+            if (!existingProfile.PP_fullName && resolvedName) {
+                existingProfile.PP_fullName = resolvedName;
+                await wixData.update("ParentProfiles", existingProfile, options);
             }
 
-            const resolvedName = `${resolvedFirst} ${resolvedLast}`.trim();
-
+            // For backfilling player records below, fall back to whatever
+            // name is already on the profile if we didn't resolve one above
+            resolvedName = resolvedName || existingProfile.PP_fullName || "";
+        } else {
+            // Fallback name/phone sourced from a matching player record, used
+            // only if we still don't have a name from the member's profile
             let fallbackName = "";
             let fallbackPhone = "";
 
             if (!resolvedName) {
-                // Try to source the parent's name/phone from a matching player record
                 const primaryMatch = await wixData.query("SignolPlayers")
                     .eq("parentEmail", loginEmail)
                     .find(options);
@@ -141,32 +154,115 @@ export async function hubEmailSweep(memberId, loginEmail, parentRoleId, firstNam
             }, options);
             parentProfileId = newProfile._id;
             isNewProfile = true;
+
+            resolvedName = resolvedName || fallbackName || "";
         }
 
-        // --- B. SWEEP FOR PRIMARY PARENT ---
-        const primaryPlayers = await wixData.query("SignolPlayers")
-            .eq("parentEmail", loginEmail)
-            .find(options);
+        // Email-based auto-linking is only ever safe if we have a real email
+        // to match on. An empty/blank loginEmail would turn .eq("parentEmail", "")
+        // into a query that matches every record where that field is blank -
+        // i.e. every incomplete registration in the database. Skip both sweeps
+        // entirely if we don't have a real email.
+        console.log("[hubEmailSweep] resolved", { parentProfileId, isNewProfile, resolvedName, loginEmailIsTruthy: !!loginEmail });
 
-        for (let player of primaryPlayers.items) {
-            // Only update if it isn't already linked
-            if (player.primaryParentId !== parentProfileId) {
-                player.primaryParentId = parentProfileId;
-                await wixData.update("SignolPlayers", player, options);
+        if (loginEmail) {
+            // --- B. SWEEP FOR PRIMARY PARENT ---
+            // Safety cap: a real family is at most a couple of kids. If an email
+            // match would auto-link more than this many *unclaimed* records, it's
+            // almost certainly a shared/placeholder email rather than genuine
+            // siblings - skip auto-linking and leave them for manual review.
+            const MAX_AUTO_LINK = 2;
+
+            const primaryPlayers = await wixData.query("SignolPlayers")
+                .eq("parentEmail", loginEmail)
+                .find(options);
+
+            console.log("[hubEmailSweep] primary query .eq('parentEmail', loginEmail) matched:",
+                primaryPlayers.items.map(p => ({
+                    _id: p._id,
+                    name: `${p.SP_firstName || ""} ${p.SP_lastName || ""}`.trim(),
+                    parentEmail: p.parentEmail,
+                    primaryParentId: p.primaryParentId
+                }))
+            );
+
+            const unclaimedPrimaryCount = primaryPlayers.items.filter(p => !p.primaryParentId).length;
+            if (unclaimedPrimaryCount > MAX_AUTO_LINK) {
+                console.warn(`Hub Sweep: skipping primary auto-link for ${loginEmail} - ${unclaimedPrimaryCount} unclaimed matches (likely a shared/placeholder email).`);
             }
-        }
 
-        // --- C. SWEEP FOR SECONDARY PARENT ---
-        const secondaryPlayers = await wixData.query("SignolPlayers")
-            .eq("secondaryParentEmail", loginEmail)
-            .find(options);
+            for (let player of primaryPlayers.items) {
+                let needsUpdate = false;
 
-        for (let player of secondaryPlayers.items) {
-             // Only update if it isn't already linked
-            if (player.secondaryParentId !== parentProfileId) {
-                player.secondaryParentId = parentProfileId;
-                await wixData.update("SignolPlayers", player, options);
+                if (!player.primaryParentId) {
+                    if (unclaimedPrimaryCount > MAX_AUTO_LINK) continue;
+                    // Unclaimed - link it to this parent
+                    player.primaryParentId = parentProfileId;
+                    needsUpdate = true;
+                } else if (player.primaryParentId !== parentProfileId) {
+                    // Already claimed by a different parent profile - don't steal it
+                    // just because the email happens to match
+                    continue;
+                }
+
+                // Backfill a missing parent name on the player record
+                if (!player.parentsName && resolvedName) {
+                    player.parentsName = resolvedName;
+                    needsUpdate = true;
+                }
+
+                if (needsUpdate) {
+                    console.log("[hubEmailSweep] updating PRIMARY link on player", { _id: player._id, primaryParentId: player.primaryParentId, parentsName: player.parentsName });
+                    await wixData.update("SignolPlayers", player, options);
+                }
             }
+
+            // --- C. SWEEP FOR SECONDARY PARENT ---
+            const secondaryPlayers = await wixData.query("SignolPlayers")
+                .eq("secondaryParentEmail", loginEmail)
+                .find(options);
+
+            console.log("[hubEmailSweep] secondary query .eq('secondaryParentEmail', loginEmail) matched:",
+                secondaryPlayers.items.map(p => ({
+                    _id: p._id,
+                    name: `${p.SP_firstName || ""} ${p.SP_lastName || ""}`.trim(),
+                    secondaryParentEmail: p.secondaryParentEmail,
+                    secondaryParentId: p.secondaryParentId
+                }))
+            );
+
+            const unclaimedSecondaryCount = secondaryPlayers.items.filter(p => !p.secondaryParentId).length;
+            if (unclaimedSecondaryCount > MAX_AUTO_LINK) {
+                console.warn(`Hub Sweep: skipping secondary auto-link for ${loginEmail} - ${unclaimedSecondaryCount} unclaimed matches (likely a shared/placeholder email).`);
+            }
+
+            for (let player of secondaryPlayers.items) {
+                let needsUpdate = false;
+
+                if (!player.secondaryParentId) {
+                    if (unclaimedSecondaryCount > MAX_AUTO_LINK) continue;
+                    // Unclaimed - link it to this parent
+                    player.secondaryParentId = parentProfileId;
+                    needsUpdate = true;
+                } else if (player.secondaryParentId !== parentProfileId) {
+                    // Already claimed by a different parent profile - don't steal it
+                    // just because the email happens to match
+                    continue;
+                }
+
+                // Backfill a missing secondary parent name on the player record
+                if (!player.secondaryParentName && resolvedName) {
+                    player.secondaryParentName = resolvedName;
+                    needsUpdate = true;
+                }
+
+                if (needsUpdate) {
+                    console.log("[hubEmailSweep] updating SECONDARY link on player", { _id: player._id, secondaryParentId: player.secondaryParentId, secondaryParentName: player.secondaryParentName });
+                    await wixData.update("SignolPlayers", player, options);
+                }
+            }
+        } else {
+            console.warn(`Hub Sweep: member ${memberId} has no loginEmail - skipping email-based linking entirely.`);
         }
 
         return { success: true, profileId: parentProfileId, isNew: isNewProfile };
@@ -195,7 +291,270 @@ export async function getSecureManagerName(managerId) {
         return "TBD";
     }
 }
+// 6. Securely updates the logged-in parent's own profile details, and syncs
+// the name/phone to every player record linked to them (primary or secondary)
+export async function secureUpdateParentProfile(fullName, phoneNumber) {
+    try {
+        const member = await currentMember.getMember();
+        if (!member) throw new Error("Security Block: Not logged in.");
+
+        const options = { suppressAuth: true };
+
+        const profileResults = await wixData.query("ParentProfiles")
+            .eq("memberId", member._id)
+            .find(options);
+
+        if (profileResults.items.length === 0) {
+            throw new Error("Security Block: No parent profile found for this member.");
+        }
+
+        const profile = profileResults.items[0];
+        console.log("[secureUpdateParentProfile] called for profile", { profileId: profile._id, memberId: member._id, fullName, phoneNumber });
+
+        profile.PP_fullName = fullName;
+        profile.PP_phoneNumber = phoneNumber;
+        await wixData.update("ParentProfiles", profile, options);
+
+        // Sync to every player this parent is linked to, primary or secondary
+        const primaryQuery = wixData.query("SignolPlayers").eq("primaryParentId", profile._id);
+        const secondaryQuery = wixData.query("SignolPlayers").eq("secondaryParentId", profile._id);
+        const linkedPlayers = await primaryQuery.or(secondaryQuery).find(options);
+
+        console.log("[secureUpdateParentProfile] linkedPlayers query matched:",
+            linkedPlayers.items.map(p => ({
+                _id: p._id,
+                name: `${p.SP_firstName || ""} ${p.SP_lastName || ""}`.trim(),
+                primaryParentId: p.primaryParentId,
+                secondaryParentId: p.secondaryParentId
+            }))
+        );
+
+        const updates = linkedPlayers.items.map(player => {
+            let needsUpdate = false;
+
+            if (player.primaryParentId === profile._id) {
+                player.parentsName = fullName;
+                player.parentPhone = phoneNumber;
+                needsUpdate = true;
+            }
+            if (player.secondaryParentId === profile._id) {
+                player.secondaryParentName = fullName;
+                player.secondaryParentMobile = phoneNumber;
+                needsUpdate = true;
+            }
+
+            return needsUpdate ? wixData.update("SignolPlayers", player, options) : null;
+        }).filter(Boolean);
+
+        await Promise.all(updates);
+
+        return { success: true };
+    } catch (error) {
+        console.error("Update Parent Profile Error:", error);
+        return { success: false, error: error.message };
+    }
+}
+
+// 7. Fallback linking for parents whose email doesn't match any player
+// record - they prove the relationship by entering the player's Fan Number
+// and Date of Birth instead.
+//
+// This is a two-step, confirm-before-linking flow:
+//   7a. findPlayerByFanNumberAndDob - looks up the player and returns a
+//       preview (name + fan number) for the parent to confirm. Does NOT
+//       link anything.
+//   7b. confirmPlayerLink - called only after the parent clicks "Yes, this
+//       is my child" - performs the actual link.
+//
+// A player with a primary parent already linked can't be self-service linked
+// as a secondary parent via this flow - for safeguarding/GDPR reasons, only
+// the existing primary parent should be adding other contacts to the child's
+// account, so anyone else is pointed to the primary parent / the club instead.
+const PRIMARY_ALREADY_LINKED_ERROR = "This player already has a primary parent/guardian linked to their account. For data protection reasons, only that parent can add another contact - please ask them to add you, or contact the club if you believe this is incorrect.";
+
+const LEFT_STATUS_ID = "d78cb8b0-3b3b-4439-b889-fd36dc434781";
+
+// Validates and looks up a player by Fan Number + DOB. Shared by the preview
+// (findPlayerByFanNumberAndDob) and confirm (confirmPlayerLink) steps so that
+// confirmPlayerLink can never be tricked into linking a player it hasn't
+// independently verified - it must re-prove the same Fan Number/DOB match,
+// not just trust a playerId handed back from the preview step.
+async function lookupPlayerByFanAndDob(fanNumber, dob, options) {
+    const fanNumberValue = Number(fanNumber);
+    if (!fanNumberValue || !dob) return null;
+
+    // `dob` arrives as a "YYYY-MM-DD" string built from local date parts
+    // on the client - validate the format and use it directly rather
+    // than round-tripping through `new Date()`, which would shift the
+    // date by the timezone offset between the parent's browser and this
+    // server (e.g. midnight BST becomes 23:00 the previous day UTC).
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dob)) return null;
+
+    const matchResults = await wixData.query("SignolPlayers")
+        .eq("SP_fanNumber", fanNumberValue)
+        .eq("SP_dob", dob)
+        .ne("SP_status", LEFT_STATUS_ID)
+        .find(options);
+
+    return matchResults.items.length > 0 ? matchResults.items[0] : null;
+}
+
+// 7a. Preview lookup - read-only (other than the attempt counter)
+export async function findPlayerByFanNumberAndDob(fanNumber, dob, parentRoleId) {
+    const GENERIC_ERROR = "We couldn't find a player matching those details. Please double-check the Fan Number and Date of Birth, or contact the club.";
+    const LOCKED_ERROR = "Too many unsuccessful attempts. Please contact the club to link your account.";
+    const MAX_ATTEMPTS = 3;
+
+    try {
+        const member = await currentMember.getMember();
+        if (!member) throw new Error("Security Block: Not logged in.");
+
+        const options = { suppressAuth: true };
+        const loginEmail = member.loginEmail;
+        const firstName = member.contactDetails ? member.contactDetails.firstName : "";
+        const lastName = member.contactDetails ? member.contactDetails.lastName : "";
+
+        // Ensure the parent profile exists (creates/links via the usual sweep)
+        const sweepResult = await hubEmailSweep(member._id, loginEmail, parentRoleId, firstName, lastName);
+        if (!sweepResult.success) {
+            return { success: false, error: "Could not prepare your parent profile. Please try again." };
+        }
+        const parentProfileId = sweepResult.profileId;
+
+        // Re-fetch the profile so we have the latest attempt count (stored
+        // server-side so it can't be reset by clearing cache/cookies)
+        const profile = await wixData.get("ParentProfiles", parentProfileId, options);
+        const attempts = profile.PP_linkAttempts || 0;
+
+        if (attempts >= MAX_ATTEMPTS) {
+            return { success: false, error: LOCKED_ERROR };
+        }
+
+        // Records a failed guess against the server-side counter and returns
+        // the message to show the user (generic, with attempts remaining)
+        const recordFailedAttempt = async () => {
+            profile.PP_linkAttempts = attempts + 1;
+            await wixData.update("ParentProfiles", profile, options);
+
+            const remaining = MAX_ATTEMPTS - (attempts + 1);
+            if (remaining <= 0) {
+                return LOCKED_ERROR;
+            }
+            return `${GENERIC_ERROR} (${remaining} attempt${remaining === 1 ? '' : 's'} remaining)`;
+        };
+
+        const player = await lookupPlayerByFanAndDob(fanNumber, dob, options);
+        if (!player) {
+            return { success: false, error: await recordFailedAttempt() };
+        }
+
+        if (player.primaryParentId === parentProfileId || player.secondaryParentId === parentProfileId) {
+            return { success: true, alreadyLinked: true };
+        }
+
+        if (player.primaryParentId) {
+            return { success: false, error: PRIMARY_ALREADY_LINKED_ERROR };
+        }
+
+        // Successful match - reset the attempt counter, then return a
+        // preview for the parent to confirm before anything is linked
+        if (attempts > 0) {
+            profile.PP_linkAttempts = 0;
+            await wixData.update("ParentProfiles", profile, options);
+        }
+
+        return {
+            success: true,
+            player: {
+                _id: player._id,
+                name: `${player.SP_firstName || ""} ${player.SP_lastName || ""}`.trim(),
+                fanNumber: player.SP_fanNumber
+            }
+        };
+    } catch (error) {
+        console.error("Fan/DOB Lookup Error:", error);
+        return { success: false, error: "Something went wrong - please try again or contact the club." };
+    }
+}
+
+// 7b. Performs the actual link - only called after the parent confirms the
+// preview returned by findPlayerByFanNumberAndDob
+//
+// fanNumber/dob are re-verified here, server-side, against playerId. This
+// function is independently callable from the client, so it must not trust a
+// bare playerId on its own - without re-proving the Fan Number/DOB match, a
+// caller could pass the ID of *any* unclaimed player and link themselves as
+// its primary parent, bypassing verification entirely.
+export async function confirmPlayerLink(playerId, fanNumber, dob, parentRoleId) {
+    try {
+        const member = await currentMember.getMember();
+        if (!member) throw new Error("Security Block: Not logged in.");
+
+        const options = { suppressAuth: true };
+        const loginEmail = member.loginEmail;
+        const firstName = member.contactDetails ? member.contactDetails.firstName : "";
+        const lastName = member.contactDetails ? member.contactDetails.lastName : "";
+        const resolvedName = `${firstName || ""} ${lastName || ""}`.trim();
+
+        const profileResults = await wixData.query("ParentProfiles")
+            .eq("memberId", member._id)
+            .find(options);
+
+        if (profileResults.items.length === 0) {
+            return { success: false, error: "Could not find your parent profile. Please try again." };
+        }
+        const parentProfileId = profileResults.items[0]._id;
+
+        // Re-verify the Fan Number/DOB match (re-fetches the player too, so
+        // this also reflects the latest ownership state since the preview)
+        const player = await lookupPlayerByFanAndDob(fanNumber, dob, options);
+        if (!player || player._id !== playerId) {
+            return { success: false, error: "That player could no longer be found. Please try the lookup again." };
+        }
+
+        if (player.primaryParentId === parentProfileId || player.secondaryParentId === parentProfileId) {
+            return { success: true, alreadyLinked: true };
+        }
+
+        if (player.primaryParentId) {
+            return { success: false, error: PRIMARY_ALREADY_LINKED_ERROR };
+        }
+
+        player.primaryParentId = parentProfileId;
+        player.parentEmail = loginEmail;
+        if (!player.parentsName && resolvedName) player.parentsName = resolvedName;
+
+        await wixData.update("SignolPlayers", player, options);
+
+        return { success: true };
+    } catch (error) {
+        console.error("Confirm Player Link Error:", error);
+        return { success: false, error: "Something went wrong - please try again or contact the club." };
+    }
+}
+
 // 5. Securely updates the player record only if the parent owns it
+// Every player gets one stable club membership number (6-digit, ~900,000 possible
+// values, no prefix), generated once the very first time their registration record
+// is saved. Guarded off the EXISTING database record rather than the incoming
+// payload, so it can never be regenerated by a later Save Draft/Submit on the same
+// player — a parent reopening/resaving the form after one has already been assigned
+// will just keep it.
+async function generateUniqueMembershipNumber() {
+    const MAX_ATTEMPTS = 20;
+    for (let i = 0; i < MAX_ATTEMPTS; i++) {
+        const candidate = String(Math.floor(100000 + Math.random() * 900000));
+        const existing = await wixData.query("SignolPlayers")
+            .eq("sp_membership_no", candidate)
+            .limit(1)
+            .find({ suppressAuth: true });
+        if (existing.items.length === 0) {
+            return candidate;
+        }
+    }
+    throw new Error("Could not generate a unique membership number after multiple attempts.");
+}
+
 export async function secureUpdatePlayerRegistration(playerData, parentProfileId) {
     try {
         // 1. Verify a real member is logged in
@@ -204,9 +563,13 @@ export async function secureUpdatePlayerRegistration(playerData, parentProfileId
 
         // 2. Fetch the true database record to check ownership
         const existingPlayer = await wixData.get("SignolPlayers", playerData._id, { suppressAuth: true });
-        
+
         if (!existingPlayer || existingPlayer.primaryParentId !== parentProfileId) {
              throw new Error("Security Block: Unauthorized access to this player.");
+        }
+
+        if (!existingPlayer.sp_membership_no) {
+            playerData.sp_membership_no = await generateUniqueMembershipNumber();
         }
 
         // 3. If ownership matches, perform the secure update
@@ -216,5 +579,232 @@ export async function secureUpdatePlayerRegistration(playerData, parentProfileId
     } catch (error) {
         console.error("Secure Update Error:", error);
         return { success: false, error: error.message };
+    }
+}
+
+// Server-side dashboard fetch — replaces a client-side wixData.query so we can
+// redact the primary parent's own DOB/address before the data ever reaches a
+// secondary-parent viewer's browser. Doing this client-side wouldn't actually hide
+// anything: the full record would already be sitting in the network response by the
+// time any JS ran, visible via dev tools regardless of what got bound to the UI.
+export async function getKidsForParent(parentProfileId) {
+    try {
+        const member = await currentMember.getMember();
+        if (!member) throw new Error("Security Block: Not logged in.");
+
+        const primaryQuery = wixData.query("SignolPlayers").eq("primaryParentId", parentProfileId);
+        const secondaryQuery = wixData.query("SignolPlayers").eq("secondaryParentId", parentProfileId);
+
+        const results = await primaryQuery.or(secondaryQuery)
+            .include("SP_team", "ageGroup")
+            .find({ suppressAuth: true });
+
+        const kids = results.items.map(kid => {
+            const primaryId = kid.primaryParentId ? (kid.primaryParentId._id || kid.primaryParentId) : "";
+            if (primaryId !== parentProfileId) {
+                delete kid.sp_parent_dob;
+                delete kid.sp_parent_address;
+            }
+            return kid;
+        });
+
+        return { success: true, data: kids };
+    } catch (error) {
+        console.error("getKidsForParent Error:", error);
+        return { success: false, error: error.message };
+    }
+}
+
+// =====================================================================
+//  SECRETARY PLAYER ADMIN — send-back, parent notifications, fees
+//  Added 2026-06-30. Used by the PlayerRecord lightbox.
+// =====================================================================
+
+// ⚠️ SETUP: create a ClubDictionary "Action Required" status in the CMS, then paste
+//    its _id here AND in Player Admin.js / Player Record.js / Parent Hub.js / Manager Hub.js.
+const ACTION_REQUIRED_ID = "d5bd1c0f-e19e-4318-a8d3-d5d6fe63b274";
+const READY_FOR_FA_ID    = "95978c83-70fc-4bd7-bd75-12f43216a0d7";
+
+// Parent notifications are queued into the ParentNotifications collection (a Wix
+// Automation emails from it). When the push-notification app is built, flip this to
+// false — notifyParent then no-ops the email and the in-hub alert/note still shows.
+const NOTIFY_EMAIL_ENABLED = true;
+
+// Fee instalment calendar: 10 monthly payments, July → April (JS month indexes).
+const FEE_PAYMENT_MONTHS = [6, 7, 8, 9, 10, 11, 0, 1, 2, 3];
+
+// Single swappable notification point. kind = "sent_back" | "fee_schedule".
+export async function notifyParent(playerId, kind, payload = {}) {
+    try {
+        const player = await wixData.get("SignolPlayers", playerId, { suppressAuth: true });
+        if (!player) return { success: false, error: "Player not found" };
+        if (!NOTIFY_EMAIL_ENABLED) return { success: true, skipped: true };
+        if (!player.parentEmail) return { success: false, error: "No parent email on file" };
+
+        await wixData.insert("ParentNotifications", {
+            player: playerId,
+            parentEmail: player.parentEmail,
+            parentName: player.parentsName,
+            childName: player.SP_firstName,
+            notifyType: kind,
+            notifyMessage: payload.message || "",
+            sentStatus: "queued"
+        }, { suppressAuth: true });
+        return { success: true };
+    } catch (err) {
+        console.error("notifyParent error:", err);
+        return { success: false, error: err.message };
+    }
+}
+
+// Secretary bounces a registration back for the parent to fix (bad photo/doc, etc.).
+// Sets Action Required + the note, then notifies. The parent's existing registration
+// form reopens because Parent Hub treats Action Required as an editable status, and on
+// resubmit it returns to Ready for FA — back in the secretary's FA queue.
+export async function secretarySendBackToParent(playerId, note) {
+    try {
+        const rec = await wixData.get("SignolPlayers", playerId, { suppressAuth: true });
+        if (!rec) return { success: false, error: "Player not found" };
+        rec.SP_status = ACTION_REQUIRED_ID;
+        rec.sp_return_note = note || "";
+        await wixData.update("SignolPlayers", rec, { suppressAuth: true });
+        await notifyParent(playerId, "sent_back", {
+            message: note || "Your child's registration needs a small update — please log in to your Parent Hub to fix it."
+        });
+        return { success: true };
+    } catch (err) {
+        console.error("secretarySendBackToParent error:", err);
+        return { success: false, error: err.message };
+    }
+}
+
+// Bulk "season rollover": move a whole team or age group of ACTIVE players into
+// Renewal Due, which reopens the registration form for their parents. Resets each
+// player's progress to 0 so the secretary's Renewal queue tracks the fresh form
+// from scratch. Pass a teamId or an ageGroupId (or both to narrow further).
+export async function bulkSetRenewal(teamId, ageGroupId) {
+    try {
+        const RENEWAL_ID = "4d354c43-c893-4bc8-8415-18cfc32b3236";
+        const ACTIVE_ID  = "705c0b66-d5d5-47b6-b828-98a94c670f1f";
+        if (!teamId && !ageGroupId) return { success: false, error: "Pick a team or age group" };
+
+        // Only Active players renew — players still mid-onboarding are left alone.
+        let query = wixData.query("SignolPlayers").eq("SP_status", ACTIVE_ID).limit(1000);
+        if (teamId) query = query.eq("SP_team", teamId);
+        if (ageGroupId) query = query.eq("ageGroup", ageGroupId);
+
+        const res = await query.find({ suppressAuth: true });
+        if (!res.items.length) return { success: true, count: 0 };
+
+        await Promise.all(res.items.map(p => {
+            p.SP_status = RENEWAL_ID;
+            p.registrationProgress = 0;
+            return wixData.update("SignolPlayers", p, { suppressAuth: true });
+        }));
+
+        return { success: true, count: res.items.length };
+    } catch (err) {
+        console.error("bulkSetRenewal error:", err);
+        return { success: false, error: err.message };
+    }
+}
+
+// Counts how many Active players a renewal selection would affect, for a
+// confirm-before-you-click preview in the dashboard.
+export async function countRenewalTargets(teamId, ageGroupId) {
+    try {
+        const ACTIVE_ID = "705c0b66-d5d5-47b6-b828-98a94c670f1f";
+        if (!teamId && !ageGroupId) return { success: true, count: 0 };
+        let query = wixData.query("SignolPlayers").eq("SP_status", ACTIVE_ID);
+        if (teamId) query = query.eq("SP_team", teamId);
+        if (ageGroupId) query = query.eq("ageGroup", ageGroupId);
+        const count = await query.count({ suppressAuth: true });
+        return { success: true, count };
+    } catch (err) {
+        console.error("countRenewalTargets error:", err);
+        return { success: false, error: err.message };
+    }
+}
+
+// Pure pro-rata schedule: every player pays the same monthly amount
+// (annual / 10); late joiners simply get fewer instalments.
+function buildFeeSchedule(registrationDate, annualAmount) {
+    const reg = registrationDate ? new Date(registrationDate) : new Date();
+    const perPayment = Math.round((Number(annualAmount) / FEE_PAYMENT_MONTHS.length) * 100) / 100;
+
+    let startIdx = FEE_PAYMENT_MONTHS.indexOf(reg.getMonth());
+    if (startIdx === -1) startIdx = 0; // off-season (May/Jun) joiner → full season from July
+    const months = FEE_PAYMENT_MONTHS.slice(startIdx);
+
+    // Season spans two calendar years (Jul Y → Apr Y+1).
+    const seasonStartYear = reg.getMonth() >= 6 ? reg.getFullYear() : reg.getFullYear() - 1;
+    const schedule = months.map(m => ({
+        date: new Date(m >= 6 ? seasonStartYear : seasonStartYear + 1, m, 1),
+        amount: perPayment
+    }));
+
+    return {
+        perPayment,
+        count: schedule.length,
+        total: Math.round(perPayment * schedule.length * 100) / 100,
+        firstDate: schedule.length ? schedule[0].date : null,
+        schedule
+    };
+}
+
+// Preview the schedule for a tier without saving anything (drives the lightbox preview).
+export async function getFeeSchedule(playerId, feeCategoryId) {
+    try {
+        if (!feeCategoryId) return { success: false, error: "No fee category selected" };
+        const [player, cat] = await Promise.all([
+            wixData.get("SignolPlayers", playerId, { suppressAuth: true }),
+            wixData.get("FeeCategories", feeCategoryId, { suppressAuth: true })
+        ]);
+        if (!player || !cat) return { success: false, error: "Missing player or fee category" };
+        const annual = Number(cat.F_annual_amount) || 0;
+        return { success: true, label: cat.F_label, annualAmount: annual, ...buildFeeSchedule(player.registrationDate, annual) };
+    } catch (err) {
+        console.error("getFeeSchedule error:", err);
+        return { success: false, error: err.message };
+    }
+}
+
+// Save the chosen tier on the player, and optionally send the schedule to the parent.
+export async function secretarySetFeeCategory(playerId, feeCategoryId, sendToParent) {
+    try {
+        if (!feeCategoryId) return { success: false, error: "No fee category selected" };
+
+        const [player, cat] = await Promise.all([
+            wixData.get("SignolPlayers", playerId, { suppressAuth: true }),
+            wixData.get("FeeCategories", feeCategoryId, { suppressAuth: true })
+        ]);
+        if (!player || !cat) return { success: false, error: "Missing player or fee category" };
+
+        const annual = Number(cat.F_annual_amount) || 0;
+        const schedule = buildFeeSchedule(player.registrationDate, annual);
+
+        player.sp_fee_category = feeCategoryId; // single-reference field set by id
+        if (sendToParent) {
+            // Store a clean YYYY-MM-DD date string (matches the taster/reg date pattern)
+            // instead of a full `new Date()` timestamp, so the CMS shows a tidy date.
+            const now = new Date();
+            player.sp_paymentschedulesentdate =
+                `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+        }
+        await wixData.update("SignolPlayers", player, { suppressAuth: true });
+
+        if (sendToParent) {
+            const lines = schedule.schedule
+                .map(s => `£${s.amount.toFixed(2)} on ${new Date(s.date).toLocaleDateString('en-GB')}`)
+                .join("; ");
+            await notifyParent(playerId, "fee_schedule", {
+                message: `${cat.F_label}: ${schedule.count} payment(s) of £${schedule.perPayment.toFixed(2)} (total £${schedule.total.toFixed(2)}). Schedule — ${lines}. Payments are collected by monthly Direct Debit.`
+            });
+        }
+
+        return { success: true, label: cat.F_label, annualAmount: annual, ...schedule };
+    } catch (err) {
+        console.error("secretarySetFeeCategory error:", err);
+        return { success: false, error: err.message };
     }
 }

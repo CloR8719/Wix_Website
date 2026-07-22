@@ -58,6 +58,22 @@ Fields:
 - SP_hasMedical (BOOLEAN)
 - registrationLink (TEXT)
 - kitNumber (NUMBER)
+- sp_return_note (TEXT)                 [NEW 2026-06-30: secretary's note when a registration is sent back]
+- sp_fee_category (REFERENCE)           [NEW 2026-06-30: → FeeCategories, the player's fee tier]
+- sp_paymentschedulesentdate (DATE)     [NEW 2026-06-30: when the schedule was last sent to the parent]
+- sp_parent_dob (DATE)                  [NEW 2026-07-22: primary parent/guardian DOB, WGS requirement]
+- sp_secparent_dob (DATE)               [NEW 2026-07-22: secondary parent/guardian DOB]
+- sp_parent_address (ADDRESS)           [NEW 2026-07-22: primary parent address, blank = same as player's]
+- sp_secparent_address (ADDRESS)        [NEW 2026-07-22: secondary parent address, blank = same]
+- sp_membership_no (TEXT)               [NEW 2026-07-22: server-generated club membership number / Standing Order payment reference — independent of SP_fanNumber, every player gets one incl. training-only]
+- sp_consent_photo (BOOLEAN)            [NEW 2026-07-22: website photo-use consent — optional]
+- sp_consent_fa (BOOLEAN)               [NEW 2026-07-22: FA/Whole Game System data-sharing consent — mandatory, gates final submit]
+- sp_consent_medical (BOOLEAN)          [NEW 2026-07-22: emergency medical treatment consent — mandatory, gates final submit]
+- sp_has_sibling (BOOLEAN)              [NEW 2026-07-22: has a sibling already registered at the club — feeds sibling-discount fee category]
+- sp_sibling_team (REFERENCE → Teams)   [NEW 2026-07-22: which team the sibling plays for]
+- sp_gender (REFERENCE → ClubDictionary) [NEW 2026-07-22: player gender, category="gender" — WGS registration requirement, Male/Female only (drives team/league eligibility, not a general demographic field)]
+  (existing `socialMedia` (BOOLEAN) field is reused for the social-media consent radio — no new field needed for that one)
+  (⚠️ actual CMS field keys are lowercase as shown — code matches these, not the SP_camelCase form)
 
 
 Collection: Parent Profiles
@@ -73,6 +89,9 @@ Fields:
 - PP_email (EMAIL)
 - memberId (TEXT)
 - PP_role (REFERENCE)
+- PP_linkAttempts (NUMBER) - failed Fan Number/DOB lookup attempts (server-side
+  cap, see linkByFanNumberAndDob in registration.jsw). Resets to 0 on a
+  successful link. Leave blank/0 for existing rows.
 
 Collection: Signol Staff
 Collection ID: SignolStaff
@@ -323,3 +342,60 @@ Fields:
 - TS_goalsFor (NUMBER)
 - TS_goalsAgainst (NUMBER)
 - seasonLabel (TEXT)
+
+
+=====================================================================
+ NEW 2026-06-30 — Secretary Player Admin: send-back + fees
+=====================================================================
+
+ClubDictionary — ADD ONE STATUS ROW (manual):
+  Add a new row in the SAME category as the existing player statuses
+  (the ones whose _id values back SP_status — Enquiry, Ready for FA, etc.),
+  label = "Action Required". Then copy its _id and paste it in place of
+  REPLACE_WITH_ACTION_REQUIRED_GUID in:
+    backend/registration.jsw, frontend/dashboard_pages/Player Admin.js,
+    frontend/additional_pages/Player Record.js,
+    frontend/members_pages/Parent Hub.js, frontend/members_pages/Manager Hub.js
+
+  DONE 2026-07-01 — the created row's _id is:
+    d5bd1c0f-e19e-4318-a8d3-d5d6fe63b274
+  Already filled into all 5 files above. Reuse this value in any future code.
+
+
+Collection: Fee Categories
+Collection ID: FeeCategories
+-----------------------------
+Fields:
+- _id (TEXT)
+- _createdDate (DATETIME)
+- _updatedDate (DATETIME)
+- _owner (TEXT)
+- F_label (TEXT)            [e.g. "Playing & Training", "Training Only + Sibling Discount"]
+- F_code (TEXT)             [optional short code]
+- F_annual_amount (NUMBER)  [full-season annual fee; monthly = annual / 10]  (field key is lowercase-with-underscores as built in the CMS)
+
+  Seed 6 rows: Training Only · Training Only + Sibling Discount ·
+  Playing & Training · Playing & Training + Sibling Discount ·
+  Playing & Training + Coach/Manager Discount A ·
+  Playing & Training + Coach/Manager Discount B.
+
+
+Collection: Parent Notifications
+Collection ID: ParentNotifications
+-----------------------------
+Fields:
+- _id (TEXT)
+- _createdDate (DATETIME)
+- _updatedDate (DATETIME)
+- _owner (TEXT)
+- player (REFERENCE)        [→ SignolPlayers]
+- parentEmail (EMAIL)
+- parentName (TEXT)
+- childName (TEXT)
+- notifyType (TEXT)         [ "sent_back" | "fee_schedule" ]
+- notifyMessage (TEXT)
+- sentStatus (TEXT)         [ "queued" → set by the email Automation ]
+
+  A Wix Automation should watch this collection and email the parent
+  (one template per notifyType). Kept separate from EmailQueue so the
+  existing registration-link automation is untouched.
