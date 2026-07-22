@@ -32,7 +32,7 @@ editor (before any code runs).
 | 2a | `#txtTeamName` | Text (in repeater) | Team name | None |
 | 2b | `#txtSquadCount` | Text (in repeater) | "Squad: X" | None |
 | 2c | `#txtPipelineCount` | Text (in repeater) | "Enquiries: X \| Trials: X" | None |
-| 2d | `#txtActionAlert` | Text (in repeater) | "⚠️ X player(s) need action - tap to review onboarding" — clickable, opens `stateSquad` for that team | Collapsed |
+| 2d | `#txtActionAlert` | Text (in repeater) | "⚠️ X registration form(s)/renewal(s) still with parent(s) - tap to follow up" — clickable, opens `stateSquad` for that team. Counts statuses where the manager may need to chase a parent (Invited, In Progress, Renewal) | Collapsed |
 | 2e | `#btnManageSquad` | Button (in repeater) | Opens Squad state for that team | None |
 | 3 | `#btnNavSquad` | Button | Nav → Squad state | None |
 | 4 | `#btnNavTeamProfile` | Button | Nav → Team Profile state | None |
@@ -88,18 +88,8 @@ editor (before any code runs).
 | 8 | `#return` | Button | Return to enquiry pool | None |
 | 9 | `#left` | Button | Archive (2-step confirm) | None |
 
-### Invite Modal (`#inviteModal`)
-
-| # | Element ID | Type | Purpose | Initial State |
-|---|-----------|------|---------|----------------|
-| 1 | `#reviewPlayerName` | Text | Player name being invited | None |
-| 2 | `#reviewParentName` | Text | Parent name | None |
-| 3 | `#reviewParentEmail` | Text | Parent email | None |
-| 4 | `#tasterDate` | Date Picker | First taster session date | None |
-| 5 | `#regDate` | Date Picker | Registration date | None |
-| 6 | `#regPlayertype` | Dropdown | Playing vs Training-only | None |
-| 7 | `#btnCancelInvite` | Button | Cancel/close modal | None |
-| 8 | `#btnSendInvite` | Button | Save + send registration link | None |
+> `#invite` opens the `InviteRegistration` Lightbox (see [Lightboxes](#lightboxes)) —
+> it is no longer a same-page modal.
 
 ### Active Squad (`#boxSquadList`)
 
@@ -111,42 +101,13 @@ editor (before any code runs).
 | 4 | `#filterOnboarding` | Text | "Onboarding: X" count | None |
 | 5 | `#repeaterSquad` | Repeater | One row per squad player | Visible |
 | 5a | `#rowFirstName` | Text (in repeater) | Player first name | None |
-| 5b | `#rowParentName` | Text (in repeater) | Parent name | None |
-| 5c | `#rowParentMobile` | Text (in repeater) | Parent mobile | None |
-| 5c-1 | `#kitnumDisplay` | Text (in repeater) | Kit number, "#X" or "-" if unset | None |
+| 5b | `#rowLastName` | Text (in repeater) | Player last name | None |
+| 5c | `#kitnumDisplay` | Text (in repeater) | Kit number, "#X" or "-" if unset | None |
 | 5d | `#rowMedicalBadge` | Text/Badge | "Clear" / "ALERT" | None |
 | 5e | `#rowTrainingBadge` | Text/Badge | "Playing" / "Training Only" | None |
 | 5f | `#rowStatusBadge` | Text/Badge | Onboarding/Active status | None |
-| 5f-1 | `#rowNextStep` | Text (in repeater) | Onboarding "Action: ..." guidance for this player | Collapsed |
-| 5g | `#btnOpenProfile` | Button (in repeater) | Opens player profile modal | None |
-
-### Player Profile Modal (`#playerProfileModal`)
-
-| # | Element ID | Type | Purpose | Initial State |
-|---|-----------|------|---------|----------------|
-| 0 | `#playerProfileModal` | Container/Lightbox | The modal itself | Collapsed |
-| 1 | `#detailFirstName` | Text | First name | None |
-| 2 | `#detailLastName` | Text | Last name | None |
-| 3 | `#detailFAN` | Text | FA number / "Pending" | None |
-| 4 | `#detailDOB` | Text | Date of birth | None |
-| 5 | `#detailParentName` | Text | Parent name | None |
-| 6 | `#detailParentMobile` | Text | Parent mobile | None |
-| 7 | `#detailParentEmail` | Text | Parent email | None |
-| 8 | `#detailParentRelation` | Text | Relationship to player | None |
-| 9 | `#detailEmergencyName` | Text | Emergency contact name | None |
-| 10 | `#detailEmergencyMobile` | Text | Emergency contact mobile | None |
-| 11 | `#detailEmergencyRelation` | Text | Emergency contact relation | None |
-| 12 | `#detailMedicalBox` | Text | Medical info (HTML stripped) | None |
-| 13 | `#detailSocialMedia` | Text | Consent given/declined | None |
-| 14 | `#detailPlayertype` | Text | Playing / Training Only | None |
-| 15 | `#detailStatusDisplay` | Text | Current status label | None |
-| 15a | `#detailRegProgress` | Text | "Registration: X% complete" — hidden once player is Active | Collapsed |
-| 15b | `#inputKitNumber` | Number Input | Squad kit number (`kitNumber` field) | None |
-| 15c | `#btnSaveKit` | Button | Save kit number | None |
-| 16 | `#dropdownLeaveReason` | Dropdown | Leave reason (on archive) | Collapsed |
-| 17 | `#datePickerLeave` | Date Picker | Leaving date (on archive) | Collapsed |
-| 18 | `#btnMakeLeaver` | Button | 2-step archive confirm | None |
-| 19 | `#btnCloseProfile` | Button | Close modal | None |
+| 5f-1 | `#rowNextStep` | Text (in repeater) | Action-first onboarding guidance — "⚠️ ..." if the manager needs to do something (chase/nudge parent), "ℹ️ ..." if it's just FYI (with club secretary, etc). Collapsed entirely once Active | Collapsed |
+| 5g | `#btnOpenProfile` | Button (in repeater) | Opens the `PlayerProfile` Lightbox (see [Lightboxes](#lightboxes)) | None |
 
 ## State: stateTeamProfile
 
@@ -208,8 +169,19 @@ editor (before any code runs).
 | 2 | `#typeDropdown` | Dropdown | News type | None |
 | 3 | `#teamDropdown` | Dropdown | Related team | None |
 | 4 | `#headlineInput` | Text Input | Headline | None |
-| 5 | `#articleBodyInput` | Text Input/Rich Text | Article body | None |
-| 6 | `#btnAddNews` | Button | Submit news item | None |
+| 5 | `#articleBodyInput` | Text Input/Rich Text | Article body (HTML) | None |
+| 6 | `#uploadNewsImage` | Upload Button | Featured image → `ClubNews.featuredImage` + blog cover | None |
+| 7 | `#btnAddNews` | Button | Submit news → saves CMS row **and** auto-publishes a Wix Blog post | None |
+
+**Auto-publish flow:** on submit, `Manager Hub.js` uploads the image, inserts the `ClubNews` row (`posted:false`), calls `backend/blog.jsw → createBlogPost()` which publishes a live Wix Blog post, then patches the row (`posted:true`, `blogPostId`). Article body HTML is converted to Ricos rich content in the backend.
+
+**Dependencies:** `backend/blog.jsw` uses the **Wix Blog SDK**. Install these npm packages via the Velo **Packages & Apps** panel: `@wix/blog` (create/publish) and `@wix/essentials` (`auth.elevate`). The classic `wix-blog-backend` module is read-only (no `createDraftPost`), so the SDK is required.
+
+**Cover image:** two separate Blog fields, both fed the native **`wix:image://v1/<id>/<name>` URI** (exactly as the upload button returns it):
+- `heroImage` (string) → image at the top of the post page.
+- `media` (`{ wixMedia: { image: <uri> }, displayed: true, custom: true }`) → the thumbnail on the blog **feed / preview cards**.
+
+`blog.jsw` passes `featuredImage` through untouched to both, with a staged fallback (both → heroImage only → none) so a picky `media` never costs the working `heroImage`. (Dead ends: `media.wixMedia.image` as `{id}` → "Invalid URL"; `heroImage` object → type error; bare media id → "Invalid URL"; https URL → "Media image not found"; `importFile` → 400 on already-hosted media.) If Wix rejects a field, the post still publishes (image is always safe on the CMS row).
 
 ## State: stateStats
 
@@ -313,6 +285,114 @@ Formerly the "Edit Records" sub-tab. Reached via `#btnNavStatsEdit` on `stateSta
 | 4b-3 | `#poeditphoto` | Upload Button | New photo | None |
 | 4b-4 | `#imgPrev` | Image | Photo preview | None |
 | 4b-5 | `#poeditSave` | Button | Save edits | None |
+
+## Lightboxes
+
+These are separate Wix Editor objects (own code file under
+`frontend/additional_pages/`, own element namespace) — **not** part of `#stateboxHub`
+and not accessed via Manager Hub's `$w()`. They're opened with
+`wixWindow.openLightbox(name, context)` and return data via
+`wixWindow.lightbox.close(data)`. Converted from same-page collapse/expand containers
+so they render centered in the viewport regardless of scroll position (fixes the
+"modal appears far down a long mobile squad list" issue).
+
+### `InviteRegistration` (opened from `#invite` on a Trials row)
+
+Code: `frontend/additional_pages/Invite Registration.js`. Context in:
+`{firstName, lastName, parentName, parentEmail}`. Returns:
+`{tasterDate, regDate, playerType}` (or nothing if cancelled).
+
+| # | Element ID | Type | Purpose | Initial State |
+|---|-----------|------|---------|----------------|
+| 1 | `#reviewPlayerName` | Text | Player name being invited | None |
+| 2 | `#reviewParentName` | Text | Parent name | None |
+| 3 | `#reviewParentEmail` | Text | Parent email | None |
+| 4 | `#tasterDate` | Date Picker | First taster session date | None |
+| 5 | `#regDate` | Date Picker | Registration date | None |
+| 6 | `#regPlayertype` | Dropdown | Playing vs Training-only | None |
+| 7 | `#btnCancelInvite` | Button | Cancel — closes with no data | None |
+| 8 | `#btnSendInvite` | Button | Validates fields, closes with form data | None |
+
+### `PlayerProfile` (opened from `#btnOpenProfile` on a Squad row)
+
+Code: `frontend/additional_pages/Player Profile.js`. Context in:
+`{ player: itemData, defaultSeason: statsSelectedSeason }` — **kept as two separate
+keys, not spread together**, because anything mixed into the same object as the
+player record gets sent straight to `wixData.update("SignolPlayers", ...)` on every
+kit/archive save; an earlier version spread `defaultSeason` directly onto the player
+object and it silently became a real "defaultSeason" column on the collection (Wix
+auto-creates columns for unrecognized fields passed to `update`/`insert`). Stats-panel
+season changes and kit-number save are handled inside the Lightbox without closing it.
+Closes with `{kitNumber}` on explicit close (so Manager Hub can patch the row directly
+instead of re-querying, which can race Wix's eventual-consistency lag right after a
+write), or `{archived: true}` after Make a Leaver succeeds (triggers a full
+`loadSquadList()` refresh since the player leaves the list entirely).
+
+Shows 3 of the 4 Parent Hub consents (social, website photo, medical) plus the club
+membership number — **deliberately excludes FA/Whole Game System consent**, since a
+player can't reach any manager-visible status without that already being "Yes" (it's
+a hard gate on `#btnSubmitFinal` in Parent Hub), so there's nothing informative to
+show a manager there.
+
+| # | Element ID | Type | Purpose | Initial State |
+|---|-----------|------|---------|----------------|
+| 0a | `#DDHeadshot` | Image | Player headshot (`SP_idPhoto`), falls back to the same placeholder image Parent Hub uses; `alt` set to the player's first name (or blank) so the browser tooltip isn't the underlying file name | None |
+| 1 | `#detailFirstName` | Text | First name | None |
+| 2 | `#detailLastName` | Text | Last name | None |
+| 3 | `#detailFAN` | Text | FA number / "Pending" | None |
+| 4 | `#detailDOB` | Text | Date of birth | None |
+| 5 | `#detailParentName` | Text | Parent name | None |
+| 6 | `#detailParentMobile` | Text | Parent mobile | None |
+| 7 | `#detailParentEmail` | Text | Parent email | None |
+| 8 | `#detailParentRelation` | Text | Relationship to player | None |
+| 9 | `#detailEmergencyName` | Text | Emergency contact name | None |
+| 10 | `#detailEmergencyMobile` | Text | Emergency contact mobile | None |
+| 11 | `#detailEmergencyRelation` | Text | Emergency contact relation | None |
+| 12 | `#detailMedicalBox` | Text | Medical info (HTML stripped) | None |
+| 13 | `#detailSocialMedia` | Text | Social media photo consent — "Consent Given" / "Declined" / "Not Yet Provided" (tri-state, not a plain boolean check) | None |
+| 13a | `#detailWebsiteConsent` | Text | Website photo consent (`sp_consent_photo`) — same tri-state display | None |
+| 13b | `#detailMedicalConsent` | Text | Emergency medical treatment consent (`sp_consent_medical`) — same tri-state display | None |
+| 13c | `#detailMembershipNo` | Text | Club membership number (`sp_membership_no`) / "Not yet assigned" | None |
+| 14 | `#detailPlayertype` | Text | Playing / Training Only | None |
+| 15 | `#detailStatusDisplay` | Text | Current status label | None |
+| 15a | `#detailRegProgress` | Text | "Registration: X% complete" — hidden once player is Active | Collapsed |
+| 15b | `#inputKitNumber` | Number Input | Squad kit number (`kitNumber` field) | None |
+| 15c | `#btnSaveKit` | Button | Save kit number (doesn't close the Lightbox) | None |
+| 16 | `#dropdownLeaveReason` | Dropdown | Leave reason (on archive) | Collapsed |
+| 17 | `#datePickerLeave` | Date Picker | Leaving date (on archive) | Collapsed |
+| 18 | `#btnMakeLeaver` | Button | 2-step archive confirm — closes Lightbox on success | None |
+| 19 | `#btnCloseProfile` | Button | Close Lightbox | None |
+| 20 | `#DDSquadSeason` | Dropdown | Season filter for the stats panel below (options from `ClubDictionary` category="season") | None |
+| 21 | `#SquadGoals` | Text | Goals for selected season | None |
+| 22 | `#SquadAssist` | Text | Assists for selected season | None |
+| 23 | `#SquadTackle` | Text | Tackles for selected season | None |
+| 24 | `#SquadSave` | Text | Saves for selected season | None |
+| 25 | `#SquadPotm` | Text | Player of the Match count for selected season | None |
+
+> Stats are matched on `playerReference` + `seasonLabel` (text), not the `season`
+> reference field — Manager Hub's Stats Add forms only ever write `seasonLabel`, so
+> filtering on `season` would always show zero.
+
+## Onboarding Status Pipeline (`SP_status`, player_status dictionary)
+
+| Status | Meaning | Manager action? |
+|---|---|---|
+| 1 - Enquiry | Initial enquiry, not yet progressed | Handled in Enquiries pipeline, not the squad list |
+| 2 - Trial | Player invited to a trial | Handled in Trials pipeline, not the squad list |
+| 3 - Invited | Parent is filling in the registration form | Yes — follow up with parent if it's been a while |
+| 9 - In Progress | Parent has completed all fields but hasn't pressed submit | Yes — nudge parent to press submit |
+| 4 - Ready for FA | With the club secretary for FA registration | No — informational only |
+| 5 - FA Complete | FA clearance done, final club checks before going live | No — informational only |
+| 6 - Active | Live with the club | No — fully onboarded |
+| 7 - Left | Left the club | Excluded from squad list |
+| 8 - Renewal | Annual renewal form is with the parent | Yes — follow up with parent if it's been a while |
+| Action Required | Club secretary sent the registration back to the parent to fix (bad photo/doc) | Informational — badge "Sent Back to Parent" (red), `#rowNextStep` notes it's with the parent |
+
+"Invited", "In Progress", and "Renewal" count toward the dashboard's `actionNeeded`/
+`#txtActionAlert`, since those are the statuses where the manager may need to chase the
+parent. "Ready for FA" and "FA Complete" show an informational message on `#rowNextStep`
+so the manager can see where a player is in the pipeline without it being flagged as
+something they need to act on.
 
 ## Data Model Notes
 
