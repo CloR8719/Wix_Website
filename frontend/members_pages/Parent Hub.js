@@ -7,6 +7,7 @@
     import { hubEmailSweep, secureUpdatePlayerRegistration, secureUpdateParentProfile, findPlayerByFanNumberAndDob, confirmPlayerLink, getKidsForParent } from 'backend/registration.jsw';
     import { getTeamManager } from 'backend/staffData.jsw';
     import wixWindow from 'wix-window';
+    import { setProgressBarVisible, setProgressBarText, getSaveDraftRequestId, setSaveDraftResult } from 'public/parentHubProgressBar.js';
     let currentPlayerId = "";
     let currentTeamId = "";
 
@@ -23,8 +24,22 @@
     // ⚠️ SETUP: paste the ClubDictionary "Action Required" _id here (same GUID as backend).
     const ACTION_REQUIRED_ID = "d5bd1c0f-e19e-4318-a8d3-d5d6fe63b274";
 
+    // Emergency contact source (#regemergencysource) — "new" is the default so an
+    // existing draft's independently-entered contact is never silently overwritten.
+    const EMERG_SOURCE_PARENT1 = "parent1";
+    const EMERG_SOURCE_PARENT2 = "parent2";
+    const EMERG_SOURCE_NEW = "new";
+
+    // Mandatory-field highlight colors for the always-visible submit button flow.
+    const FIELD_BORDER_INVALID = "#FF4D4D";
+    const FIELD_BORDER_DEFAULT = "#E0E0E0";
+
     let activePlayerContext = null;
     let currentParentProfileId = null;
+    // Mirrors calculateProgress()'s last result - mapUItoPlayer reads this instead of
+    // #textProgress's on-page text, since that element now lives in the header and
+    // can't be $w-selected from this file (see public/parentHubProgressBar.js).
+    let lastCalculatedPercentage = 0;
 
     // ==========================================
     // INITIALIZATION & EVENT LISTENERS
@@ -192,6 +207,7 @@
 
                 activePlayerContext = null;
                 $w("#stateboxHub").changeState("stateDashboard");
+                setProgressBarVisible(false);
 
                 // Reset the back button for next time
                 $w("#btnBackToHubReg").label = "< Back to Dashboard";
@@ -211,7 +227,21 @@
                 } else {
                     $w("#regsecparentname, #regsecparentmobile, #regsecparentemail, #regsecparentrelation, #regsecparentdob, #regsecparentaddress, #b1, #b2, #b3, #b4, #b6, #b7").collapse();
                     $w("#regsecparentname, #regsecparentmobile, #regsecparentemail, #regsecparentrelation, #regsecparentdob, #regsecparentaddress").value = null;
+
+                    // Parent 2 just disappeared - if that was the selected emergency
+                    // contact source, fall back to "New" rather than leaving stale
+                    // Parent 2 details sitting in the (now hidden) contact fields.
+                    if ($w("#regemergencysource").value === EMERG_SOURCE_PARENT2) {
+                        $w("#regemergencysource").value = EMERG_SOURCE_NEW;
+                        applyEmergencySource(EMERG_SOURCE_NEW);
+                    }
                 }
+                refreshEmergencySourceOptions();
+                calculateProgress();
+            });
+
+            $w("#regemergencysource").onChange(() => {
+                applyEmergencySource($w("#regemergencysource").value);
                 calculateProgress();
             });
 
@@ -240,26 +270,25 @@
                 } else {
                     $w("#inputSignature").collapse();
                     $w("#inputSignature").value = "";
-                    $w("#btnSubmitFinal").collapse();
                 }
             });
 
-            $w("#inputSignature").onChange(() => {
-                if ($w("#inputSignature").value.length > 2) {
-                    $w("#btnSubmitFinal").expand();
-                } else {
-                    $w("#btnSubmitFinal").collapse();
-                }
-            });
+            // #btnSubmitFinal is always visible (see validateRequiredFields/its
+            // onClick handler) — this no longer needs to expand/collapse it, the
+            // signature length check is enforced there instead.
 
-            $w("TextInput, Dropdown, RadioGroup, Checkbox, DatePicker, RichTextBox, UploadButton").onChange(() => {
+            $w("TextInput, Dropdown, RadioGroup, Checkbox, DatePicker, RichTextBox, UploadButton").onChange((event) => {
                 calculateProgress();
+                clearFieldHighlight(event.target);
             });
 
             // AddressInput isn't covered by the type selector above, so its changes
             // wouldn't recount progress — the form would stall one field short (e.g.
             // 95%) until another field fired a recalc. Wire it explicitly.
-            $w("#regAddress").onChange(() => calculateProgress());
+            $w("#regAddress").onChange(() => {
+                calculateProgress();
+                clearFieldHighlight($w("#regAddress"));
+            });
 
             // Consent Lightbox — #regconsent* radios are read-only mirrors, only
             // ever set from this Lightbox's close data. Programmatic .value sets
@@ -479,6 +508,7 @@
 
                     await loadRegistrationForm(activePlayerContext);
                     $w("#stateboxHub").changeState("stateRegistration");
+                    setProgressBarVisible(true);
                 } else {
                     // Every other status opens the Read-Only Profile View
                     loadProfileForm(activePlayerContext);
@@ -616,6 +646,15 @@
             $w("#regsecparentname, #regsecparentmobile, #regsecparentemail, #regsecparentrelation, #regsecparentdob, #regsecparentaddress").collapse();
         }
 
+        // Emergency contact source - rebuild Parent 1/2 options against whichever
+        // parents are on the form now, then re-apply so Parent 1/2 auto-fill always
+        // reflects their CURRENT details rather than what was saved last time.
+        // Defaults to "New" for any draft saved before this feature existed, so an
+        // already-typed independent contact is never silently overwritten.
+        refreshEmergencySourceOptions();
+        $w("#regemergencysource").value = player.sp_emerg_source || EMERG_SOURCE_NEW;
+        applyEmergencySource($w("#regemergencysource").value);
+
         if (player.SP_idPhoto) {
             $w("#regheadshot").buttonLabel = "Photo Saved ✓";
         } else {
@@ -633,7 +672,8 @@
 
         $w("#chkConfirm").collapse();
         $w("#inputSignature").collapse();
-        $w("#btnSubmitFinal").collapse();
+        $w("#btnSubmitFinal").expand();
+        $w("#txtValidationMsg").collapse();
 
         calculateProgress();
     }
@@ -712,6 +752,116 @@
         }
     }
 
+    // Rebuilds #regemergencysource's options from the parents currently on the
+    // form. Parent 1 is always an option (a primary parent always exists); Parent 2
+    // only appears while #regadd2parents is "Yes", so it can never be picked for a
+    // family that doesn't have one.
+    function refreshEmergencySourceOptions() {
+        const options = [
+            { label: `Parent 1 (${$w("#regparentname").text || "Parent 1"})`, value: EMERG_SOURCE_PARENT1 }
+        ];
+
+        if ($w("#regadd2parents").value === "Yes") {
+            options.push({ label: `Parent 2 (${$w("#regsecparentname").value || "Parent 2"})`, value: EMERG_SOURCE_PARENT2 });
+        }
+
+        options.push({ label: "New / someone else", value: EMERG_SOURCE_NEW });
+        $w("#regemergencysource").options = options;
+    }
+
+    // Auto-fills (and hides) the 3 manual emergency contact fields when Parent 1/2
+    // is selected, so the form always mirrors that parent's current details rather
+    // than a separately-typed copy that could go stale. "New" reveals the manual
+    // fields untouched for hand entry.
+    function applyEmergencySource(source) {
+        if (source === EMERG_SOURCE_PARENT1) {
+            $w("#regemergencycontact").value = $w("#regparentname").text || "";
+            $w("#regemergencycontactmobile").value = $w("#regparentmobile").value || "";
+            $w("#regemergencycontactrelatoin").value = $w("#regparentrelation").value || null;
+            $w("#boxEmergencyManual").collapse();
+        } else if (source === EMERG_SOURCE_PARENT2) {
+            $w("#regemergencycontact").value = $w("#regsecparentname").value || "";
+            $w("#regemergencycontactmobile").value = $w("#regsecparentmobile").value || "";
+            $w("#regemergencycontactrelatoin").value = $w("#regsecparentrelation").value || null;
+            $w("#boxEmergencyManual").collapse();
+        } else {
+            $w("#boxEmergencyManual").expand();
+        }
+    }
+
+    // Clears a field's invalid-highlight border once it's actually been filled in -
+    // called from the shared onChange handlers below so a red border doesn't linger
+    // after the parent fixes it, without waiting for another submit click.
+    function clearFieldHighlight(element) {
+        if (!element || !element.value) return;
+        try {
+            element.style.borderColor = FIELD_BORDER_DEFAULT;
+        } catch (err) {
+            // Element type doesn't support border styling (e.g. some radio/upload
+            // controls) - nothing to clear, safe to ignore.
+        }
+    }
+
+    // Mirrors the same required-field list calculateProgress() counts (so "100%
+    // complete" and "nothing left to highlight" always agree), but returns which
+    // elements are still empty instead of a percentage - lets the always-visible
+    // submit button highlight exactly what's missing instead of just staying hidden.
+    function validateRequiredFields() {
+        const requiredIds = [
+            "#regDOB", "#regAddress", "#regshirtsize", "#regshortsize", "#regcoatsize",
+            "#reghoodiesize", "#regsocksize", "#regemergencycontact", "#regemergencycontactmobile",
+            "#regemergencycontactrelatoin", "#regparentrelation", "#regparentdob", "#reggender"
+        ];
+
+        if ($w("#regsibling").value === "true") {
+            requiredIds.push("#regsiblingteam");
+        }
+
+        if ($w("#regadd2parents").value === "Yes") {
+            requiredIds.push("#regsecparentname", "#regsecparentmobile", "#regsecparentemail", "#regsecparentrelation", "#regsecparentdob");
+        }
+
+        const missingIds = [];
+
+        requiredIds.forEach((id) => {
+            const el = $w(id);
+            const isEmpty = !el.value;
+            try {
+                el.style.borderColor = isEmpty ? FIELD_BORDER_INVALID : FIELD_BORDER_DEFAULT;
+            } catch (err) {
+                // Not every element type supports border styling - still tracked
+                // in missingIds below so the summary message/count stays accurate.
+            }
+            if (isEmpty) missingIds.push(id);
+        });
+
+        // Medical details only required when "Yes" was chosen; "No" is a complete
+        // answer on its own (mirrors calculateProgress's medicalyn/regmedical pair).
+        if ($w("#medicalyn").value === "true" && !$w("#regmedical").value) {
+            missingIds.push("#regmedical");
+            try { $w("#regmedical").style.borderColor = FIELD_BORDER_INVALID; } catch (err) { /* not styleable */ }
+        } else if ($w("#medicalyn").value !== "true" && $w("#medicalyn").value !== "false") {
+            missingIds.push("#medicalyn");
+        }
+
+        if (!$w("#regconsentphoto").value) missingIds.push("#regconsentphoto");
+        if (!$w("#regconsentsocial").value) missingIds.push("#regconsentsocial");
+        if (!$w("#regconsentfa").value) missingIds.push("#regconsentfa");
+        if (!$w("#regconsentmedical").value) missingIds.push("#regconsentmedical");
+        if (!$w("#regsibling").value) missingIds.push("#regsibling");
+        if (!$w("#chkParentConduct").checked) missingIds.push("#chkParentConduct");
+        if (!$w("#chkPlayerConduct").checked) missingIds.push("#chkPlayerConduct");
+
+        if ($w("#regheadshot").value.length === 0 && !(activePlayerContext && activePlayerContext.SP_idPhoto)) {
+            missingIds.push("#regheadshot");
+        }
+        if ($w("#regpaperid").value.length === 0 && !(activePlayerContext && activePlayerContext.SP_idDocument)) {
+            missingIds.push("#regpaperid");
+        }
+
+        return { missingIds };
+    }
+
     function calculateProgress() {
         // 17 original fields + parent DOB + gender + the 3 consent items that are
         // new here (photo/FA/medical — social media's slot is unchanged, it just
@@ -778,7 +928,13 @@
         let percentage = Math.round((completedFields / baseTotalFields) * 100);
         if (percentage > 100) percentage = 100;
 
-        $w("#textProgress").text = `Registration: ${percentage}% Complete`;
+        // #textProgress now lives in the header (sticky bar) - only masterPage.js can
+        // $w-select it, so route the text through the bridge instead of setting it here.
+        // lastCalculatedPercentage is the read-back copy mapUItoPlayer saves into
+        // registrationProgress, since it can no longer read the percentage back out
+        // of #textProgress's on-page text either.
+        lastCalculatedPercentage = percentage;
+        setProgressBarText(`Registration: ${percentage}% Complete`);
 
         if (percentage === 100) {
             $w("#chkConfirm").expand();
@@ -787,7 +943,6 @@
             $w("#chkConfirm").checked = false;
             $w("#inputSignature").collapse();
             $w("#inputSignature").value = "";
-            $w("#btnSubmitFinal").collapse();
         }
     }
 
@@ -815,6 +970,7 @@
         playerData.SP_initials = $w("#reginitials").value;
         playerData.SP_emergContactName = $w("#regemergencycontact").value;
         playerData.SP_emergContactNumber = $w("#regemergencycontactmobile").value;
+        playerData.sp_emerg_source = $w("#regemergencysource").value || EMERG_SOURCE_NEW;
 
         playerData.SP_shirtSize = $w("#regshirtsize").value;
         playerData.SP_shortSize = $w("#regshortsize").value;
@@ -880,18 +1036,18 @@
         playerData.registrationConfirmCorrect = $w("#chkConfirm").checked;
         playerData.registrationPrintNameSignature = $w("#inputSignature").value;
 
-        const progressText = $w("#textProgress").text || "0";
-        let currentPercentStr = progressText.replace(/\D/g, '');
-        playerData.registrationProgress = Number(currentPercentStr);
+        playerData.registrationProgress = lastCalculatedPercentage;
 
         return playerData;
     }
 
-    // SECURE SAVE DRAFT
-    $w("#btnSaveDraft").onClick(async () => {
-        $w("#btnSaveDraft").label = "Saving Draft securely...";
-        $w("#btnSaveDraft").disable();
-
+    // SECURE SAVE DRAFT - #btnSaveDraft now lives in the header (sticky bar), so
+    // masterPage.js owns the actual button/label. This is what runs when it's
+    // clicked - detected by polling getSaveDraftRequestId() (session storage, see
+    // public/parentHubProgressBar.js) since only this file knows activePlayerContext,
+    // and a public file's plain functions/variables aren't actually shared between
+    // masterPage.js and page code in Velo.
+    async function handleSaveDraftFromHeader() {
         let playerToUpdate = mapUItoPlayer(activePlayerContext);
         playerToUpdate = await handleFileUploads(playerToUpdate);
 
@@ -904,29 +1060,67 @@
             activePlayerContext.SP_status = DRAFT_STATUS_ID;
         }
 
-        const response = await secureUpdatePlayerRegistration(playerToUpdate, currentParentProfileId);
+        return await secureUpdatePlayerRegistration(playerToUpdate, currentParentProfileId);
+    }
 
-        if (response.success) {
-            $w("#btnSaveDraft").label = "Saved Successfully";
+    // Baseline to whatever's already sitting in storage at load time - otherwise a
+    // browser refresh mid-session would see an old, already-handled requestId as
+    // "new" and fire an unwanted save the instant the page loads.
+    let lastHandledSaveDraftRequestId = getSaveDraftRequestId();
+
+    setInterval(async () => {
+        const requestId = getSaveDraftRequestId();
+        if (!requestId || requestId === lastHandledSaveDraftRequestId) return;
+        lastHandledSaveDraftRequestId = requestId;
+
+        if (activePlayerContext) {
+            const result = await handleSaveDraftFromHeader();
+            setSaveDraftResult(requestId, result);
         } else {
-            $w("#btnSaveDraft").label = "Error Saving";
-            console.error(response.error);
+            // Header button shouldn't be clickable outside stateRegistration (the bar
+            // stays collapsed), but guard anyway so masterPage.js's button doesn't
+            // hang waiting on a result that would otherwise never arrive.
+            setSaveDraftResult(requestId, { success: false, error: "Not currently in the registration form." });
         }
-
-        setTimeout(() => {
-            $w("#btnSaveDraft").label = "Save Draft";
-            $w("#btnSaveDraft").enable();
-        }, 2000);
-    });
+    }, 400);
 
     // SECURE FINAL SUBMIT
     $w("#btnSubmitFinal").onClick(async () => {
-        // FA and medical consent are mandatory — 100% progress only means every
-        // field has been ANSWERED (see calculateProgress), not that these two were
-        // answered "Yes". This is the actual hard gate.
+        // Submit is always visible now (feedback: parents had no way to tell which
+        // fields were mandatory until the button silently appeared at 100%). A click
+        // while incomplete highlights exactly what's missing instead of doing nothing.
+        const validation = validateRequiredFields();
+        if (validation.missingIds.length > 0) {
+            const count = validation.missingIds.length;
+            $w("#txtValidationMsg").text = `Please complete the ${count} highlighted field${count > 1 ? "s" : ""} above before submitting.`;
+            $w("#txtValidationMsg").expand();
+            $w(validation.missingIds[0]).scrollTo();
+            return;
+        }
+        $w("#txtValidationMsg").collapse();
+
+        // FA and medical consent are mandatory — "answered" (checked above via
+        // regconsentfa/medical having a value) isn't the same as answered "Yes".
+        // This is the actual hard gate.
         if ($w("#regconsentfa").value !== "true" || $w("#regconsentmedical").value !== "true") {
             $w("#btnSubmitFinal").label = "Consent required — see above";
+            $w("#txtConsent").scrollTo();
             setTimeout(() => { $w("#btnSubmitFinal").label = "Submit Form"; }, 2500);
+            return;
+        }
+
+        if (!$w("#chkConfirm").checked) {
+            $w("#txtValidationMsg").text = "Please tick the confirmation box below before submitting.";
+            $w("#txtValidationMsg").expand();
+            $w("#chkConfirm").scrollTo();
+            return;
+        }
+
+        if (!$w("#inputSignature").value || $w("#inputSignature").value.length <= 2) {
+            $w("#txtValidationMsg").text = "Please type your name as a signature before submitting.";
+            $w("#txtValidationMsg").expand();
+            try { $w("#inputSignature").style.borderColor = FIELD_BORDER_INVALID; } catch (err) { /* not styleable */ }
+            $w("#inputSignature").scrollTo();
             return;
         }
 
@@ -945,6 +1139,7 @@
             await loadDashboard(currentParentProfileId);
             activePlayerContext = null;
             $w("#stateboxHub").changeState("stateDashboard");
+            setProgressBarVisible(false);
             $w("#btnSubmitFinal").label = "Submit Form";
             $w("#btnSubmitFinal").enable();
         } else {

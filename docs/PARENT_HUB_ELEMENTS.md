@@ -96,9 +96,11 @@ dashboard first).
 | 13b | `#regparentaddress` | Address Input | Primary parent address, only if different from player's (blank = same) | None |
 | 13c | `#regmembership` | Text (display, read-only) | Club membership number / Standing Order payment reference — server-generated | None |
 | 14 | `#reginitials` | Text Input | Player initials | None |
-| 15 | `#regemergencycontact` | Text Input | Emergency contact name | None |
-| 16 | `#regemergencycontactmobile` | Text Input | Emergency contact number | None |
-| 17 | `#regemergencycontactrelatoin` | Dropdown | Emergency contact relationship (`ClubDictionary` category=`relationship`) | None |
+| 14a | `#regemergencysource` | Dropdown | Emergency contact source — options built at runtime: "Parent 1 (name)", "Parent 2 (name)" (only if `#regadd2parents`=Yes), "New / someone else". Picking Parent 1/2 auto-fills + collapses `#boxEmergencyManual`; "New" expands it for manual entry. See "Emergency contact source" under Data Model Notes | None |
+| 15 | `#boxEmergencyManual` | Container | Wraps the 3 fields below (+ their labels) — collapsed entirely when Parent 1/2 is selected above, so nothing shows twice | None (expanded by default; code will collapse it on load if a parent source was previously saved) |
+| 15a | `#regemergencycontact` | Text Input (in `#boxEmergencyManual`) | Emergency contact name | None |
+| 16 | `#regemergencycontactmobile` | Text Input (in `#boxEmergencyManual`) | Emergency contact number | None |
+| 17 | `#regemergencycontactrelatoin` | Dropdown (in `#boxEmergencyManual`) | Emergency contact relationship (`ClubDictionary` category=`relationship`) | None |
 | 17a | `#reggender` | Dropdown | Player gender (`ClubDictionary` category=`gender`) — WGS requirement, counted in `#textProgress` | None |
 | 18 | `#regshirtsize` | Dropdown | Shirt size (`ClubDictionary` category=`shirt_size`) | None |
 | 19 | `#regshortsize` | Dropdown | Shorts size (`ClubDictionary` category=`shorts_size`) | None |
@@ -132,11 +134,97 @@ dashboard first).
 | 37 | `#regpaperid` | Upload Button | ID document — label flips to "ID Saved ✓" once uploaded | None |
 | 38 | `#chkParentConduct` | Checkbox | Parent code of conduct agreed | None |
 | 39 | `#chkPlayerConduct` | Checkbox | Player code of conduct agreed | None |
-| 40 | `#textProgress` | Text | "Registration: X% Complete" | None |
+| 40 | `#textProgress` | Text | "Registration: X% Complete" — **lives in the Site Header** inside `#stickyProgressBar`, not on this page at all; set via `masterPage.js`/the bridge module, see "Sticky Progress Bar" below | None |
 | 41 | `#chkConfirm` | Checkbox | "I confirm the above is correct" — only reachable at 100% complete | Collapsed |
 | 42 | `#inputSignature` | Text Input | Typed signature (must be >2 chars) | Collapsed |
-| 43 | `#btnSaveDraft` | Button | Saves progress without submitting | None |
-| 44 | `#btnSubmitFinal` | Button | Final submit — sets status to Ready for FA | Collapsed |
+| 43 | `#btnSaveDraft` | Button | Saves progress without submitting — **lives in the Site Header** inside `#stickyProgressBar`, not on this page at all; click is wired in `masterPage.js`, actual save logic in `Parent Hub.js` via the bridge, see "Sticky Progress Bar" below | None |
+| 44 | `#btnSubmitFinal` | Button | Final submit — **always visible now** (was gated to 100% complete; changed 2026-07-26 per parent feedback that they had no way to tell which fields were mandatory). A click while required fields are still empty highlights them red and shows `#txtValidationMsg` instead of submitting — see "Mandatory-field highlighting" below | None (was Collapsed) |
+| 44a | `#txtValidationMsg` | Text | "Please complete the N highlighted field(s) above…" / confirm-checkbox / signature prompts, shown on an incomplete submit attempt | Collapsed |
+
+### Sticky Progress Bar (mobile) — now lives in the Header, added/revised 2026-07-26
+
+Feedback: the progress bar + Save Draft could be pinned in **desktop** view but not
+**mobile**. First attempt moved them into a page-level container and tried to pin that
+— didn't work, because **Classic Editor has no Fixed Position option for regular
+elements in mobile view at all**, regardless of nesting (confirmed: still missing even
+after moving out of the `stateRegistration` State Box). The only thing that reliably
+sticks on mobile is a Header/Footer with a sticky scroll effect, which is a native,
+first-party Wix feature rather than per-element pinning — so that's where these two
+elements now live.
+
+**Editor setup:**
+
+1. **Delete** the existing `#textProgress` and `#btnSaveDraft` from `stateRegistration`
+   first — an element ID must be unique across the page + header together, so the old
+   ones have to go before the new ones (same IDs) can be added in the header.
+2. In the **Site Header**, add a Container named `#stickyProgressBar` holding
+   `#textProgress` (Text) and `#btnSaveDraft` (Button) — same element IDs, same purpose,
+   just relocated from `stateRegistration`.
+3. On the Header itself, set its Scroll Effect to **"Always fixed"** (or your theme's
+   equivalent sticky option) — check this applies on **both** desktop and mobile; some
+   themes have a separate mobile toggle for this.
+4. Leave `#stickyProgressBar`'s Initial State as **Collapsed** — `masterPage.js` also
+   collapses it defensively on load, and it only expands when Parent Hub.js says so.
+
+**Why this needed a bridge, not just moving the elements:** header/footer elements can
+only be `$w`-selected from `masterPage.js` — a page's own code (`Parent Hub.js`) can't
+reach them, and can't import `masterPage.js` directly either (re-runs its `$w.onReady`).
+
+**First version of this bridge was wrong** — it used an in-memory callback registry in
+`public/parentHubProgressBar.js` (`registerHeaderHandlers`/`registerSaveDraftHandler`).
+Deployed with no console errors, but silently did nothing: plain variables/functions in
+a Velo `public/*.js` file are **not** actually shared between `masterPage.js` and page
+code — each gets its own separate copy, so `masterPage.js`'s registered handlers were
+never the same object `Parent Hub.js` was calling. Corrected version routes everything
+through `wix-storage-frontend` session storage instead (Wix's own documented pattern for
+masterPage↔page communication), which genuinely is shared. Storage has no same-tab
+change event, so each side polls it every 400ms rather than getting a live push:
+
+- `Parent Hub.js` calls `setProgressBarVisible(true/false)` right after entering/leaving
+  `stateRegistration` (`#btnAction`'s click handler, `#btnBackToHubReg`, and the
+  successful-submit branch of `#btnSubmitFinal`), and `setProgressBarText(...)` from
+  inside `calculateProgress()` — both just write to session storage.
+- `masterPage.js` polls `getProgressBarVisible()`/`getProgressBarText()` every 400ms and
+  only touches `$w("#stickyProgressBar")`/`#textProgress` when a value actually changed
+  since the last poll.
+- `masterPage.js`'s `#btnSaveDraft` click calls `requestSaveDraft()` (writes a
+  timestamp-based request ID to storage) and remembers it as `pendingSaveRequestId`.
+  `Parent Hub.js` polls `getSaveDraftRequestId()` every 400ms; on a new ID it runs the
+  actual save (needs `activePlayerContext`, which only this file knows) and writes the
+  result back via `setSaveDraftResult(requestId, result)`. `masterPage.js`'s poll picks
+  up the matching result and updates the button label ("Saved Successfully"/"Error
+  Saving") — matched by request ID so a stale result can't be mistaken for the current
+  click.
+- `Parent Hub.js` seeds its "last handled" request ID from whatever's already in storage
+  at load time, so a mid-session browser refresh doesn't replay an old, already-handled
+  save request the instant the page reloads.
+- No "which page is this" logic anywhere — the bar defaults to collapsed and only shows
+  when Parent Hub.js's own code says so, so it's invisible on every other page.
+- `mapUItoPlayer`'s `registrationProgress` field now reads a module-level
+  `lastCalculatedPercentage` (set inside `calculateProgress`) instead of reading
+  `#textProgress`'s on-page text back out, for the same reason — that element isn't on
+  this page anymore.
+
+### Mandatory-field highlighting, added 2026-07-26
+
+Feedback: parents had no way to tell which fields were required until `#btnSubmitFinal`
+either silently appeared (at 100%) or didn't. `#btnSubmitFinal` is now always visible;
+clicking it while required fields are empty calls `validateRequiredFields()` (mirrors
+the exact field list `calculateProgress()` counts, so "100%" and "nothing left to
+highlight" can never disagree), sets a red border (`FIELD_BORDER_INVALID`) on every
+empty one, shows `#txtValidationMsg` with a count, and scrolls to the first one. The
+border resets to `FIELD_BORDER_DEFAULT` either on the next submit click or as soon as
+that specific field is filled in (via `clearFieldHighlight`, hooked into the existing
+shared `onChange` handlers). Not every element type supports `.style.borderColor` in
+Velo (e.g. some Checkbox/UploadButton/RadioGroup controls) — for those, the field still
+counts toward the "N highlighted fields" message even if no visible border appears; test
+each one in the Editor and swap in `.style.backgroundColor` instead if a given control
+doesn't visibly respond.
+
+If `FIELD_BORDER_DEFAULT` (`#E0E0E0`) doesn't match your actual field styling, adjust
+the constant in `Parent Hub.js` — Velo's Style API can set border color but can't read
+back what the Editor originally set, so this is a hardcoded "reset" value rather than a
+true restore of the original.
 
 ### Consent Lightbox
 
@@ -324,6 +412,23 @@ only: the secondary parent's own DOB/address (`#secondparentDob`/`#secondparentA
 stays visible to the primary parent, same as the rest of the secondary-parent block —
 the primary parent enters and owns that data as part of managing the registration, so
 there's nothing to protect there.
+
+### Emergency contact source, added 2026-07-26
+
+New `SignolPlayers` field: **`sp_emerg_source`** (TEXT) — stores `"parent1"`,
+`"parent2"`, or `"new"`, whichever `#regemergencysource` was set to at last save.
+Doesn't exist in the CMS yet; add it manually (or let the first `secureUpdatePlayerRegistration`
+write auto-create it — Wix Data silently adds a column for any new key in an
+update payload, so either works, but adding it explicitly up front avoids it looking
+like an accidental stray column later).
+
+Selecting Parent 1/2 re-derives `SP_emergContactName`/`SP_emergContactNumber`/
+`SP_emergContactRelationship` from that parent's CURRENT on-form values every time
+`loadRegistrationForm` runs or the dropdown changes — it's a live mirror, not a
+one-time copy, so editing Parent 2's phone number elsewhere on the same form updates
+the emergency contact too. `sp_emerg_source` defaults to `"new"` for any player record
+saved before this feature existed, so an already-typed independent emergency contact on
+an old draft is never silently overwritten by this change.
 
 ### `TeamStats` collection
 
