@@ -73,6 +73,15 @@ export async function linkParentSecurely(memberId, loginEmail, activePlayerData,
     }
 }
 // 3. The "Self-Healing" Sweep for the Parent Hub
+// A loginEmail is only ever used as a last-resort placeholder name (so a
+// profile/player record is never left completely blank). It must never be
+// trusted as a real display name once one becomes available - this lets us
+// tell the two apart instead of treating "field is non-empty" as "field is
+// a real name".
+function isEmailLike(value) {
+    return typeof value === "string" && value.includes("@");
+}
+
 export async function hubEmailSweep(memberId, loginEmail, parentRoleId, firstName, lastName) {
     try {
         let parentProfileId;
@@ -100,6 +109,9 @@ export async function hubEmailSweep(memberId, loginEmail, parentRoleId, firstNam
         }
 
         let resolvedName = `${resolvedFirst} ${resolvedLast}`.trim();
+        // Defense in depth: never treat an email-shaped "name" as real,
+        // regardless of where it came from (member profile data included).
+        if (isEmailLike(resolvedName)) resolvedName = "";
 
         // --- A. FIND OR CREATE PARENT PROFILE ---
         const profileQuery = await wixData.query("ParentProfiles")
@@ -110,15 +122,21 @@ export async function hubEmailSweep(memberId, loginEmail, parentRoleId, firstNam
             const existingProfile = profileQuery.items[0];
             parentProfileId = existingProfile._id;
 
-            // Backfill a missing name on an existing profile
-            if (!existingProfile.PP_fullName && resolvedName) {
+            // A profile's PP_fullName is only usable as a name if it isn't
+            // just the loginEmail placeholder from when the profile was
+            // created before a real name was known.
+            const existingNameIsUsable = existingProfile.PP_fullName && !isEmailLike(existingProfile.PP_fullName);
+
+            // Backfill a missing OR email-poisoned name on an existing profile
+            if (!existingNameIsUsable && resolvedName) {
                 existingProfile.PP_fullName = resolvedName;
                 await wixData.update("ParentProfiles", existingProfile, options);
             }
 
             // For backfilling player records below, fall back to whatever
-            // name is already on the profile if we didn't resolve one above
-            resolvedName = resolvedName || existingProfile.PP_fullName || "";
+            // usable name is already on the profile if we didn't resolve one
+            // above - never fall back to an email-poisoned value
+            resolvedName = resolvedName || (existingNameIsUsable ? existingProfile.PP_fullName : "");
         } else {
             // Fallback name/phone sourced from a matching player record, used
             // only if we still don't have a name from the member's profile
@@ -143,6 +161,10 @@ export async function hubEmailSweep(memberId, loginEmail, parentRoleId, firstNam
                         fallbackPhone = secondaryMatch.items[0].secondaryParentMobile;
                     }
                 }
+
+                // A sibling record could already carry this same email-as-name
+                // bug from before this fix - don't propagate it to a new profile.
+                if (isEmailLike(fallbackName)) fallbackName = "";
             }
 
             const newProfile = await wixData.insert("ParentProfiles", {
@@ -205,8 +227,8 @@ export async function hubEmailSweep(memberId, loginEmail, parentRoleId, firstNam
                     continue;
                 }
 
-                // Backfill a missing parent name on the player record
-                if (!player.parentsName && resolvedName) {
+                // Backfill a missing OR email-poisoned parent name on the player record
+                if ((!player.parentsName || isEmailLike(player.parentsName)) && resolvedName) {
                     player.parentsName = resolvedName;
                     needsUpdate = true;
                 }
@@ -250,8 +272,8 @@ export async function hubEmailSweep(memberId, loginEmail, parentRoleId, firstNam
                     continue;
                 }
 
-                // Backfill a missing secondary parent name on the player record
-                if (!player.secondaryParentName && resolvedName) {
+                // Backfill a missing OR email-poisoned secondary parent name on the player record
+                if ((!player.secondaryParentName || isEmailLike(player.secondaryParentName)) && resolvedName) {
                     player.secondaryParentName = resolvedName;
                     needsUpdate = true;
                 }
