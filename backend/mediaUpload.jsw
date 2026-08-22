@@ -1,0 +1,117 @@
+// =====================================================================
+//  mediaUpload.jsw — file uploads from a custom element
+// =====================================================================
+//  A Wix UploadButton uploads via $w("#el").uploadFiles(), which is an
+//  element method. A custom element is isolated from $w, so it can't call
+//  it - that's the one thing on stateRegistration with no obvious custom
+//  element equivalent, and the reason the whole state's conversion was
+//  parked pending this test.
+//
+//  The route this proves: the element reads the file, shrinks it if it's
+//  an image, base64-encodes it and hands it out as an event; page code
+//  passes it here; this uploads to the Media Manager and returns a
+//  fileUrl in exactly the same shape UploadButton gives back
+//  (`wix:image://...` / `wix:document://...`), so SP_idPhoto and
+//  SP_idDocument are written identically to today.
+//
+//  THE RISK THIS IS TESTING is payload size. Base64 inflates a file by
+//  ~33%, and a modern phone camera produces 3-8MB photos - so a raw
+//  headshot could arrive as 4-11MB through a web module call. The element
+//  downscales images before encoding for exactly this reason; a 1200px
+//  JPEG lands around 150-400KB. PDFs can't be downscaled, so they're
+//  capped and rejected with a readable message instead.
+// =====================================================================
+
+import { mediaManager } from 'wix-media-backend';
+import { currentMember } from 'wix-members-backend';
+
+// Post-decode, i.e. the real file size, not the base64 length. Deliberately
+// well under any platform ceiling - if a legitimate file is ever rejected
+// here, the answer is more aggressive downscaling in the element, not a
+// bigger number.
+const MAX_BYTES = 4 * 1024 * 1024;
+
+// mediaType is a separate argument to mimeType in the Media Manager API and
+// it has to be right, so derive it rather than trusting the caller.
+const ALLOWED_TYPES = {
+    "image/jpeg": "image",
+    "image/jpg": "image",
+    "image/png": "image",
+    "image/webp": "image",
+    "application/pdf": "document"
+};
+
+export async function uploadRegistrationFile(base64, fileName, mimeType) {
+    try {
+        // Uploads are member-only. Not a substitute for the ownership check
+        // that guards the player record itself - this only stops an
+        // anonymous visitor filling the Media Manager with junk.
+        const member = await currentMember.getMember();
+        if (!member) return { success: false, error: "You need to be signed in to upload a file." };
+
+        const mediaType = ALLOWED_TYPES[String(mimeType || "").toLowerCase()];
+        if (!mediaType) {
+            return { success: false, error: "That file type isn't supported. Please upload a JPG, PNG or PDF." };
+        }
+
+        // Tolerate a full data: URI as well as bare base64 - it's an easy
+        // thing to get wrong on the frontend and a silent corruption if we
+        // don't strip it.
+        const payload = String(base64 || "").replace(/^data:[^;]+;base64,/, "");
+        if (!payload) return { success: false, error: "No file was received. Please try again." };
+
+        const buffer = Buffer.from(payload, "base64");
+        if (!buffer.length) return { success: false, error: "That file couldn't be read. Please try another." };
+
+        if (buffer.length > MAX_BYTES) {
+            const mb = (buffer.length / 1024 / 1024).toFixed(1);
+            return {
+                success: false,
+                error: `That file is ${mb}MB, which is too large. Please use a file under 4MB.`
+            };
+        }
+
+        // Media Manager will happily accept a name with path separators or
+        // odd characters; keep it boring. Tail-trimmed so a long name keeps
+        // its extension.
+        const safeName = String(fileName || "upload")
+            .replace(/[^\w.\-]/g, "_")
+            .slice(-80);
+
+        console.log("[uploadRegistrationFile] uploading", {
+            memberId: member._id, safeName, mimeType, mediaType, bytes: buffer.length
+        });
+
+        const uploaded = await mediaManager.upload(
+            "/registration-uploads",
+            buffer,
+            safeName,
+            {
+                mediaOptions: { mimeType, mediaType },
+                // ⚠️ DECISION NEEDED, not a recommendation: this matches what
+                // the existing UploadButton path does today (public), so the
+                // test is a fair comparison. These are children's headshots
+                // and ID documents, and a public Media Manager URL is
+                // guessable-adjacent. Worth deciding deliberately before this
+                // goes near real registrations - isPrivate: true works, but
+                // private files need a signed URL to display, which changes
+                // how the preview thumbnail is rendered.
+                metadataOptions: { isPrivate: false, isVisitorUpload: false }
+            }
+        );
+
+        console.log("[uploadRegistrationFile] uploaded ok", { fileUrl: uploaded.fileUrl });
+
+        // fileUrl is the same shape UploadButton returns, so callers assign it
+        // straight onto SP_idPhoto / SP_idDocument exactly as they do now.
+        return {
+            success: true,
+            fileUrl: uploaded.fileUrl,
+            fileName: safeName,
+            sizeBytes: buffer.length
+        };
+    } catch (err) {
+        console.error("uploadRegistrationFile failed:", err);
+        return { success: false, error: err.message || "Upload failed. Please try again." };
+    }
+}

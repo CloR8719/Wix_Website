@@ -16,7 +16,7 @@ editor (before any code runs).
 | # | Element ID | Type | Purpose | Initial State |
 |---|-----------|------|---------|----------------|
 | 1 | `#textWelcome` | Text | "Welcome back,\n[Name]" greeting | None |
-| 2 | `#stateboxHub` | State Box | Main container — holds 3 states (`stateDashboard`, `stateRegistration`, `stateProfile`) | Default state = `stateDashboard` |
+| 2 | `#stateboxHub` | State Box | Main container — holds 4 states (`stateDashboard`, `stateRegistration`, `stateProfile`, `statePayment`) | Default state = `stateDashboard` |
 
 ## State: stateDashboard
 
@@ -67,6 +67,7 @@ already has one child linked (e.g. to add a sibling on a different email).
 | 3c | `#headshot` | Image (in repeater) | Child's photo, falls back to a placeholder | None |
 | 3d | `#textStatus` | Text (in repeater) | Onboarding status label, color-coded (see Status Pipeline below) | None |
 | 3e | `#btnAction` | Button (in repeater) | Routes to Registration form (Invited/Renewal/Draft) or read-only Profile (everything else) | None |
+| 3f | `#btnPayment` | Button (in repeater) | **NEW.** Its own button, separate from `#btnAction` (paying fees is a different concern from status-driven routing) — only shown once a fee schedule's been saved AND that tier has a matching `F_wixPlanId`. Routes to `statePayment`. Never hidden again once paid - relabels instead ("Set Up Payment" → "Payment ✓ (Manage)" → "⚠️ Payment Failed - Fix" / "⚠️ Plan Changed - See Details"), so it's always reachable to switch plans or fix a problem. Guarded on `.id`. See "Payment Plan" under Data Model Notes. | Collapsed |
 
 ## State: stateRegistration
 
@@ -369,6 +370,25 @@ for a secondary parent (see Role-Based Access Control below).
 | 13a | `#formCircle` | Shape (in repeater) | Color-coded W/L/D circle | None |
 | 13b | `#txtFormLetter` | Text (in repeater) | "W"/"L"/"D" | None |
 
+## State: statePayment (added 2026-07-28, backend switched to GoCardless 2026-07-30)
+
+**NEW state.** Reached only via `#btnPayment` on a kid's dashboard card (Kids List,
+above) — that button is itself hidden until a fee schedule's been saved+sent for that
+child. Not reachable from `#btnAction`; paying fees is a separate concern from the
+status-driven registration/profile routing. See "Payment tracking — GoCardless Direct
+Debit" under Data Model Notes for the full mechanism (the older Wix Pricing
+Plans/Stripe section further down is superseded but kept for history).
+
+| # | Element ID | Type | Purpose | Initial State |
+|---|-----------|------|---------|----------------|
+| 1 | `#btnBackToHubPayment` | Button | Back to Dashboard (refreshes data first, same pattern as `#btnBackToHubProfile`) | None |
+| 2 | `#textPaymentKidName` | Text | Which child this plan is for | None |
+| 3 | `#textPaymentPlanLabel` | Text | Fee tier label (`FeeCategories.F_label`) - name only, not the amount | None |
+| 3a | `#textPaymentSchedule` | Text, optional | **NEW 2026-08.** "N payment(s) of £X (total £Y) - first payment DD/MM/YYYY, then monthly." - the actual amount/frequency, which `#textPaymentPlanLabel` never showed. Reuses `getFeeSchedule()` from `backend/registration.jsw`, same numbers the secretary's PlayerRecord preview (`#prSchedulePreview`) shows, so they always match. Shows "No fee - this is a free membership." for a £0 tier. | None |
+| 4 | `#btnSetupPayment` | Button | "Set up your payment plan" — calls `startGoCardlessSetup(playerId, feeCategoryId, returnUrl)` then redirects to the returned `authorisationUrl` (GoCardless's hosted mandate-setup flow). Only ever shown when there's genuinely nothing active (never started, or a previous plan ended/canceled) — see "Payment tracking — GoCardless Direct Debit" under Data Model Notes for why. | Collapsed (code reveals) |
+| 5 | `#textPaymentStatus` | Text | Reports the real subscription status (paid this month / failed / canceled / ended / setup pending / mismatched-tier), or "No payment plan started yet." / "Checking payment status..." | None |
+| 6 | `#btnCancelOldPlan` | Button | Only shown when there's an active subscription on a DIFFERENT fee tier than the one now assigned (secretary changed tier) — calls `cancelGoCardlessSubscription(recordId)`, then refreshes the state. `#btnSetupPayment` for the new plan only appears once this succeeds. | Collapsed (code reveals) |
+
 ## Status Pipeline (Parent-facing, `SP_status`)
 
 `#repeaterKids`'s `#textStatus`/`#btnAction` map the same `SP_status` IDs documented
@@ -390,6 +410,232 @@ Players with status Left are excluded entirely from `#repeaterKids` (filtered ou
 `loadDashboard`).
 
 ## Data Model Notes
+
+### Payment plan — GoCardless Direct Debit (backend replaced 2026-07-30)
+
+`resolveFeeCategoryId(player)` in `Parent Hub.js` (renamed from `resolvePlanId`) returns
+the kid's fee category id once `player.sp_paymentschedulesentdate` is set — unlike the
+old Wix Pricing Plans version, GoCardless doesn't need a pre-existing "plan" object to
+check for (the schedule is computed dynamically per player via `buildFeeSchedule()`), so
+`FeeCategories.F_wixPlanId` is no longer required for `#btnPayment` to appear. That field
+is left in the CMS, unused, rather than removed (see `database/CMS_SCHEMA.txt`).
+
+`loadPaymentState(player)` still populates `statePayment`'s text fields the same way;
+`#btnSetupPayment` now calls `startGoCardlessSetup` (see "Payment tracking — GoCardless
+Direct Debit" below) instead of Wix's `customPurchaseFlow.navigateToCheckout`. Same
+principle as before still holds: `statePayment` doesn't rebuild a payment/checkout page
+itself — GoCardless's own hosted Billing Request Flow is the PCI-compliant collection
+step, same reasoning that previously applied to Wix's built-in Checkout.
+
+**Free (£0) fee categories skip GoCardless entirely (added 2026-08).** GoCardless
+requires a minimum £1 transaction and never activates a £0 subscription — confirmed
+live when a real test (a free tier for managers' own kids) got stuck PENDING forever.
+`startGoCardlessSetup` now detects `annual <= 0` and, instead of creating a Billing
+Request, inserts a `GoCardlessSubscriptions` row straight as `status: "ACTIVE"` /
+`confirmed: true` with no real mandate involved, and returns `{ success: true, free:
+true }`. The frontend's `#btnSetupPayment` click handler checks for `result.free` and
+re-renders `statePayment` instead of redirecting to GoCardless's hosted flow — the
+parent never sees a bank-details step for a free tier.
+
+### Payment plan — OLDER Wix Pricing Plans/Stripe mechanism (superseded 2026-07-30)
+
+**Superseded.** Code (`backend/events.js`, `markPendingPayment`/
+`getChildSubscriptionStatus` in `registration.jsw`, the `wix-pricing-plans-frontend`
+import) is left in place, dormant, until GoCardless has been live and collected at
+least one real monthly cycle — see the GoCardless section above/below for what's
+actually running now. Kept here for history:
+
+Replaces the earlier email-notification idea (`ParentNotifications` + Wix Automation,
+which required manual Automation setup and had no in-app fallback if the email never
+sent) with a simple in-Hub flow instead — same trigger, no email dependency. First cut
+was an inline banner on the registration/profile screens; moved to a dedicated
+`statePayment` (see above) reached via its own `#btnPayment` per kid, since paying
+fees is a distinct action from viewing/editing a registration, not a footnote on it.
+
+- **`resolvePlanId(player)`** in `Parent Hub.js` — returns the kid's Wix Pricing Plan
+  id only when `player.sp_paymentschedulesentdate` is set AND the linked fee tier has
+  a `F_wixPlanId`; else `null`. Drives both `#btnPayment`'s visibility on the
+  dashboard card (`#repeaterKids.onItemReady`) and the actual checkout call.
+- **`loadPaymentState(player)`** populates `statePayment`'s 2 text fields and wires
+  `#btnSetupPayment`. All guarded on `.id`.
+- **`#btnSetupPayment`** calls `customPurchaseFlow.navigateToCheckout({ planId })`
+  from `wix-pricing-plans-frontend` (Wix's real Pricing Plans checkout API) — hands
+  off to Wix's own hosted checkout for that exact plan. `statePayment` deliberately
+  does NOT rebuild a payment/checkout page itself or re-show the schedule breakdown —
+  Wix's checkout page displays the real price/interval once the parent lands there,
+  so the numbers aren't computed a third time (already duplicated once between
+  `registration.jsw` and `Player Record.js` for the secretary's preview). The **Plans
+  & Pricing listing page CAN be fully custom** (that's what this state is), but the
+  actual checkout/payment-collection step should stay on Wix's built-in Checkout —
+  it's the PCI-compliant hosted flow; there's no reason to rebuild it.
+- **⚠️ CMS SETUP needed:** new field `FeeCategories.F_wixPlanId` (Text) — for each fee
+  tier, paste in the matching Wix Pricing Plan's ID (Wix Dashboard → Pricing Plans →
+  that plan's settings). Without this, `#btnPayment` never appears even if a schedule
+  was sent, since there'd be nothing to check out to.
+- **Backend:** `getKidsForParent` now `.include("sp_fee_category")` so the linked
+  `FeeCategories` row (label + `F_wixPlanId`) travels with each kid's record.
+
+### Payment tracking — per-child subscription status, OLDER mechanism (superseded 2026-07-30)
+
+**The core problem:** a Wix Pricing Plans order only ever records *which member*
+bought *which plan* — never which of their children it was for. Two kids on the
+same fee tier, bought back-to-back, look identical from Wix's side. Solved with a
+"mark before checkout, confirm after" pattern (same shape Wix's own build assistant
+suggested when Rob asked it independently):
+
+1. **`markPendingPayment(playerId, planId)`** (`registration.jsw`) — called the
+   instant the parent taps `#btnSetupPayment`, *before* `navigateToCheckout()`.
+   Writes an unconfirmed row to a new **`ChildSubscriptions`** CMS collection:
+   `player` (ref), `memberId`, `wixPlanId`, `status: "pending"`, `confirmed: false`.
+2. **`wixPricingPlans_onOrderPurchased`** (`backend/events.js` — new file, new kind
+   of backend file for this project) fires when Wix confirms the real order/first
+   payment. Matches it to the **oldest unconfirmed** `ChildSubscriptions` row for
+   the same `memberId` + `planId` (FIFO — correct even if a parent buys two kids on
+   the same tier within seconds of each other), then fills in `subscriptionId`,
+   `orderId`, `status`, `lastPaymentStatus`, `currentCycleIndex/Start/End`, and sets
+   `confirmed: true`.
+3. **`wixPricingPlans_onOrderCycleStarted`**, **`wixPricingPlans_onOrderCanceled`**,
+   **`wixPricingPlans_onOrderEnded`** (same file, all sharing one
+   `syncSubscriptionFromOrder(order)` helper) fire at the start of every payment
+   cycle, on cancellation, and on natural expiry respectively — each writes the
+   order's current `status`/`lastPaymentStatus`/`currentCycle...` onto the matching
+   `ChildSubscriptions` row by `subscriptionId`. Critically, **this is keyed on the
+   event, not on which page triggered it** — `onOrderCanceled` fires the same way
+   whether the parent cancelled via our own `#btnCancelOldPlan` or via Wix's own
+   built-in Subscriptions/My Account page, so `ChildSubscriptions` never drifts out
+   of sync just because a cancellation happened somewhere outside our custom flow.
+   (Bug caught 2026-07-28: the first version of `events.js` only had
+   `onOrderPurchased`/`onOrderCycleStarted` — no cancellation handler at all, so
+   *any* cancellation, ours or Wix's own page, silently never updated the CMS.)
+4. **`getChildSubscriptionStatus(playerId)`** reads the latest confirmed record back
+   for display — used by `statePayment`'s `#textPaymentStatus` and the dashboard
+   card's `#btnPayment` label (see below).
+
+**CONFIRMED WORKING END-TO-END (2026-07-28)** — `ChildSubscriptions` collection
+built, `events.js` created as a real `.js` file (not `.jsw` — see the gotcha note
+below), published, and tested live by Rob.
+
+**⚠️ `.js` vs `.jsw` gotcha:** `events.js` must be an actual `.js` file, NOT a `.jsw`
+Web Module — Wix only wires up backend event handlers (`wixPricingPlans_onOrder...`)
+from a plain `.js` file with that exact name. Saved as `.jsw`, the functions just sit
+there unused and nothing ever fires. Caught and fixed during testing.
+
+**Once paid, `#btnPayment` relabels rather than disappearing** (`describePaymentButtonLabel`
+in `Parent Hub.js`, mirrored by `describeSubscriptionStatus` for the fuller text on
+`statePayment`) — so it's always there to reopen, never a dead end:
+- No subscription yet → **"Set Up Payment"**
+- Confirmed + active, payment going through → **"Payment ✓ (Manage)"**
+- `lastPaymentStatus: FAILED` → **"⚠️ Payment Failed - Fix"**
+- Subscription `CANCELED`/`ENDED` → back to **"Set Up Payment"**
+
+**Switching fee tiers — a real Wix limitation, worked around with a real fix (2026-07-28):**
+Wix's Pricing Plans app has no "replace my plan" for site members — buying a new
+plan does NOT cancel an old one, so a parent could end up on two concurrent
+subscriptions, billed for both, if the secretary changes their tier while they're
+already on an active one. `getChildSubscriptionStatus` returns `wixPlanId` +
+`orderId`; `renderPaymentAction` in `Parent Hub.js` compares the confirmed
+subscription's plan against whatever tier is currently assigned:
+- Match, payment fine → no button, just status text (nothing to click, can't
+  accidentally duplicate).
+- Mismatch → **`#btnSetupPayment` is hidden entirely**, only `#btnCancelOldPlan`
+  shows, calling `orders.requestCurrentMemberOrderCancellation(orderId,
+  "IMMEDIATELY")` (from `wix-pricing-plans-frontend`'s Orders API — cancels that
+  ONE specific order, confirmed via Wix docs it doesn't touch any other
+  subscriptions the member holds). Once that succeeds, the state refreshes and
+  `#btnSetupPayment` for the new plan appears.
+- `lastPaymentStatus: FAILED` on an otherwise-matching plan → status text only,
+  pointing them to fix their payment method via their own Wix account -
+  deliberately NOT a checkout button, since retrying checkout would create a
+  second subscription rather than fixing the existing one's payment method.
+
+So: **`#btnSetupPayment` and `#btnCancelOldPlan` are never both visible, and
+checkout is never offered while any subscription is still active** — the only way
+back to "Set up your payment plan" is via a genuinely absent/canceled/ended
+subscription.
+
+**⚠️ CMS reference:** `ChildSubscriptions` fields: `player` (Reference →
+SignolPlayers), `memberId` (Text), `wixPlanId` (Text), `subscriptionId` (Text),
+`orderId` (Text), `status` (Text), `lastPaymentStatus` (Text), `currentCycleIndex`
+(Number), `currentCycleStart` (Date), `currentCycleEnd` (Date), `confirmed`
+(Boolean).
+
+**Not yet built:** any secretary-facing view of `ChildSubscriptions` (e.g. on Player
+Record, so she can see who's behind without checking Wix's own Pricing Plans
+dashboard). Superseded by the GoCardless mechanism below — not worth building further
+for the old path.
+
+### Payment tracking — GoCardless Direct Debit (added 2026-07-30)
+
+Replaces the mechanism above. Rob found GoCardless meaningfully cheaper than Wix/Stripe
+for this use case (1% + 20p vs 1.5% + 20p, plus a discount GoCardless offers football
+clubs) and wanted a full replacement, not a parallel option. GoCardless's API is more
+cooperative than Wix's here — it supports custom `metadata` on the resources we create —
+so this avoids the FIFO-matching hack the old mechanism needed entirely.
+
+1. **`startGoCardlessSetup(playerId, feeCategoryId, returnUrl)`** (`registration.jsw`) —
+   called the instant the parent taps `#btnSetupPayment`. Computes the fee schedule
+   (same `buildFeeSchedule()` the secretary's preview uses), inserts a new
+   **`GoCardlessSubscriptions`** row snapshotting it (`perPayment`, `scheduleCount`,
+   `firstDate`, `status: "PENDING"`), then calls `backend/gocardless.jsw`'s
+   `createBillingRequestFlow(recordId, returnUrl)` — creates a GoCardless Billing
+   Request tagged with `metadata.internalRef = recordId`, wraps it in a Billing Request
+   Flow, and returns the hosted `authorisationUrl`. The frontend redirects the parent
+   there via `wixLocationFrontend.to(...)`.
+2. **`post_gocardlessWebhook`** (`backend/http-functions.js` — first file of this kind
+   in the codebase; Wix's reserved `http-functions.js` filename for exposing an inbound
+   endpoint) verifies the `Webhook-Signature` header (HMAC-SHA256 over the raw body),
+   checks/logs each event's id into **`GoCardlessWebhookEvents`** first (GoCardless
+   webhooks retry/duplicate), then dispatches by `resource_type`/`action`:
+   - `billing_requests: fulfilled` — matches the `GoCardlessSubscriptions` row by
+     `gcBillingRequestId`, reads back the newly-created mandate's id, and (via
+     `ensureSubscriptionCreated`) immediately calls `backend/gocardless.jsw`'s
+     `createSubscription(mandateId, schedule, recordId)` — the parent doesn't take a
+     second action for this step.
+   - `mandates: active/cancelled/failed/expired` — kept as a backup path to the same
+     `ensureSubscriptionCreated` trigger, and to sync `status` if a mandate is
+     cancelled/expires outside the `billing_requests` event.
+   - `subscriptions: created/cancelled/finished` — syncs `subscriptionStatus`/`status`.
+   - `payments: confirmed/paid_out/failed/charged_back/...` — inserts a new row into
+     **`GoCardlessPayments`** (the per-payment ledger — foundation for a possible future
+     per-player/per-month "paid" tick-box view, itself not yet built) AND updates the
+     matching `GoCardlessSubscriptions` row's `lastPaymentStatus`/`lastPaymentId`/
+     `paymentsCollectedCount`.
+3. **`getGoCardlessStatus(playerId)`** (`registration.jsw`) reads the latest
+   `GoCardlessSubscriptions` row back for display — used by `statePayment`'s
+   `#textPaymentStatus` and the dashboard card's `#btnPayment` label. Field names
+   deliberately mirror the old `getChildSubscriptionStatus`'s shape (`status`,
+   `lastPaymentStatus`, plus `feeCategoryId` in place of `wixPlanId`), so
+   `describePaymentButtonLabel`/`describeSubscriptionStatus`/`renderPaymentAction` in
+   `Parent Hub.js` needed only field-name edits, not new logic — including a new
+   `"PENDING"` status case (mandate/billing request in flight, not yet active) that the
+   old Wix/Stripe flow never really needed, since GoCardless's hosted-flow round trip
+   via webhook isn't as instant as Wix's checkout confirmation.
+4. **`cancelGoCardlessSubscription(recordId)`** (`registration.jsw`) — same
+   tier-mismatch guard as before (`renderPaymentAction` compares the confirmed
+   subscription's fee category against whatever's currently assigned; `#btnSetupPayment`
+   and `#btnCancelOldPlan` are never both visible), but now a real backend call rather
+   than a direct frontend Wix API call — GoCardless's secret API key can't be used from
+   the frontend the way Wix's member-authenticated order-cancellation API could.
+   Verifies the caller's `memberId` owns the record before cancelling.
+
+**⚠️ GoCardless API details flagged as unverified until Rob has sandbox access to test
+against real payloads** (see the implementation plan for the full list): the exact
+advance-notice floor for a Bacs subscription's `start_date`, the exact link key GoCardless
+uses for a fulfilled billing request's new mandate id (code tries
+`mandate_request_mandate` then falls back to `mandate`, then falls back to re-fetching
+the billing request directly), and whether webhook payloads carry `metadata` inline.
+
+**⚠️ CMS SETUP needed:** three new collections — `GoCardlessSubscriptions`,
+`GoCardlessPayments`, `GoCardlessWebhookEvents` — plus two new Wix secrets
+(`_GOCARDLESS_ACCESS_TOKEN`, `_GOCARDLESS_WEBHOOK_SECRET`) and the `gocardless-nodejs`
+npm package installed via Velo's package manager. Full field lists in
+`database/CMS_SCHEMA.txt`.
+
+**Not yet built:** the per-player/per-month "paid" tick-box view (secretary/manager/
+parent-visible) and a secretary-facing dashboard count of successful/failed/missing
+payments — deliberately deferred until the core payment swap is confirmed working;
+the `GoCardlessPayments` ledger above is the foundation for it whenever that's picked
+back up.
 
 ### Role-based access (primary vs secondary parent)
 

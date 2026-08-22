@@ -1,0 +1,576 @@
+// =====================================================================
+//  teamAdmin.jsw — team profile, staff record, sponsors, news
+// =====================================================================
+//  The four admin screens behind More. Small, related, and all doing the
+//  same shape of thing: read a record, save a record, sometimes with an
+//  image.
+//
+//  ⚠️ IMAGES COME IN AS BASE64, NOT THROUGH A WIX UPLOAD BUTTON. Custom
+//  elements can't use $w("#upload").uploadFiles() - they're isolated from
+//  $w entirely. The element reads the file with FileReader, downscales it
+//  on a canvas, and posts base64 here. Same path the Parent Hub registration
+//  uploads already use in production, so it's proven rather than novel.
+//
+//  ⚠️ THE TEAM PROFILE FEEDS A DYNAMIC PUBLIC PAGE. Editing it is publishing
+//  to the website, not note-keeping, which is why it's gated on the
+//  `editTeam` permission rather than being available to anyone on the team.
+//  A Limited coach can read their own staff record and add a sponsor; they
+//  cannot rewrite what the public sees about the squad.
+//
+//  ⚠️ NEVER SPREAD A RECORD INTO update(). Wix silently creates a real CMS
+//  column for any unrecognised key in the payload - that's how a stray
+//  "Default season" column appeared. Every save here patches named fields on
+//  a freshly fetched record.
+// =====================================================================
+
+import wixData from 'wix-data';
+import { mediaManager } from 'wix-media-backend';
+import { assertTeamAccess, getManagerContext } from 'backend/managerData.jsw';
+import { createBlogPost } from 'backend/blog.jsw';
+// Shared so the six RICH_TEXT columns edited across this Hub are all converted
+// the same way - see backend/wixFormat.js.
+import { imageToUrl, richToText, textToRich } from 'backend/wixFormat.js';
+
+const OPTIONS = { suppressAuth: true };
+
+// Generous for a downscaled photo, small enough to refuse an untouched
+// 12-megapixel phone original that would only fill the Media Manager.
+const MAX_BYTES = 4 * 1024 * 1024;
+
+function refId(value) {
+    if (!value) return "";
+    return (typeof value === "string") ? value : (value._id || "");
+}
+
+// Shared by every image field here. Returns the wix:image:// URI, which is
+// what an IMAGE column and the Blog cover both want.
+async function uploadImage(folder, base64, fileName, mimeType) {
+    if (!base64) return "";
+    const bytes = Math.floor(base64.length * 3 / 4);
+    if (bytes > MAX_BYTES) throw new Error("That image is too big — try a smaller one.");
+
+    const safe = String(fileName || "upload.jpg").replace(/[^A-Za-z0-9._-]+/g, "-");
+    const uploaded = await mediaManager.upload(
+        folder,
+        Buffer.from(base64, "base64"),
+        safe,
+        {
+            mediaOptions: { mimeType: mimeType || "image/jpeg", mediaType: "image" },
+            metadataOptions: { isPrivate: false, isVisitorUpload: false }
+        }
+    );
+    return uploaded.fileUrl || "";
+}
+
+// ---------------------------------------------------------------------
+//  Team profile
+// ---------------------------------------------------------------------
+export async function getTeamProfile(teamId) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+        if (!access.ctx.perms.editTeam) {
+            return { success: false, error: "You don't have access to edit team details." };
+        }
+
+        const res = await wixData.query("Teams")
+            .eq("_id", teamId)
+            .include("AG_ageGroup")
+            .find(OPTIONS);
+        const team = res.items[0];
+        if (!team) return { success: false, error: "Team not found." };
+
+        const [sponsorsRes, linked] = await Promise.all([
+            wixData.query("ClubSponsors").ascending("sponsorName").limit(200).find(OPTIONS),
+            wixData.queryReferenced("Teams", teamId, "teamSponsors", OPTIONS).catch(() => ({ items: [] }))
+        ]);
+
+        return {
+            success: true,
+            id: team._id,
+            teamName: team.T_teamName || "",
+            ageGroup: (team.AG_ageGroup && team.AG_ageGroup.AG_ageGroup) || "",
+            intro: richToText(team.teamIntro),
+            achievements: richToText(team.achievements),
+            league: team.leagueDivision || "",
+            photo: imageToUrl(team.T_teamPhoto),
+            trainingDay: team.T_trainingDay || "",
+            trainingTime: team.T_trainingStartTime || "",
+            trainingPitch: team.trainingPitch || "",
+            trainingLocation: (team.trainingLocation && team.trainingLocation.formatted) ||
+                              (typeof team.trainingLocation === "string" ? team.trainingLocation : ""),
+            sponsorOptions: sponsorsRes.items.map(s => ({ value: s._id, label: s.sponsorName || "" })),
+            sponsorIds: (linked.items || []).map(s => s._id)
+        };
+    } catch (error) {
+        console.error("getTeamProfile error:", error);
+        return { success: false, error: "Couldn't load the team profile." };
+    }
+}
+
+export async function saveTeamProfile(teamId, form = {}) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+        if (!access.ctx.perms.editTeam) {
+            return { success: false, error: "You don't have access to edit team details." };
+        }
+
+        const team = await wixData.get("Teams", teamId, OPTIONS);
+        if (!team) return { success: false, error: "Team not found." };
+
+        if (form.photoBase64) {
+            team.T_teamPhoto = await uploadImage(
+                "/team-photos", form.photoBase64, form.photoName || `team-${teamId}.jpg`, form.photoType);
+        }
+
+        team.teamIntro = textToRich(form.intro);
+        team.achievements = textToRich(form.achievements);
+        team.leagueDivision = String(form.league || "").trim();
+        team.T_trainingDay = String(form.trainingDay || "").trim();
+        team.T_trainingStartTime = String(form.trainingTime || "").trim();
+        team.trainingPitch = String(form.trainingPitch || "").trim();
+        // trainingLocation is an ADDRESS column. A plain string flattens a
+        // structured address that was entered through the CMS picker, losing
+        // city, postcode and coordinates - so only write when it actually
+        // changed. Same guard the Parent Hub uses on parent addresses.
+        const currentLoc = (team.trainingLocation && team.trainingLocation.formatted) ||
+                           (typeof team.trainingLocation === "string" ? team.trainingLocation : "");
+        const incomingLoc = String(form.trainingLocation || "").trim();
+        if (incomingLoc !== currentLoc) team.trainingLocation = incomingLoc;
+
+        await wixData.update("Teams", team, OPTIONS);
+
+        if (Array.isArray(form.sponsorIds)) {
+            await wixData.replaceReferences("Teams", "teamSponsors", teamId, form.sponsorIds, OPTIONS);
+        }
+
+        return { success: true, photo: imageToUrl(team.T_teamPhoto) };
+    } catch (error) {
+        console.error("saveTeamProfile error:", error);
+        return { success: false, error: error.message || "Couldn't save the team profile." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Staff record — always the caller's own
+// ---------------------------------------------------------------------
+// Takes no id on purpose. A manager edits their own bio and photo; anything
+// wider is the secretary's Staff Admin screen, which already exists.
+export async function getMyStaffRecord() {
+    try {
+        const ctx = await getManagerContext();
+        if (!ctx.success) return { success: false, error: ctx.error };
+
+        const staff = await wixData.get("SignolStaff", ctx.staffId, OPTIONS);
+        if (!staff) return { success: false, error: "Staff record not found." };
+
+        const [qualsRes, linked] = await Promise.all([
+            wixData.query("Qualifications").ascending("Q_badgeName").limit(200).find(OPTIONS).catch(() => ({ items: [] })),
+            wixData.queryReferenced("SignolStaff", ctx.staffId, "SS_Qualifications", OPTIONS).catch(() => ({ items: [] }))
+        ]);
+
+        return {
+            success: true,
+            id: staff._id,
+            name: staff.SS_name || `${staff.SS_firstName || ""} ${staff.SS_lastName || ""}`.trim(),
+            bio: richToText(staff.bio),
+            headshot: imageToUrl(staff.headshot),
+            mobile: staff.mobile || "",
+            email: staff.emailAddress || "",
+            // Read-only compliance dates. Shown because an out-of-date DBS is
+            // the manager's problem to chase, but only the secretary can
+            // change them.
+            dbsExpiry: staff.dbsExpiry || null,
+            firstAidExpiry: staff.firstAidExpiry || null,
+            safeGuardingExpiry: staff.safeGuardingExpiry || null,
+            coachingExpiry: staff.coachingExpiry || null,
+            qualOptions: (qualsRes.items || []).map(q => ({
+                value: q._id, label: q.Q_badgeName || q.shortName || ""
+            })).filter(q => q.label),
+            qualIds: (linked.items || []).map(q => q._id)
+        };
+    } catch (error) {
+        console.error("getMyStaffRecord error:", error);
+        return { success: false, error: "Couldn't load your staff record." };
+    }
+}
+
+export async function saveMyStaffRecord(form = {}) {
+    try {
+        const ctx = await getManagerContext();
+        if (!ctx.success) return { success: false, error: ctx.error };
+
+        const staff = await wixData.get("SignolStaff", ctx.staffId, OPTIONS);
+        if (!staff) return { success: false, error: "Staff record not found." };
+
+        if (form.photoBase64) {
+            staff.headshot = await uploadImage(
+                "/staff-headshots", form.photoBase64, form.photoName || `staff-${ctx.staffId}.jpg`, form.photoType);
+        }
+
+        staff.bio = textToRich(form.bio);
+        // Mobile matters beyond the profile page - it's what prints on a
+        // recruitment poster, so it's editable here rather than secretary-only.
+        if (typeof form.mobile === "string") staff.mobile = form.mobile.trim();
+
+        await wixData.update("SignolStaff", staff, OPTIONS);
+
+        if (Array.isArray(form.qualIds)) {
+            await wixData.replaceReferences("SignolStaff", "SS_Qualifications", ctx.staffId, form.qualIds, OPTIONS);
+        }
+
+        return { success: true, headshot: imageToUrl(staff.headshot) };
+    } catch (error) {
+        console.error("saveMyStaffRecord error:", error);
+        return { success: false, error: error.message || "Couldn't save your record." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Sponsors
+// ---------------------------------------------------------------------
+export async function getSponsors() {
+    try {
+        const ctx = await getManagerContext();
+        if (!ctx.success) return { success: false, error: ctx.error };
+
+        const teamIds = (ctx.teams || []).map(t => t.id).filter(Boolean);
+        if (teamIds.length === 0) return { success: true, sponsors: [] };
+
+        // EVERY team, not just this manager's. Deleting a sponsor club-wide
+        // has to be able to warn that another squad is also using them - and
+        // at ~20 teams one query is cheaper than being vague about it.
+        const teams = await wixData.query("Teams")
+            .include("teamSponsors")
+            .limit(200)
+            .find(OPTIONS);
+
+        // Sponsors are club-wide records but a manager only sees the ones
+        // attached to their own squads - the same scoping the old screen had.
+        const seen = new Set();
+        const sponsors = [];
+        teams.items.forEach(team => {
+            const mine = teamIds.indexOf(team._id) !== -1;
+            (team.teamSponsors || []).forEach(s => {
+                const id = refId(s);
+                if (!id) return;
+                const entry = { id: team._id, name: team.T_teamName || "Team" };
+
+                if (seen.has(id)) {
+                    const prev = sponsors.find(x => x.id === id);
+                    if (prev) (mine ? prev.teams : prev.otherTeams).push(entry);
+                    return;
+                }
+                // Only surfaced if one of THIS manager's teams uses them -
+                // a manager has no reason to see another squad's sponsors.
+                if (!mine) return;
+                seen.add(id);
+                sponsors.push({
+                    id,
+                    name: s.sponsorName || "",
+                    logo: imageToUrl(s.sponsorLogo),
+                    url: s.sponsorUrl || "",
+                    blurb: richToText(s.sponsorBlurb),
+                    // Which of THIS manager's teams the sponsor is attached to,
+                    // so the remove button can name them rather than being
+                    // vague about what it's about to do.
+                    teams: [entry],
+                    otherTeams: []
+                });
+            });
+        });
+
+        // A sponsor first seen on one of my teams may also be on someone
+        // else's; that pass only records attachments found AFTER the first.
+        // Catch the ones found before it.
+        teams.items.forEach(team => {
+            if (teamIds.indexOf(team._id) !== -1) return;
+            (team.teamSponsors || []).forEach(s => {
+                const id = refId(s);
+                const sp = sponsors.find(x => x.id === id);
+                if (!sp) return;
+                if (!sp.otherTeams.some(t => t.id === team._id)) {
+                    sp.otherTeams.push({ id: team._id, name: team.T_teamName || "Team" });
+                }
+            });
+        });
+
+        sponsors.sort((a, b) => a.name.localeCompare(b.name));
+
+        // Everything on the club list this manager's teams DON'T already have.
+        // Sponsors get re-used across squads far more often than new ones get
+        // created, and re-typing a name and re-uploading a logo produces a
+        // duplicate record that then has to be cleaned up.
+        const all = await wixData.query("ClubSponsors")
+            .ascending("sponsorName")
+            .limit(200)
+            .find(OPTIONS);
+
+        const onMine = new Set(sponsors.map(s => s.id));
+        const available = all.items
+            .filter(s => !onMine.has(s._id))
+            .map(s => ({
+                id: s._id,
+                name: s.sponsorName || "",
+                logo: imageToUrl(s.sponsorLogo)
+            }))
+            .filter(s => s.name);
+
+        return { success: true, sponsors, available };
+    } catch (error) {
+        console.error("getSponsors error:", error);
+        return { success: false, error: "Couldn't load sponsors." };
+    }
+}
+
+export async function addSponsor(form = {}) {
+    try {
+        const ctx = await getManagerContext();
+        if (!ctx.success) return { success: false, error: ctx.error };
+
+        const name = String(form.name || "").trim();
+        if (!name) return { success: false, error: "Give the sponsor a name." };
+
+        let url = String(form.url || "").trim();
+        // A bare "example.com" in an href resolves relative to the site and
+        // 404s. Carried over from the old form, which got this right.
+        if (url && !/^https?:\/\//i.test(url)) url = "https://" + url;
+
+        const logo = form.logoBase64
+            ? await uploadImage("/sponsor-logos", form.logoBase64, form.logoName || `${name}.png`, form.logoType)
+            : "";
+
+        const saved = await wixData.insert("ClubSponsors", {
+            sponsorName: name,
+            sponsorLogo: logo,
+            sponsorUrl: url,
+            sponsorBlurb: textToRich(form.blurb)
+        }, OPTIONS);
+
+        // Attached to the team straight away, otherwise it's invisible to the
+        // manager who just added it - sponsors are listed by team association.
+        if (form.teamId) {
+            const access = await assertTeamAccess(form.teamId);
+            if (access.ok) {
+                await wixData.insertReference("Teams", "teamSponsors", form.teamId, saved._id, OPTIONS);
+            }
+        }
+
+        return { success: true, id: saved._id };
+    } catch (error) {
+        console.error("addSponsor error:", error);
+        return { success: false, error: error.message || "Couldn't add that sponsor." };
+    }
+}
+
+// Detaches a sponsor from the caller's teams. Deliberately does NOT delete the
+// ClubSponsors record: sponsors are club-wide and another squad may still be
+// sponsored by them - a manager ending their own arrangement shouldn't wipe
+// someone else's. Deleting the record outright is a secretary's job.
+//
+// Scoped to teams the caller actually manages, so this can't detach a sponsor
+// from a squad that isn't theirs even if the id is guessed.
+export async function removeSponsorFromMyTeams(sponsorId) {
+    try {
+        const ctx = await getManagerContext();
+        if (!ctx.success) return { success: false, error: ctx.error };
+        if (!sponsorId) return { success: false, error: "No sponsor given." };
+
+        const teamIds = (ctx.teams || []).map(t => t.id).filter(Boolean);
+        if (teamIds.length === 0) return { success: false, error: "You're not assigned to a team." };
+
+        const teams = await wixData.query("Teams")
+            .hasSome("_id", teamIds)
+            .include("teamSponsors")
+            .find(OPTIONS);
+
+        const removedFrom = [];
+        for (const team of teams.items) {
+            const has = (team.teamSponsors || []).some(s => refId(s) === sponsorId);
+            if (!has) continue;
+            await wixData.removeReference("Teams", "teamSponsors", team._id, sponsorId, OPTIONS);
+            removedFrom.push(team.T_teamName || "your team");
+        }
+
+        if (removedFrom.length === 0) {
+            return { success: false, error: "That sponsor isn't on any of your teams." };
+        }
+        return { success: true, removedFrom };
+    } catch (error) {
+        console.error("removeSponsorFromMyTeams error:", error);
+        return { success: false, error: "Couldn't remove that sponsor." };
+    }
+}
+
+// Attaches a sponsor that already exists on the club list. The common case by
+// far - a local business sponsoring a second squad is one tap, not a retyped
+// name and a re-uploaded logo that becomes a duplicate record.
+export async function attachSponsor(teamId, sponsorId) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+        if (!sponsorId) return { success: false, error: "No sponsor given." };
+
+        const sponsor = await wixData.get("ClubSponsors", sponsorId, OPTIONS);
+        if (!sponsor) return { success: false, error: "That sponsor no longer exists." };
+
+        // Already attached is not an error worth stopping for - two managers
+        // adding the same sponsor at once should both end up fine.
+        const teamRes = await wixData.query("Teams")
+            .eq("_id", teamId)
+            .include("teamSponsors")
+            .find(OPTIONS);
+        const team = teamRes.items[0];
+        if (team && (team.teamSponsors || []).some(s => refId(s) === sponsorId)) {
+            return { success: true, name: sponsor.sponsorName || "Sponsor", already: true };
+        }
+
+        await wixData.insertReference("Teams", "teamSponsors", teamId, sponsorId, OPTIONS);
+        return { success: true, name: sponsor.sponsorName || "Sponsor" };
+    } catch (error) {
+        console.error("attachSponsor error:", error);
+        return { success: false, error: "Couldn't add that sponsor." };
+    }
+}
+
+// Deletes the sponsor RECORD outright, after detaching it from every team.
+//
+// ⚠️ This is club-wide and can't be undone. It's offered at manager level
+// because in practice a manager is the one who knows a sponsorship has ended -
+// but the element shows which OTHER squads use them first, so nobody removes
+// someone else's sponsor without being told. Informed rather than blocked:
+// blocking would just mean the record lingers forever with nobody able to
+// tidy it.
+//
+// References go first. Deleting the record while teams still point at it would
+// leave dangling references that nothing ever cleans up.
+export async function deleteSponsor(sponsorId) {
+    try {
+        const ctx = await getManagerContext();
+        if (!ctx.success) return { success: false, error: ctx.error };
+        if (!sponsorId) return { success: false, error: "No sponsor given." };
+
+        const sponsor = await wixData.get("ClubSponsors", sponsorId, OPTIONS);
+        if (!sponsor) return { success: false, error: "That sponsor no longer exists." };
+
+        const teams = await wixData.query("Teams")
+            .include("teamSponsors")
+            .limit(200)
+            .find(OPTIONS);
+
+        const detached = [];
+        for (const team of teams.items) {
+            const has = (team.teamSponsors || []).some(s => refId(s) === sponsorId);
+            if (!has) continue;
+            await wixData.removeReference("Teams", "teamSponsors", team._id, sponsorId, OPTIONS);
+            detached.push(team.T_teamName || "a team");
+        }
+
+        await wixData.remove("ClubSponsors", sponsorId, OPTIONS);
+        return { success: true, name: sponsor.sponsorName || "Sponsor", detached };
+    } catch (error) {
+        console.error("deleteSponsor error:", error);
+        return { success: false, error: "Couldn't delete that sponsor." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  News
+// ---------------------------------------------------------------------
+export async function postNews(form = {}) {
+    try {
+        const ctx = await getManagerContext();
+        if (!ctx.success) return { success: false, error: ctx.error };
+
+        const headline = String(form.headline || "").trim();
+        const body = String(form.body || "").trim();
+        if (!headline) return { success: false, error: "Give the story a headline." };
+        if (!body) return { success: false, error: "Write the story." };
+
+        if (form.teamId) {
+            const access = await assertTeamAccess(form.teamId);
+            if (!access.ok) return { success: false, error: access.error };
+        }
+
+        const image = form.imageBase64
+            ? await uploadImage("/news-images", form.imageBase64, form.imageName || "news.jpg", form.imageType)
+            : "";
+
+        // Converted once and used for both - the CMS column and the Blog
+        // want the same HTML, and converting twice would double-escape it.
+        const bodyHtml = textToRich(body);
+
+        const row = {
+            headline,
+            articleBody: bodyHtml,
+            featuredImage: image,
+            type: String(form.type || "News"),
+            posted: true
+        };
+        if (form.teamId) row.team = form.teamId;
+
+        // ⚠️ NOTHING READS THIS YET. The old news form set it to today + 60
+        // days and no code anywhere reads it back - if it does anything, it's
+        // a dataset filter on the news page in the Editor, which isn't visible
+        // from here.
+        //
+        // Written anyway, and with the SAME 60 days, so posts made through this
+        // form are indistinguishable from the old ones. The alternative is a
+        // column where half the rows have a date and half are blank, which
+        // would behave unpredictably the moment a filter is switched on.
+        //
+        // A caller-supplied date wins, for when this becomes editable.
+        if (form.expire) {
+            row.expire = new Date(form.expire);
+        } else {
+            const expires = new Date();
+            expires.setDate(expires.getDate() + 60);
+            expires.setHours(0, 0, 0, 0);
+            row.expire = expires;
+        }
+
+        const saved = await wixData.insert("ClubNews", row, OPTIONS);
+
+        // Auto-publish to the Wix Blog, exactly as the old form did. A failure
+        // here must NOT fail the whole post - the news item is already saved
+        // and shows on the site; the blog copy is a bonus.
+        let blogPostId = "";
+        try {
+            // ⚠️ memberId is REQUIRED - createBlogPost throws without it, and
+            // this whole block is wrapped in a catch, so passing null failed
+            // silently: the news item saved and the blog copy never appeared.
+            const blog = await createBlogPost({
+                title: headline,
+                bodyHtml: bodyHtml,
+                featuredImage: image,
+                memberId: ctx.memberId
+            });
+            blogPostId = (blog && blog.blogPostId) || "";
+            if (blogPostId) {
+                const fresh = await wixData.get("ClubNews", saved._id, OPTIONS);
+                fresh.blogPostId = blogPostId;
+                await wixData.update("ClubNews", fresh, OPTIONS);
+            }
+        } catch (blogErr) {
+            // Deliberately non-fatal: the news item is already saved and shows on
+            // the site, so a blog failure shouldn't lose the manager's writing.
+            // But it MUST be loud in the log - a silent catch here is what hid
+            // the missing-author bug.
+            console.error("[teamAdmin] blog publish FAILED, news item still saved. reason:",
+                blogErr && blogErr.message, blogErr);
+        }
+
+        return {
+            success: true,
+            id: saved._id,
+            blogPostId,
+            message: blogPostId
+                ? "Posted to the website and the club blog."
+                : "Posted to the website."
+        };
+    } catch (error) {
+        console.error("postNews error:", error);
+        return { success: false, error: error.message || "Couldn't post that story." };
+    }
+}

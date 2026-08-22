@@ -1,0 +1,26 @@
+import wixData from 'wix-data';
+
+// GoCardlessWebhookEvents exists purely for webhook idempotency (see markProcessed in
+// backend/http-functions.js) - GoCardless's own retry window is only a few days, so once
+// a row's past that it serves no further purpose. Without this, the table grows forever:
+// every payment event, every month, for every child, on top of the one-off signup events.
+export async function pruneGoCardlessWebhookEvents() {
+    try {
+        const cutoff = new Date();
+        cutoff.setDate(cutoff.getDate() - 30);
+
+        const stale = await wixData.query("GoCardlessWebhookEvents")
+            .lt("_createdDate", cutoff)
+            .limit(1000)
+            .find({ suppressAuth: true });
+
+        if (stale.items.length > 0) {
+            await wixData.bulkRemove("GoCardlessWebhookEvents", stale.items.map(i => i._id), { suppressAuth: true });
+            console.log(`Pruned ${stale.items.length} old GoCardless webhook events.`);
+        } else {
+            console.log("No stale GoCardless webhook events to prune.");
+        }
+    } catch (err) {
+        console.error("GoCardless webhook cleanup crashed:", err);
+    }
+}

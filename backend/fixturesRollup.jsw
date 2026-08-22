@@ -1,0 +1,199 @@
+// =====================================================================
+//  fixturesRollup.jsw — nightly RSVP archiving
+// =====================================================================
+//  Once a fixture has happened, its responses stop being live data and
+//  become history. This collapses them onto the fixture row and deletes
+//  the originals, which is what stops FixtureResponses growing forever.
+//
+//  Without it: ~230 children with training and a match most weeks is
+//  ~17,000 rows a season, compounding annually. With it, FixtureResponses
+//  only ever holds responses for fixtures that haven't happened yet -
+//  roughly a fortnight's worth, a few hundred rows, flat year on year.
+//
+//  Triggered by the 02:00 cron in jobs.config. Ran manually behind an
+//  email gate during the 2026-08 build; that hook was deleted once the
+//  scheduled run was confirmed working, since an exported .jsw function is
+//  callable by anyone who knows its name.
+//
+//  SCHEDULING: triggered off the FIXTURE, not the calendar - "anything
+//  that has passed and isn't rolled up yet". A missed run is picked up by
+//  the next one, and `rsvpRolledUp` makes double-processing impossible.
+//  A fixed weekly sweep would leave a Tuesday fixture unarchived for days
+//  and lose a week entirely if one run failed.
+//
+//  ORDER MATTERS: write the summary, confirm it, and only then delete the
+//  hot rows. The reverse would lose the lot if the write failed.
+//
+//  ⚠️ These are RESPONSES, not attendance. `rsvpAccepted` is who SAID they
+//  were coming. If the club ever wants a real register, that's a manager
+//  marking who turned up - a different field and a different screen.
+// =====================================================================
+
+import wixData from 'wix-data';
+import { isExpectedAtFixture, playerName, STATUS_NAMES } from 'backend/squadRules.js';
+
+const OPTIONS = { suppressAuth: true };
+
+// Fixtures per run. Generous enough to clear a backlog after an outage,
+// small enough that one run can't time out.
+const MAX_PER_RUN = 100;
+
+function refId(value) {
+    if (!value) return "";
+    return (typeof value === "string") ? value : (value._id || "");
+}
+
+function toEventDate(value) {
+    if (!value) return null;
+    const d = (value instanceof Date) ? value : new Date(String(value).slice(0, 10) + "T00:00:00");
+    return isNaN(d.getTime()) ? null : d;
+}
+
+export async function rollUpFixtureResponses() {
+    const summary = { checked: 0, rolledUp: 0, responsesArchived: 0, errors: 0 };
+
+    try {
+        // Can't filter on date in the query - date_only is a string field, and
+        // comparing it against a Date silently matches nothing. Pull the
+        // un-rolled ones and sort it out here.
+        //
+        // ⚠️ NOT `.ne("rsvpRolledUp", true)`. A column added to a collection
+        // that already has rows leaves those rows with the field UNSET, not
+        // false - and Wix Data's .ne() doesn't reliably match an unset field,
+        // so it returned zero candidates and the job silently did nothing.
+        // isEmpty() is what actually catches "never been set".
+        const base = () => wixData.query("fixtures");
+        const candidates = await base().eq("rsvpRolledUp", false)
+            .or(base().isEmpty("rsvpRolledUp"))
+            .limit(500)
+            .find(OPTIONS);
+
+        console.log("[fixturesRollup] candidates not yet rolled up:", candidates.items.length);
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        // Only once the day is fully behind us, so a fixture can't be archived
+        // on the morning of the event while parents are still answering.
+        const due = candidates.items
+            .filter(f => {
+                const d = toEventDate(f.date_only);
+                return d && d < today;
+            })
+            .slice(0, MAX_PER_RUN);
+
+        summary.checked = due.length;
+        // Separates "the query found nothing" from "it found rows but none
+        // have happened yet" - two very different problems that both surface
+        // as checked: 0.
+        if (candidates.items.length > 0 && due.length === 0) {
+            console.log("[fixturesRollup] candidates found but none in the past. Dates seen:",
+                candidates.items.map(f => f.date_only).join(", "));
+        }
+
+        for (const fixture of due) {
+            try {
+                const responsesRes = await wixData.query("FixtureResponses")
+                    .eq("fixtureReference", fixture._id)
+                    .limit(1000)
+                    .find(OPTIONS);
+                const responses = responsesRes.items;
+
+                // Everyone the fixture applied to, so "no reply" is a real list
+                // rather than something derived later. Squads change - a player
+                // who leaves in March shouldn't retrospectively disappear from
+                // January's no-reply list.
+                const teamId = refId(fixture.club_team);
+                let squad = [];
+                if (teamId) {
+                    const squadRes = await wixData.query("SignolPlayers")
+                        .eq("SP_team", teamId)
+                        .limit(1000)
+                        .find(OPTIONS);
+
+                    // The same rule the parent-facing list uses. Without the
+                    // status half of it, everyone who has EVER been on the
+                    // team counted - players who left last season included -
+                    // and rsvpNoReplyCount was meaningless as a chase list.
+                    squad = squadRes.items.filter(p => isExpectedAtFixture(fixture, p));
+
+                    const dropped = squadRes.items.length - squad.length;
+                    if (dropped > 0) {
+                        console.log(`[fixturesRollup] ${fixture._id}: ${squadRes.items.length} on team, ` +
+                            `${squad.length} expected, ${dropped} excluded (left/enquiry/invited/audience)`);
+                    }
+                }
+
+                const named = playerName;
+                const byId = {};
+                responses.forEach(r => { byId[refId(r.playerReference)] = r.response; });
+
+                const accepted = [], declined = [], noReply = [];
+                squad.forEach(p => {
+                    const answer = byId[p._id];
+                    const entry = { id: p._id, name: named(p) };
+                    if (answer === "Accepted") accepted.push(entry);
+                    else if (answer === "Declined") declined.push(entry);
+                    else noReply.push(entry);
+                });
+
+                // Someone who answered and has since left the squad still
+                // answered - keep them rather than losing the record.
+                responses.forEach(r => {
+                    const pid = refId(r.playerReference);
+                    if (squad.some(p => p._id === pid)) return;
+                    const entry = { id: pid, name: "(no longer in squad)" };
+                    if (r.response === "Accepted") accepted.push(entry);
+                    else if (r.response === "Declined") declined.push(entry);
+                });
+
+                // The number on its own is the thing Rob queried - "12 no
+                // replies" is unactionable until you can see whether those are
+                // real children. Names and statuses make it checkable.
+                if (noReply.length > 0) {
+                    const byStatus = {};
+                    squad.forEach(p => {
+                        if (!noReply.some(x => x.id === p._id)) return;
+                        const label = STATUS_NAMES[
+                            (typeof p.SP_status === "string") ? p.SP_status : (p.SP_status && p.SP_status._id)
+                        ] || "unset/unknown";
+                        byStatus[label] = (byStatus[label] || 0) + 1;
+                    });
+                    console.log(`[fixturesRollup] ${fixture._id}: ${noReply.length} no reply -`,
+                        JSON.stringify(byStatus), "|", noReply.map(x => x.name).join(", "));
+                }
+
+                fixture.rsvpAccepted = JSON.stringify(accepted);
+                fixture.rsvpDeclined = JSON.stringify(declined);
+                fixture.rsvpNoReply = JSON.stringify(noReply);
+                fixture.rsvpAcceptedCount = accepted.length;
+                fixture.rsvpDeclinedCount = declined.length;
+                fixture.rsvpNoReplyCount = noReply.length;
+                fixture.rsvpRolledUp = true;
+                fixture.rsvpRolledUpDate = new Date();
+
+                await wixData.update("fixtures", fixture, OPTIONS);
+
+                // Only now, with the summary safely written.
+                for (const r of responses) {
+                    await wixData.remove("FixtureResponses", r._id, OPTIONS);
+                }
+
+                summary.rolledUp++;
+                summary.responsesArchived += responses.length;
+            } catch (err) {
+                // One bad fixture mustn't stop the rest. It stays un-rolled and
+                // the next run tries again.
+                summary.errors++;
+                console.error(`[fixturesRollup] fixture ${fixture._id} failed:`, err.message);
+            }
+        }
+
+        console.log("[fixturesRollup] done", summary);
+        return summary;
+    } catch (error) {
+        console.error("[fixturesRollup] run failed:", error);
+        summary.errors++;
+        return summary;
+    }
+}

@@ -23,7 +23,13 @@ export async function getTeamManager(teamId) {
                 return {
                     "fullName": manager.SS_name || "Manager TBC",
                     "photo": manager.headshot || "https://static.wixstatic.com/media/your-default-avatar-link.png",
-                    "team": teamItem.T_teamName
+                    "team": teamItem.T_teamName,
+                    // Added 2026-08-15 for Parent Hub v2's More > Club Contacts.
+                    // Parents only ever see the manager of a team their own
+                    // child is in - the repeater is built from their kids'
+                    // teams, not every team at the club.
+                    "mobile": manager.mobile || "",
+                    "emailAddress": manager.emailAddress || ""
                 };
             }
         }
@@ -78,6 +84,141 @@ export async function getFullTeamStaff(teamId) {
 }
 
 
+// =====================================================================
+//  SECRETARY STAFF ADMIN (2026-08 redesign) — list + StaffRecord/StaffQuickAdd
+//  lightboxes, replacing the old inline-editable repeater. See
+//  docs/STAFF_RECORD_ELEMENTS.md for the full field list. status/startDate/
+//  emergencyContactName/emergencyContactRelation/emergencyContactPhone/notes
+//  were added to SignolStaff 2026-08 and are wired below the same as every
+//  other field.
+// =====================================================================
+
+// Team/role/qualification pickers - used for both the roster's filter
+// dropdowns (Player Admin.js) and the record's add-a-role/team/badge
+// dropdowns (Staff Record.js / Staff Quick Add.js).
+export async function getStaffFormOptions() {
+    const options = { suppressAuth: true, suppressHooks: true };
+    const [teams, roles, quals] = await Promise.all([
+        wixData.query("Teams").ascending("T_teamName").limit(1000).find(options),
+        wixData.query("ClubRoles").ascending("CR_role").limit(1000).find(options),
+        wixData.query("Qualifications").ascending("Q_badgeName").limit(1000).find(options)
+    ]);
+    return {
+        teams: teams.items.map(t => ({ _id: t._id, label: t.T_teamName })),
+        roles: roles.items.map(r => ({ _id: r._id, label: r.CR_role })),
+        qualifications: quals.items.map(q => ({ _id: q._id, label: q.Q_badgeName }))
+    };
+}
+
+// One query with .include() for the whole roster (not per-item queryReferenced
+// calls - that'd be an N+1 query for every staff member). .include() resolves
+// multi-reference fields to arrays of full referenced items, same as a normal
+// reference field, just an array of them.
+export async function getStaffRoster() {
+    const options = { suppressAuth: true, suppressHooks: true };
+    const res = await wixData.query("SignolStaff")
+        .include("SS_team", "SS_role")
+        .ascending("SS_name")
+        .limit(1000)
+        .find(options);
+
+    return res.items.map(item => ({
+        _id: item._id,
+        name: item.SS_name || "Unnamed",
+        teams: (item.SS_team || []).map(t => t.T_teamName).filter(Boolean),
+        teamIds: (item.SS_team || []).map(t => t._id),
+        roles: (item.SS_role || []).map(r => r.CR_role).filter(Boolean),
+        roleIds: (item.SS_role || []).map(r => r._id),
+        dbsExpiry: item.dbsExpiry || null,
+        firstAidExpiry: item.firstAidExpiry || null,
+        safeGuardingExpiry: item.safeGuardingExpiry || null,
+        coachingExpiry: item.coachingExpiry || null,
+        status: item.status || ""
+    }));
+}
+
+export async function getStaffRecord(staffId) {
+    const options = { suppressAuth: true, suppressHooks: true };
+    const item = await wixData.get("SignolStaff", staffId, options);
+    if (!item) return null;
+
+    const [teamRes, roleRes, qualRes] = await Promise.all([
+        wixData.queryReferenced("SignolStaff", staffId, "SS_team", options),
+        wixData.queryReferenced("SignolStaff", staffId, "SS_role", options),
+        wixData.queryReferenced("SignolStaff", staffId, "SS_Qualifications", options)
+    ]);
+
+    return {
+        _id: item._id,
+        name: item.SS_name || "",
+        dob: item.dob || null,
+        fanNumber: item.fanNumber || null,
+        email: item.emailAddress || "",
+        mobile: item.mobile || "",
+        address: item.address || "",
+        headshot: item.headshot || "",
+        dbsExpiry: item.dbsExpiry || null,
+        firstAidExpiry: item.firstAidExpiry || null,
+        safeGuardingExpiry: item.safeGuardingExpiry || null,
+        coachingExpiry: item.coachingExpiry || null,
+        status: item.status || "",
+        startDate: item.startDate || null,
+        emergencyContactName: item.emergencyContactName || "",
+        emergencyContactRelation: item.emergencyContactRelation || "",
+        emergencyContactPhone: item.emergencyContactPhone || "",
+        notes: item.notes || "",
+        teams: teamRes.items.map(t => ({ _id: t._id, label: t.T_teamName })),
+        roles: roleRes.items.map(r => ({ _id: r._id, label: r.CR_role })),
+        qualifications: qualRes.items.map(q => ({ _id: q._id, label: q.Q_badgeName }))
+    };
+}
+
+// fields: plain-value keys (SS_name/dob/fanNumber/emailAddress/mobile/address/
+// the 4 expiry dates/status/startDate/emergencyContact*/notes) plus optional
+// teamIds/roleIds/qualificationIds arrays. Only known keys are written - never
+// spread the fetched record back in wholesale (auto-creates phantom CMS
+// columns), same rule as patchPlayer() in Player Admin.js.
+export async function saveStaffRecord(staffId, fields) {
+    const options = { suppressAuth: true, suppressHooks: true };
+    const record = await wixData.get("SignolStaff", staffId, options);
+
+    const EDITABLE = ["SS_name", "dob", "fanNumber", "emailAddress", "mobile", "address",
+        "dbsExpiry", "firstAidExpiry", "safeGuardingExpiry", "coachingExpiry", "headshot",
+        "status", "startDate", "emergencyContactName", "emergencyContactRelation", "emergencyContactPhone", "notes"];
+    EDITABLE.forEach(key => {
+        if (fields[key] !== undefined) record[key] = fields[key];
+    });
+    await wixData.update("SignolStaff", record, options);
+
+    if (fields.teamIds) await wixData.replaceReferences("SignolStaff", "SS_team", staffId, fields.teamIds, options);
+    if (fields.roleIds) await wixData.replaceReferences("SignolStaff", "SS_role", staffId, fields.roleIds, options);
+    if (fields.qualificationIds) await wixData.replaceReferences("SignolStaff", "SS_Qualifications", staffId, fields.qualificationIds, options);
+
+    return { success: true };
+}
+
+// Quick-add - just enough to create the row (name/email/mobile + one team/role);
+// StaffRecord opens straight into edit mode afterwards for everything else.
+export async function createStaffMember(fields) {
+    const options = { suppressAuth: true, suppressHooks: true };
+    const res = await wixData.insert("SignolStaff", {
+        SS_name: fields.name || "New Staff Member",
+        emailAddress: fields.email || "",
+        mobile: fields.mobile || ""
+    }, options);
+
+    if (fields.teamId) await wixData.replaceReferences("SignolStaff", "SS_team", res._id, [fields.teamId], options);
+    if (fields.roleId) await wixData.replaceReferences("SignolStaff", "SS_role", res._id, [fields.roleId], options);
+
+    return { _id: res._id };
+}
+
+export async function removeStaffMember(staffId) {
+    const options = { suppressAuth: true, suppressHooks: true };
+    await wixData.remove("SignolStaff", staffId, options);
+    return { success: true };
+}
+
 export async function linkMemberToStaff(memberId, loginEmail) {
     const options = { "suppressAuth": true, "suppressHooks": true };
     
@@ -122,5 +263,101 @@ export async function linkMemberToStaff(memberId, loginEmail) {
     } catch (err) {
         console.error("Vault: Sync Error", err);
         return { status: "error", message: err.message };
+    }
+}
+
+// =====================================================================
+//  CLUB OFFICIALS — Parent Hub v2, More tab (2026-08-16)
+// =====================================================================
+//  Club-wide contacts (Secretary, Chairman) as opposed to getTeamManager's
+//  per-team ones. Parents see these regardless of which team their kids
+//  are in, so there's no team filter here.
+//
+//  SS_role is a MULTI_REFERENCE to ClubRoles, not text - so this is a
+//  two-step lookup: resolve the role names to ClubRoles ids first, then
+//  find staff pointing at them. Same shape as getFullTeamStaff's
+//  hasSome("SS_team", ...).
+// =====================================================================
+
+// Role names as spelled in the ClubRoles collection's CR_role field.
+// Matching is case-insensitive, but the SPELLING must exist - "Chairman"
+// won't match a row labelled "Chair" or "Club Chairman". Check the
+// collection if a contact comes back missing.
+const OFFICIAL_ROLES = ["Secretary", "Chairman"];
+
+export async function getClubOfficials(roleNames) {
+    const options = { suppressAuth: true, suppressHooks: true };
+    const wanted = (Array.isArray(roleNames) && roleNames.length ? roleNames : OFFICIAL_ROLES)
+        .map(r => String(r || "").trim().toLowerCase())
+        .filter(Boolean);
+
+    if (!wanted.length) return [];
+
+    try {
+        // 1. Resolve role names -> ClubRoles ids. Pulling the whole
+        //    collection and filtering in JS rather than building an `or`
+        //    chain: it's a tiny lookup table, and this way the match can be
+        //    case-insensitive (CR_role is free text, so casing drifts).
+        const roleRes = await wixData.query("ClubRoles").limit(200).find(options);
+
+        const roleById = new Map();
+        roleRes.items.forEach(item => {
+            const label = String(item.CR_role || "").trim();
+            if (label && wanted.includes(label.toLowerCase())) {
+                roleById.set(item._id, label);
+            }
+        });
+
+        if (!roleById.size) {
+            console.warn("getClubOfficials: no ClubRoles matched " + wanted.join(", "));
+            return [];
+        }
+
+        // 2. Staff holding any of those roles.
+        const staffRes = await wixData.query("SignolStaff")
+            .hasSome("SS_role", Array.from(roleById.keys()))
+            .ascending("siteRank")
+            .find(options);
+
+        // 3. queryReferenced per staff member so each one is labelled with
+        //    the role that actually got them into this list - a person can
+        //    hold several (Secretary AND Treasurer) and we only want to
+        //    show the relevant one.
+        const officials = await Promise.all(staffRes.items.map(async (item) => {
+            const theirRoles = await wixData.queryReferenced("SignolStaff", item._id, "SS_role", options);
+
+            const matched = theirRoles.items
+                .filter(r => roleById.has(r._id))
+                .map(r => roleById.get(r._id));
+
+            // NO mobile number, deliberately. These are volunteers' personal
+            // numbers and every parent in the club sees this list - leaving it
+            // out of the payload keeps it out of the page source too, which
+            // hiding it in the UI alone would not. Team managers are the
+            // exception (getTeamManager), since parents need to reach them
+            // about a specific match at short notice.
+            return {
+                _id: item._id,
+                role: matched.join(" & ") || "Club Official",
+                fullName: item.SS_name || "",
+                emailAddress: item.emailAddress || ""
+            };
+        }));
+
+        // Return in the order the roles were requested, so the More tab
+        // doesn't reshuffle depending on how the CMS happens to sort.
+        officials.sort((a, b) => {
+            const rank = (o) => {
+                const i = wanted.indexOf(String(o.role).split(" & ")[0].toLowerCase());
+                return i === -1 ? 999 : i;
+            };
+            return rank(a) - rank(b);
+        });
+
+        return officials;
+
+    } catch (err) {
+        console.error("getClubOfficials failed", err);
+        return [];
     }
 }

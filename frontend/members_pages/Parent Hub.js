@@ -4,7 +4,7 @@
     import { currentMember } from 'wix-members-frontend';
     import wixData from 'wix-data';
     import wixLocationFrontend from 'wix-location-frontend';
-    import { hubEmailSweep, secureUpdatePlayerRegistration, secureUpdateParentProfile, findPlayerByFanNumberAndDob, confirmPlayerLink, getKidsForParent } from 'backend/registration.jsw';
+    import { hubEmailSweep, secureUpdatePlayerRegistration, secureUpdateParentProfile, findPlayerByFanNumberAndDob, confirmPlayerLink, getKidsForParent, startGoCardlessSetup, getGoCardlessStatus, cancelGoCardlessSubscription, getFeeSchedule } from 'backend/registration.jsw';
     import { getTeamManager } from 'backend/staffData.jsw';
     import wixWindow from 'wix-window';
     import { setProgressBarVisible, setProgressBarText, getSaveDraftRequestId, setSaveDraftResult } from 'public/parentHubProgressBar.js';
@@ -220,6 +220,17 @@
                 $w("#stateboxHub").changeState("stateDashboard");
             });
 
+            // NEW - guarded on .id since it isn't built in the Editor yet (see the
+            // #regsibling incident precedent: referencing a missing element id
+            // throws and can break handlers registered after it in this function).
+            if ($w("#btnBackToHubPayment").id) {
+                $w("#btnBackToHubPayment").onClick(async () => {
+                    await loadDashboard(currentParentProfileId);
+                    activePlayerContext = null;
+                    $w("#stateboxHub").changeState("stateDashboard");
+                });
+            }
+
             // UI Toggles
             $w("#regadd2parents").onChange(() => {
                 if ($w("#regadd2parents").value === "Yes") {
@@ -422,6 +433,44 @@
             $item("#headshot").src = "https://static.wixstatic.com/media/c837a6_ba0353c713b1456da871eb329a4358d3~mv2.png";
         }
 
+        // Payment plan button: only visible once the secretary has saved a fee
+        // tier for this child. Its own button, separate from #btnAction, since
+        // it's a different concern (paying fees) from the status-driven
+        // registration/profile routing above. Guarded on .id so nothing breaks
+        // before it's built.
+        //
+        // Never fully disappears once paid - relabeled instead, so the parent
+        // can always reopen it (e.g. to switch plans, or fix a failed payment).
+        // Starts on the urgent default label; getGoCardlessStatus updates it a
+        // moment later once the real status is back (same pattern as the async
+        // getTeamManager lookup below).
+        if ($item("#btnPayment").id) {
+            const feeCategoryId = resolveFeeCategoryId(itemData);
+            if (feeCategoryId) {
+                $item("#btnPayment").expand();
+                $item("#btnPayment").label = "Set Up Payment";
+                getGoCardlessStatus(itemData._id).then((result) => {
+                    $item("#btnPayment").label = describePaymentButtonLabel(result, feeCategoryId);
+                }).catch(err => console.error("getGoCardlessStatus error:", err));
+
+                $item("#btnPayment").onClick(() => {
+                    activePlayerContext = { ...itemData };
+                    // changeState FIRST, then load - statePayment's elements must be
+                    // mounted before loadPaymentState starts writing to them. Doing it
+                    // the other way round races an unawaited async loadPaymentState
+                    // against the state switch - confirmed live (2026-08): the console
+                    // showed "Component ... was mounted but not found in the DOM" from
+                    // inside renderPaymentAction, and #textPaymentSchedule (written after
+                    // an extra await, so more exposed to the race) was silently never
+                    // getting its text set as a result.
+                    $w("#stateboxHub").changeState("statePayment");
+                    loadPaymentState(activePlayerContext);
+                });
+            } else {
+                $item("#btnPayment").collapse();
+            }
+        }
+
         // UPDATED: Precise Status & Button Routing
         switch (itemData.SP_status) {
         case INVITED_STATUS_ID:
@@ -489,11 +538,24 @@
                 // stale closure from a prior render.
                 activePlayerContext = { ...itemData };
 
+                // Registration is PRIMARY PARENT ONLY (2026-08-14). Two reasons:
+                // it exposes and lets someone edit the other parent's personal
+                // contact details, and — since getKidsForParent now redacts
+                // those fields for a secondary viewer — a secondary parent
+                // saving this form would write the resulting blanks straight
+                // back over the primary's real phone number.
+                const primaryIdForForm = itemData.primaryParentId
+                    ? (itemData.primaryParentId._id || itemData.primaryParentId) : "";
+                const viewerIsPrimary = (typeof itemData.viewerIsPrimaryParent === "boolean")
+                    ? itemData.viewerIsPrimaryParent
+                    : (primaryIdForForm === currentParentProfileId);
+
                 // Allow New, Renewals, Drafts, AND Action-Required to access the editable form
-                if (itemData.SP_status === INVITED_STATUS_ID ||
+                if (viewerIsPrimary && (
+                    itemData.SP_status === INVITED_STATUS_ID ||
                     itemData.SP_status === RENEWAL_STATUS_ID ||
                     itemData.SP_status === DRAFT_STATUS_ID ||
-                    itemData.SP_status === ACTION_REQUIRED_ID) {
+                    itemData.SP_status === ACTION_REQUIRED_ID)) {
 
                     // New invites flip to Draft immediately so the manager/secretary
                     // can see the parent has started. Renewals (and Action Required)
@@ -527,6 +589,207 @@
         });
 
     });
+
+    // Returns this kid's fee category id if the secretary has saved+sent a fee
+    // schedule for them, else null. Shared by the dashboard card (to show/hide
+    // #btnPayment) and statePayment. Unlike the old Wix Pricing Plans version,
+    // GoCardless doesn't need a pre-existing "plan" object to check for (the
+    // schedule is computed dynamically per player) - any assigned fee category
+    // is enough.
+    function resolveFeeCategoryId(player) {
+        const cat = player.sp_fee_category;
+        const feeCategoryId = cat && typeof cat === "object" ? cat._id : cat;
+        return (player.sp_paymentschedulesentdate && feeCategoryId) ? feeCategoryId : null;
+    }
+
+    // Never hides #btnPayment once paid - relabels it instead, so it's always
+    // there to reopen (switch plans, fix a failed payment) but stops reading as
+    // an outstanding action item once it's genuinely sorted.
+    function describePaymentButtonLabel(result, currentFeeCategoryId) {
+        if (!result.success || !result.found) return "Set Up Payment";
+        if (result.status === "CANCELED" || result.status === "ENDED") return "Set Up Payment";
+        if (result.status === "PENDING") return "Payment Setup In Progress...";
+        if (result.lastPaymentStatus === "FAILED") return "⚠️ Payment Failed - Fix";
+        // Secretary's since changed this child's tier - GoCardless won't auto-cancel
+        // the old subscription when a new one's set up, so call this out before they
+        // get to the full explanation on statePayment.
+        if (result.status === "ACTIVE" && currentFeeCategoryId && result.feeCategoryId && result.feeCategoryId !== currentFeeCategoryId) {
+            return "⚠️ Plan Changed - See Details";
+        }
+        return "Payment ✓ (Manage)";
+    }
+
+    // ==========================================
+    // STATE: PAYMENT PLAN — entered via #btnPayment on a kid's dashboard card
+    // (see #repeaterKids.onItemReady), only visible once a plan is ready. Does
+    // NOT rebuild Wix's checkout - navigateToCheckout() hands off to Wix's own
+    // Plans & Pricing checkout page for the actual payment collection, this
+    // state is just "here's your assigned plan, tap to pay".
+    //
+    // Exactly ONE action is ever shown (or none), decided by renderPaymentAction
+    // below - so a confused parent can never click through to checkout on top of
+    // a subscription that's already active, which would create a SECOND, duplicate
+    // subscription rather than fixing anything.
+    // ==========================================
+    async function loadPaymentState(player) {
+        const cat = player.sp_fee_category;
+        const feeCategoryId = resolveFeeCategoryId(player);
+
+        if ($w("#textPaymentKidName").id) $w("#textPaymentKidName").text = `${player.SP_firstName} ${player.SP_lastName}`;
+        if ($w("#textPaymentPlanLabel").id) $w("#textPaymentPlanLabel").text = cat && cat.F_label ? cat.F_label : "Club fees";
+        if ($w("#textPaymentStatus").id) $w("#textPaymentStatus").text = "Checking payment status...";
+
+        // Schedule detail (amount/frequency) - #textPaymentPlanLabel above only ever
+        // shows the tier NAME (e.g. "Full Membership"), never the actual amount, so
+        // this is a separate element for "N payments of £X, first on DD/MM/YYYY" -
+        // same getFeeSchedule() the secretary's PlayerRecord preview already uses,
+        // so the numbers always match exactly. Guarded/optional.
+        if ($w("#textPaymentSchedule").id) {
+            if (feeCategoryId) {
+                try {
+                    const sched = await getFeeSchedule(player._id, feeCategoryId);
+                    $w("#textPaymentSchedule").text = sched.success
+                        ? (sched.annualAmount > 0
+                            ? `${sched.count} payment(s) of £${sched.perPayment.toFixed(2)} (total £${sched.total.toFixed(2)}) - first payment ${new Date(sched.firstDate).toLocaleDateString('en-GB')}, then monthly.`
+                            : "No fee - this is a free membership.")
+                        : "";
+                } catch (err) {
+                    console.error("getFeeSchedule error:", err);
+                    $w("#textPaymentSchedule").text = "";
+                }
+            } else {
+                $w("#textPaymentSchedule").text = "";
+            }
+        }
+
+        let result;
+        try {
+            result = await getGoCardlessStatus(player._id);
+        } catch (err) {
+            console.error("getGoCardlessStatus error:", err);
+            result = { success: false };
+        }
+
+        renderPaymentAction(player, feeCategoryId, result);
+    }
+
+    // Works out which single action (if any) makes sense given the real
+    // subscription status. Never offers checkout at all while an active
+    // subscription already exists (right tier or wrong) - only "Cancel Old Plan"
+    // for a mismatched tier, or nothing at all when everything's already correct.
+    const PENDING_STALE_AFTER_MS = 60 * 60 * 1000; // matches startGoCardlessSetup's 1hr staleness window
+
+    function renderPaymentAction(player, feeCategoryId, result) {
+        if ($w("#btnSetupPayment").id) $w("#btnSetupPayment").collapse();
+        if ($w("#btnCancelOldPlan").id) $w("#btnCancelOldPlan").collapse();
+
+        const found = result.success && result.found;
+        const isActive = found && result.status === "ACTIVE";
+        const isMismatched = isActive && feeCategoryId && result.feeCategoryId && result.feeCategoryId !== feeCategoryId;
+        // A PENDING row with no gcMandateId this old almost certainly means the parent
+        // abandoned the GoCardless hosted flow partway through (closed the tab before
+        // finishing bank details) rather than genuinely still being mid-setup - without
+        // this, they'd be stuck on "in progress" text with no way to ever retry.
+        const isStalePending = found && result.status === "PENDING" && result.createdDate &&
+            (Date.now() - new Date(result.createdDate).getTime() > PENDING_STALE_AFTER_MS);
+
+        // Nothing active (never started, previous plan ended/canceled, setup abandoned,
+        // or setup still pending) - safe to offer checkout, except while genuinely pending.
+        if (!found || result.status === "CANCELED" || result.status === "ENDED" || isStalePending) {
+            if ($w("#textPaymentStatus").id) {
+                $w("#textPaymentStatus").text = isStalePending
+                    ? "Previous payment setup didn't complete - you can try again below."
+                    : (found ? describeSubscriptionStatus(result) : "No payment plan started yet.");
+            }
+            showSetupButton(player, feeCategoryId);
+            return;
+        }
+
+        if (result.status === "PENDING") {
+            if ($w("#textPaymentStatus").id) {
+                $w("#textPaymentStatus").text = "Payment setup in progress - you'll be notified once it's confirmed.";
+            }
+            return;
+        }
+
+        // Active, but on a DIFFERENT fee tier than the one now assigned - the
+        // secretary's changed their tier. GoCardless won't auto-cancel the old
+        // subscription when a new one's set up, so this must be cancelled first,
+        // not just warned about - offer the actual fix instead of a checkout button.
+        if (isMismatched) {
+            if ($w("#textPaymentStatus").id) {
+                $w("#textPaymentStatus").text = "You're currently paying for a different fee tier than the one the club has now assigned. Cancel the old plan below first - once that's done you'll be able to set up the new one, without being charged for both.";
+            }
+            if ($w("#btnCancelOldPlan").id) {
+                $w("#btnCancelOldPlan").expand();
+                $w("#btnCancelOldPlan").label = "Cancel Old Plan";
+                $w("#btnCancelOldPlan").enable();
+                $w("#btnCancelOldPlan").onClick(async () => {
+                    $w("#btnCancelOldPlan").disable();
+                    $w("#btnCancelOldPlan").label = "Cancelling...";
+                    try {
+                        const cancelResult = await cancelGoCardlessSubscription(result.recordId);
+                        if (!cancelResult.success) throw new Error(cancelResult.error || "Cancel failed");
+                        await loadPaymentState(player); // refresh - falls into the "nothing active" branch above once it takes effect
+                    } catch (err) {
+                        console.error("cancelGoCardlessSubscription error:", err);
+                        $w("#btnCancelOldPlan").label = "Error - try again";
+                        $w("#btnCancelOldPlan").enable();
+                    }
+                });
+            }
+            return;
+        }
+
+        // Active, correct tier - nothing to click, just report where it stands
+        // (including the failed-payment case, which needs a payment-method fix
+        // via their own bank, not another checkout attempt).
+        if ($w("#textPaymentStatus").id) $w("#textPaymentStatus").text = describeSubscriptionStatus(result);
+    }
+
+    function showSetupButton(player, feeCategoryId) {
+        if (!$w("#btnSetupPayment").id) return;
+        if (!feeCategoryId) { $w("#btnSetupPayment").collapse(); return; }
+        $w("#btnSetupPayment").expand();
+        $w("#btnSetupPayment").enable();
+        $w("#btnSetupPayment").label = "Set up your payment plan";
+        $w("#btnSetupPayment").onClick(async () => {
+            $w("#btnSetupPayment").disable();
+            $w("#btnSetupPayment").label = "Redirecting...";
+            try {
+                const result = await startGoCardlessSetup(player._id, feeCategoryId, wixLocationFrontend.url);
+                if (!result.success) throw new Error(result.error || "Could not start payment setup");
+                // Free tier (e.g. managers' kids) - backend already marked it done,
+                // nothing to authorise with GoCardless, just re-render this state
+                // instead of redirecting anywhere.
+                if (result.free) {
+                    await loadPaymentState(player);
+                    return;
+                }
+                wixLocationFrontend.to(result.authorisationUrl);
+            } catch (err) {
+                console.error("startGoCardlessSetup error:", err);
+                if ($w("#textPaymentStatus").id) $w("#textPaymentStatus").text = err.message;
+                $w("#btnSetupPayment").label = "Error - try again";
+                $w("#btnSetupPayment").enable();
+            }
+        });
+    }
+
+    // Friendly summary of a CONFIRMED, CURRENT subscription's status. The
+    // mismatched-plan case is handled separately in renderPaymentAction, so this
+    // only ever needs to describe "here's what's actually happening right now".
+    function describeSubscriptionStatus(sub) {
+        if (sub.status === "CANCELED") return "This payment plan was canceled.";
+        if (sub.status === "ENDED") return "This payment plan has ended.";
+        if (sub.status === "PENDING") return "Payment setup in progress - you'll be notified once it's confirmed.";
+        if (sub.lastPaymentStatus === "FAILED") {
+            return "This month's payment failed. Please contact the club, or check your Direct Debit is still set up correctly with your bank.";
+        }
+        const PAID_LABELS = { PAID: "paid", UNPAID: "not yet taken", PENDING: "processing" };
+        const payLabel = PAID_LABELS[sub.lastPaymentStatus] || sub.lastPaymentStatus || "unknown";
+        return `Payment plan active - this month's payment: ${payLabel}.`;
+    }
 
     // ==========================================
     // STATE 2: REGISTRATION FORM LOGIC
@@ -1462,6 +1725,7 @@
         // Map to the correct field
         activePlayerContext.mainAddress = $w("#inputAddress").value;
         activePlayerContext.parentPhone = $w("#txtLockedParentMobile").value;
+        activePlayerContext.parentEmail = $w("#txtLockedParentEmail").value;
 
         // Primary parent's own DOB/address — this button is only ever enabled/
         // reachable for the primary parent (see RBAC block above), so these

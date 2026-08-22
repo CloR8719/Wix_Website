@@ -1,0 +1,488 @@
+// =====================================================================
+//  messages.jsw — Parent Hub messages
+// =====================================================================
+//  Everything a parent should read: club-wide announcements, messages to
+//  their children's squads, and messages addressed to them directly.
+//
+//  IN-HUB ONLY. Nothing here sends an email or an SMS, deliberately - the
+//  club is limited on email volume, and announcements are exactly the sort
+//  of high-volume, low-urgency traffic that would burn through it. The
+//  reach problem is real and is answered later by push notifications when
+//  the app exists; this collection is already the right shape for that,
+//  since a push needs a message row and a resolved recipient set, and
+//  that's what getParentMessages produces.
+//
+//  ⚠️ NOT the same thing as ParentNotifications. That is an outbound EMAIL
+//  QUEUE written only by notifyParent() in registration.jsw and watched by
+//  a Wix Automation, for the two registration events worth spending an
+//  email on. Send-and-forget, no read state, one parent at a time. Don't
+//  merge them - overloading it is what would start emailing announcements.
+//
+//  READ STATE IS A HIGH-WATER MARK, not a row per message. A single
+//  DATETIME on the parent (PP_messagesReadUpTo) beats a MessageReads join
+//  table: one club-wide message across 200 parents would be 200 rows there,
+//  with no natural point to archive them (unlike FixtureResponses, which
+//  the nightly rollup clears). One field per parent never grows, needs no
+//  job, and matches how an inbox is actually used - you open it and see
+//  what's new, rather than marking individual items unread.
+// =====================================================================
+
+import wixData from 'wix-data';
+// The same "is this child actually in the squad" rule the fixtures code uses.
+// Only the status half of it - a message has no audience to match against.
+import { isAttendingSquadMember } from 'backend/squadRules.js';
+// Manager-side entry points re-check team ownership through this rather than
+// trusting the teamId and scope the browser sent.
+import { assertTeamAccess } from 'backend/managerData.jsw';
+
+const OPTIONS = { suppressAuth: true };
+
+// A parent with a long history doesn't need all of it on a phone.
+const MAX_MESSAGES = 60;
+
+// Kinds the element has an icon for. Anything else renders as "club"
+// rather than as a blank space.
+const KNOWN_KINDS = ["alert", "fixture", "club"];
+
+function refId(value) {
+    if (!value) return "";
+    return (typeof value === "string") ? value : (value._id || "");
+}
+
+// Relative for anything recent, absolute once "5 days ago" stops being
+// easier to read than the date itself.
+function timeLabel(date, now) {
+    if (!date) return "";
+    const then = (date instanceof Date) ? date : new Date(date);
+    if (isNaN(then.getTime())) return "";
+
+    const mins = Math.floor((now.getTime() - then.getTime()) / 60000);
+    if (mins < 1) return "Just now";
+    if (mins < 60) return mins + "m ago";
+
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return hours + "h ago";
+
+    const days = Math.floor(hours / 24);
+    if (days === 1) return "Yesterday";
+    if (days < 7) return days + " days ago";
+
+    return then.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+}
+
+// First line or so of the body, for the collapsed row. Cut on a word so it
+// doesn't end mid-syllable.
+function snippetOf(body) {
+    const text = String(body || "").replace(/\s+/g, " ").trim();
+    if (text.length <= 120) return text;
+    const cut = text.slice(0, 120);
+    const lastSpace = cut.lastIndexOf(" ");
+    return (lastSpace > 60 ? cut.slice(0, lastSpace) : cut) + "…";
+}
+
+// Returns every message this parent should see, newest first, each marked
+// read or unread against their high-water mark.
+export async function getParentMessages(parentProfileId) {
+    try {
+        if (!parentProfileId) return { success: false, error: "No parent profile." };
+
+        const profile = await wixData.get("ParentProfiles", parentProfileId, OPTIONS);
+        if (!profile) return { success: false, error: "Profile not found." };
+
+        const kidsRes = await wixData.query("SignolPlayers")
+            .eq("primaryParentId", parentProfileId)
+            .or(wixData.query("SignolPlayers").eq("secondaryParentId", parentProfileId))
+            .find(OPTIONS);
+
+        // TEAM messages go to squad members only, using the same rule as
+        // fixtures - Enquiry, Trial, Invited and Left don't count. A child
+        // part-way through registration has an SP_team set long before they
+        // are actually in the squad, so without this their parent gets the
+        // manager's "training moved to Thursday" for a team they haven't
+        // joined.
+        //
+        // CLUB and PARENT scoped messages are NOT gated this way, on purpose.
+        // "Your registration needs a fix" has to reach someone mid-
+        // registration - that's precisely who it's for - and a club-wide
+        // announcement is the one message a joining family should see.
+        const teamIds = [...new Set(
+            kidsRes.items
+                .filter(isAttendingSquadMember)
+                .map(k => refId(k.SP_team))
+                .filter(Boolean)
+        )];
+
+        // One query, three audiences OR'd together. Club-wide needs no
+        // reference at all, which is why scope is stored explicitly rather
+        // than inferred from which reference happens to be filled in.
+        const base = () => wixData.query("ParentMessages");
+        let scoped = base().eq("scope", "Club")
+            .or(base().eq("scope", "Parent").eq("parentProfile", parentProfileId));
+
+        if (teamIds.length > 0) {
+            scoped = scoped.or(base().eq("scope", "Team").hasSome("team", teamIds));
+        }
+
+        const res = await scoped
+            .descending("publishDate")
+            .limit(MAX_MESSAGES)
+            .find(OPTIONS);
+
+        const now = new Date();
+        const readUpTo = profile.PP_messagesReadUpTo ? new Date(profile.PP_messagesReadUpTo) : null;
+
+        const messages = res.items
+            .filter(m => {
+                // Scheduled for later, or already expired.
+                if (m.publishDate && new Date(m.publishDate) > now) return false;
+                if (m.expiryDate && new Date(m.expiryDate) < now) return false;
+                return true;
+            })
+            .map(m => {
+                // An unset publishDate falls back to when the row was created,
+                // so a message added by hand without one still sorts and dates
+                // sensibly instead of showing a blank timestamp.
+                const published = m.publishDate ? new Date(m.publishDate)
+                    : (m._createdDate ? new Date(m._createdDate) : null);
+
+                return {
+                    id: m._id,
+                    sender: m.senderName || "Signol Athletic",
+                    title: m.title || "",
+                    body: m.body || "",
+                    snippet: snippetOf(m.body),
+                    time: timeLabel(published, now),
+                    kind: KNOWN_KINDS.includes(m.kind) ? m.kind : "club",
+                    // No high-water mark at all means nothing has ever been
+                    // read, so everything is new - which is right for a parent
+                    // opening the tab for the first time.
+                    unread: !readUpTo || !published || published > readUpTo
+                };
+            });
+
+        return {
+            success: true,
+            messages,
+            unreadCount: messages.filter(m => m.unread).length
+        };
+    } catch (error) {
+        console.error("getParentMessages error:", error);
+        return { success: false, error: "Couldn't load messages just now." };
+    }
+}
+
+// Moves the high-water mark to now. Called when the parent opens the tab.
+//
+// Writes ONLY this field onto the record we just fetched - any unrecognised
+// key in a Wix Data update payload silently becomes a real new column on the
+// collection, so nothing extra gets spread in here.
+export async function markMessagesRead(parentProfileId) {
+    try {
+        if (!parentProfileId) return { success: false, error: "No parent profile." };
+
+        const profile = await wixData.get("ParentProfiles", parentProfileId, OPTIONS);
+        if (!profile) return { success: false, error: "Profile not found." };
+
+        profile.PP_messagesReadUpTo = new Date();
+        await wixData.update("ParentProfiles", profile, OPTIONS);
+
+        return { success: true };
+    } catch (error) {
+        // A failed mark-read must never break the tab - the parent has already
+        // seen the messages; the badge is just stale until next time.
+        console.error("markMessagesRead error:", error);
+        return { success: false, error: error.message };
+    }
+}
+
+// =====================================================================
+//  MANAGER SIDE
+// =====================================================================
+//  Everything above is what a parent reads. Below is what a manager writes.
+//
+//  ⚠️ SCOPE IS DECIDED HERE, NOT BY THE BROWSER. A manager may send to their
+//  own squad or to one parent in it. "Club" is deliberately NOT available -
+//  a club-wide announcement is a secretary's job, and an exported .jsw
+//  function is callable from any console, so the value arriving in the
+//  payload is a suggestion, not an instruction.
+//
+//  senderName comes from the staff record, never the form. A parent seeing
+//  "Michael Turner (Manager)" needs that to be true.
+// =====================================================================
+
+const MANAGER_SCOPES = ["Team", "Parent"];
+
+const CLUB_NAME = "Signol Athletic JFC";
+
+// WHO A MESSAGE APPEARS TO BE FROM.
+//
+// A manager may speak as themselves or as their squad - both are genuinely
+// theirs. Speaking as THE CLUB is different: a parent reading
+// "Signol Athletic JFC" takes it as official, so that voice stays with Admin
+// access (the secretary). Same reasoning as holding Facebook posts for
+// approval - it's the difference between a message and a statement.
+//
+// ⚠️ RESOLVED SERVER-SIDE FROM AN OPTION KEY, never taken as free text. The
+// browser sends "me" / "team" / "club"; the real name is looked up here. That
+// way the dropdown is convenience and this is the actual control - an exported
+// .jsw function is callable from any console.
+function resolveSenderName(ctx, teamName, senderAs) {
+    if (senderAs === "club" && ctx.perms.allTeams) return CLUB_NAME;
+    if (senderAs === "team" && teamName) return teamName;
+    return ctx.name;
+}
+
+// How many parents a squad message will actually land in front of. Shown
+// before sending, because "send to 14 parents" is a very different decision
+// from "send to 2" and a manager should see which one they're making.
+// Read straight from Teams rather than from the resolved SS_team array on the
+// staff record. SS_team is a MULTI_REFERENCE and whether .include() hydrates
+// it into full rows is not worth depending on - if it comes back as bare ids,
+// T_teamName is undefined and the sender silently falls back to the person's
+// name, which is exactly the failure this replaced.
+async function teamNameFor(teamId) {
+    if (!teamId) return "";
+    try {
+        const team = await wixData.get("Teams", teamId, OPTIONS);
+        return (team && team.T_teamName) || "";
+    } catch (err) {
+        console.error("[messages] teamNameFor failed:", err.message);
+        return "";
+    }
+}
+
+async function squadParentIds(teamId) {
+    const kids = await wixData.query("SignolPlayers")
+        .eq("SP_team", teamId)
+        .limit(1000)
+        .find(OPTIONS);
+
+    const parentIds = new Set();
+    kids.items.filter(isAttendingSquadMember).forEach(k => {
+        const a = refId(k.primaryParentId);
+        const b = refId(k.secondaryParentId);
+        if (a) parentIds.add(a);
+        if (b) parentIds.add(b);
+    });
+    return [...parentIds];
+}
+
+async function squadReach(teamId) {
+    return (await squadParentIds(teamId)).length;
+}
+
+// ⚠️ THIS IS "SEEN", NOT "READ", AND THE WORDING MATTERS.
+//
+// Read state is a high-water mark per parent (PP_messagesReadUpTo), not a row
+// per message - see the header for why. So all we can honestly say is whether
+// a parent has opened their messages SINCE this one was sent. A parent who
+// opened the tab to read something else counts too.
+//
+// That's still worth showing: it answers "has this reached anyone yet". But
+// never label it "read by" - a manager acting on a number believes what the
+// number says, and chasing a parent who genuinely did read it is worse than
+// showing nothing.
+function seenCount(profiles, recipientIds, publishDate) {
+    if (!publishDate) return 0;
+    const sent = new Date(publishDate).getTime();
+    let seen = 0;
+    recipientIds.forEach(id => {
+        const p = profiles[id];
+        if (!p || !p.PP_messagesReadUpTo) return;
+        if (new Date(p.PP_messagesReadUpTo).getTime() >= sent) seen += 1;
+    });
+    return seen;
+}
+
+export async function getComposeContext(teamId) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+
+        const kids = await wixData.query("SignolPlayers")
+            .eq("SP_team", teamId)
+            .limit(1000)
+            .find(OPTIONS);
+
+        const players = kids.items
+            .filter(isAttendingSquadMember)
+            .map(k => ({
+                id: k._id,
+                name: `${k.SP_firstName || ""} ${k.SP_lastName || ""}`.trim(),
+                parentName: k.parentsName || "",
+                hasParent: !!(refId(k.primaryParentId) || refId(k.secondaryParentId))
+            }))
+            .filter(p => p.hasParent)
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+        const teamName = await teamNameFor(teamId);
+
+        // Club is offered only where it's permitted, so a coach never sees an
+        // option that would be refused - but the refusal is in
+        // resolveSenderName regardless.
+        const senderOptions = [{ value: "me", label: access.ctx.name }];
+        if (teamName) senderOptions.push({ value: "team", label: teamName });
+        if (access.ctx.perms.allTeams) senderOptions.push({ value: "club", label: CLUB_NAME });
+
+        return {
+            success: true,
+            senderName: access.ctx.name,
+            senderOptions,
+            reach: await squadReach(teamId),
+            players
+        };
+    } catch (error) {
+        console.error("getComposeContext error:", error);
+        return { success: false, error: "Couldn't load the compose screen." };
+    }
+}
+
+export async function sendManagerMessage(teamId, payload = {}) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+        const ctx = access.ctx;
+
+        const title = String(payload.title || "").trim();
+        const body = String(payload.body || "").trim();
+        if (!title) return { success: false, error: "Give the message a subject." };
+        if (!body) return { success: false, error: "Write something to send." };
+
+        const scope = MANAGER_SCOPES.includes(payload.scope) ? payload.scope : "Team";
+
+        const teamName = await teamNameFor(teamId);
+
+        const row = {
+            title,
+            body,
+            senderName: resolveSenderName(ctx, teamName, payload.senderAs),
+            kind: "club",
+            scope,
+            team: teamId,
+            publishDate: new Date()
+        };
+
+        if (scope === "Parent") {
+            // Addressed to a CHILD by the manager, but stored against the
+            // PARENT - that's who reads it. Both parents on the record get it,
+            // which is right: a message about a child is for whoever is
+            // responsible for them, not just whoever registered first.
+            const player = await wixData.get("SignolPlayers", payload.playerId, OPTIONS);
+            if (!player) return { success: false, error: "Player not found." };
+            if (refId(player.SP_team) !== teamId) {
+                return { success: false, error: "That player isn't in this team." };
+            }
+
+            const parents = [refId(player.primaryParentId), refId(player.secondaryParentId)].filter(Boolean);
+            if (parents.length === 0) {
+                return { success: false, error: "That player has no linked parent account yet." };
+            }
+
+            row.player = player._id;
+            row.kind = "alert";
+
+            // One row per parent rather than one row with two references -
+            // scope=Parent reads a single parentProfile, and a multi-reference
+            // would need a different query path for no real benefit at this
+            // volume.
+            for (const parentId of parents) {
+                await wixData.insert("ParentMessages",
+                    Object.assign({}, row, { parentProfile: parentId }), OPTIONS);
+            }
+            return { success: true, reach: parents.length };
+        }
+
+        row.kind = "club";
+        await wixData.insert("ParentMessages", row, OPTIONS);
+        return { success: true, reach: await squadReach(teamId) };
+    } catch (error) {
+        console.error("sendManagerMessage error:", error);
+        return { success: false, error: "Couldn't send that message." };
+    }
+}
+
+export async function getSentMessages(teamId) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+
+        const res = await wixData.query("ParentMessages")
+            .eq("team", teamId)
+            .descending("publishDate")
+            .limit(60)
+            .find(OPTIONS);
+
+        const now = new Date();
+        const seen = new Set();
+        const rows = [];
+
+        // A squad message reached however many parents the squad has NOW, not
+        // when it was sent - we don't snapshot that. Close enough for "who saw
+        // this", and honest about being a current figure rather than a
+        // historical one.
+        const teamParentIds = await squadParentIds(teamId);
+        const teamReach = teamParentIds.length;
+
+        // Every parent who could have seen anything on this team, fetched ONCE
+        // rather than per message. Includes the per-parent recipients too, so
+        // a one-family message can be counted from the same map.
+        const perParentIds = res.items
+            .map(m => refId(m.parentProfile))
+            .filter(Boolean);
+        const allIds = [...new Set([...teamParentIds, ...perParentIds])];
+
+        const profiles = {};
+        if (allIds.length) {
+            const profRes = await wixData.query("ParentProfiles")
+                .hasSome("_id", allIds)
+                .limit(1000)
+                .find(OPTIONS);
+            profRes.items.forEach(p => { profiles[p._id] = p; });
+        }
+
+        res.items.forEach(m => {
+            // A per-parent message was written once per parent. Collapse them
+            // so a manager sees "sent to the Bennetts", not the same message
+            // twice with no explanation.
+            const key = m.scope === "Parent"
+                ? `${m.title}|${m.publishDate}|${refId(m.player)}`
+                : m._id;
+            if (seen.has(key)) {
+                const prev = rows.find(r => r.key === key);
+                if (prev) {
+                    prev.reach += 1;
+                    const pid = refId(m.parentProfile);
+                    if (pid) {
+                        prev.seenBy += seenCount(profiles, [pid], m.publishDate || m._createdDate);
+                    }
+                }
+                return;
+            }
+            seen.add(key);
+
+            const when = m.publishDate || m._createdDate;
+            const recipients = m.scope === "Parent"
+                ? [refId(m.parentProfile)].filter(Boolean)
+                : teamParentIds;
+
+            rows.push({
+                key,
+                id: m._id,
+                title: m.title || "",
+                body: m.body || "",
+                snippet: snippetOf(m.body),
+                time: timeLabel(when, now),
+                scope: m.scope || "Team",
+                // Per-parent rows count up as duplicates collapse; a squad
+                // message goes to the whole squad.
+                reach: m.scope === "Parent" ? 1 : teamReach,
+                seenBy: seenCount(profiles, recipients, when)
+            });
+        });
+
+        return { success: true, messages: rows };
+    } catch (error) {
+        console.error("getSentMessages error:", error);
+        return { success: false, error: "Couldn't load sent messages." };
+    }
+}

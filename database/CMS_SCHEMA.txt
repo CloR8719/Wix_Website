@@ -61,6 +61,21 @@ Fields:
 - sp_return_note (TEXT)                 [NEW 2026-06-30: secretary's note when a registration is sent back]
 - sp_fee_category (REFERENCE)           [NEW 2026-06-30: → FeeCategories, the player's fee tier]
 - sp_paymentschedulesentdate (DATE)     [NEW 2026-06-30: when the schedule was last sent to the parent]
+- sp_paymentStartOverride (DATE)        [NEW 2026-07-31: optional secretary-set explicit
+                                          schedule anchor, takes priority over
+                                          registrationDate when set - see
+                                          resolveScheduleAnchorDate() in registration.jsw.
+                                          For the 2026-27 GoCardless rollout: migrating an
+                                          existing player onto GoCardless mid-season should
+                                          NOT auto-reduce their instalment count the way a
+                                          genuine new joiner's registrationDate would]
+- sp_paymentCountOverride (NUMBER)      [NEW 2026-08-01: optional secretary-set explicit
+                                          instalment count, pairs with the override above -
+                                          setting a start date alone still auto-reduces the
+                                          count (e.g. an August anchor → 9), this forces a
+                                          specific count instead (e.g. 10, running into May
+                                          the following year). See
+                                          resolveScheduleCountOverride() in registration.jsw]
 - sp_parent_dob (DATE)                  [NEW 2026-07-22: primary parent/guardian DOB, WGS requirement]
 - sp_secparent_dob (DATE)               [NEW 2026-07-22: secondary parent/guardian DOB]
 - sp_parent_address (ADDRESS)           [NEW 2026-07-22: primary parent address, blank = same as player's]
@@ -121,6 +136,14 @@ Fields:
 - coachingExpiry (DATE)
 - SS_firstName (TEXT)
 - SS_lastName (TEXT)
+- status (TEXT)                        [NEW 2026-08-10: "Active" / "Inactive" / "Left the Club" -
+                                          drives #staffShowFormer filter in Player Admin.js]
+- startDate (DATE)                     [NEW 2026-08-10: date staff member started]
+- emergencyContactName (TEXT)          [NEW 2026-08-10]
+- emergencyContactRelation (TEXT)      [NEW 2026-08-10]
+- emergencyContactPhone (TEXT)         [NEW 2026-08-10]
+- notes (TEXT)                         [NEW 2026-08-10: kept separate from the pre-existing
+                                          unused bio field per Rob's call]
 
 Collection: Teams
 Collection ID: Teams
@@ -373,11 +396,139 @@ Fields:
 - F_label (TEXT)            [e.g. "Playing & Training", "Training Only + Sibling Discount"]
 - F_code (TEXT)             [optional short code]
 - F_annual_amount (NUMBER)  [full-season annual fee; monthly = annual / 10]  (field key is lowercase-with-underscores as built in the CMS)
+- F_wixPlanId (TEXT)        [links this tier to a Wix Pricing Plan, for the OLDER
+                             Stripe-based payment flow. Unused by the GoCardless flow
+                             (schedule is computed dynamically per player instead) -
+                             left in place harmlessly, not removed, until the old
+                             Wix Pricing Plans path is fully retired.]
 
   Seed 6 rows: Training Only · Training Only + Sibling Discount ·
   Playing & Training · Playing & Training + Sibling Discount ·
   Playing & Training + Coach/Manager Discount A ·
   Playing & Training + Coach/Manager Discount B.
+
+
+Collection: Child Subscriptions
+Collection ID: ChildSubscriptions
+-----------------------------
+(Was undocumented here despite being live code since 2026-07-28 - backfilled
+2026-07-30. Belongs to the OLDER Wix Pricing Plans/Stripe payment flow -
+backend/events.js and the now-superseded markPendingPayment/
+getChildSubscriptionStatus in registration.jsw. Left in place, dormant, as a
+historical record - see the GoCardless collections below for the current flow.)
+Fields:
+- _id (TEXT)
+- _createdDate (DATETIME)
+- _updatedDate (DATETIME)
+- _owner (TEXT)
+- player (REFERENCE)          [→ SignolPlayers]
+- memberId (TEXT)             [Wix member id of the buying parent]
+- wixPlanId (TEXT)            [the Wix Pricing Plan bought]
+- subscriptionId (TEXT)       [set once confirmed]
+- orderId (TEXT)              [set once confirmed]
+- status (TEXT)               [Wix order status: "pending" until confirmed, then
+                                mirrors Wix's own order status - "ACTIVE"/"CANCELED"/
+                                "ENDED"]
+- lastPaymentStatus (TEXT)
+- currentCycleIndex (NUMBER)
+- currentCycleStart (DATE)
+- currentCycleEnd (DATE)
+- confirmed (BOOLEAN)         [false until wixPricingPlans_onOrderPurchased matches
+                                this row to a real order (see backend/events.js)]
+
+
+Collection: GoCardless Subscriptions
+Collection ID: GoCardlessSubscriptions
+-----------------------------
+(New 2026-07-30 - GoCardless Direct Debit replacement for ChildSubscriptions above.
+One row per child's payment setup. See docs/PARENT_HUB_ELEMENTS.md's "Payment
+tracking" section for the full mechanism.)
+Fields:
+- _id (TEXT)
+- _createdDate (DATETIME)
+- _updatedDate (DATETIME)
+- _owner (TEXT)
+- player (REFERENCE)          [→ SignolPlayers]
+- memberId (TEXT)             [Wix member id of the parent who set this up - used
+                                for ownership checks on cancel]
+- feeCategoryId (TEXT)        [snapshot of the tier this was created for, used for
+                                the same tier-mismatch check the old system did]
+- playerName (TEXT)           [added 2026-08-01, snapshot of SP_firstName+SP_lastName -
+                                also sent as GoCardless metadata (billing request AND
+                                subscription) so the GoCardless dashboard itself shows
+                                something human-identifiable, not just internalRef's GUID]
+- membershipNo (TEXT)          [added 2026-08-01, snapshot of sp_membership_no - same
+                                GoCardless metadata purpose as playerName above]
+- perPayment (NUMBER)         [snapshot of buildFeeSchedule()'s output at setup time]
+- scheduleCount (NUMBER)      [snapshot - number of instalments]
+- firstDate (DATE)            [snapshot - needed when the GoCardless subscription is
+                                actually created, once the mandate goes active]
+- season (TEXT)                [e.g. "2026-27" - Jul Y → Jun Y+1, computed from the same
+                                player.registrationDate buildFeeSchedule() uses, NOT the
+                                date GoCardless setup happened, so it always matches what's
+                                actually being billed. See getSeasonInfo() in registration.jsw]
+- seasonStartDate (DATE)       [1 Jul of the season's start year]
+- seasonEndDate (DATE)         [30 Jun of the season's end year]
+- gcCustomerId (TEXT)         [captured from the fulfilled billing_request event/fallback
+                                fetch, added 2026-07-31 - was a documented-but-unpopulated
+                                dead field before this]
+- gcBillingRequestId (TEXT)   [set at creation, before a mandate exists]
+- gcMandateId (TEXT)          [set once the mandate is confirmed active]
+- gcSubscriptionId (TEXT)     [set once the GoCardless subscription is created]
+- mandateStatus (TEXT)        [raw GoCardless mandate status, for audit]
+- subscriptionStatus (TEXT)   [raw GoCardless subscription status, for audit]
+- lastPaymentId (TEXT)
+- lastPaymentChargeDate (DATE)
+- paymentsCollectedCount (NUMBER)
+- status (TEXT)               [normalized: "PENDING" | "ACTIVE" | "CANCELED" | "ENDED"
+                                - deliberately reuses the old ChildSubscriptions
+                                vocabulary so Parent Hub.js's status-label logic
+                                needed minimal changes]
+- lastPaymentStatus (TEXT)    [normalized: "PAID" | "UNPAID" | "PENDING" | "FAILED"]
+- confirmed (BOOLEAN)         [true once mandate active AND subscription created]
+
+
+Collection: GoCardless Payments
+Collection ID: GoCardlessPayments
+-----------------------------
+(New 2026-07-30 - ledger, one row per actual payment event, not per subscription.
+Foundation for a future per-player/per-month "paid" tick-box view - that visual/
+dashboard UI itself is deferred; this ledger is built now since the webhook handler
+needs to write to it regardless.)
+Fields:
+- _id (TEXT)
+- _createdDate (DATETIME)
+- _updatedDate (DATETIME)
+- _owner (TEXT)
+- subscriptionRecord (REFERENCE)  [→ GoCardlessSubscriptions]
+- player (REFERENCE)              [→ SignolPlayers]
+- season (TEXT)                   [denormalized copy of the parent subscription record's
+                                    season, so this ledger can be filtered by season without
+                                    a join - added 2026-07-31]
+- gcPaymentId (TEXT)
+- chargeDate (DATE)
+- amount (NUMBER)
+- status (TEXT)                   [normalized: "PAID" | "FAILED" | "PENDING"]
+
+
+Collection: GoCardless Webhook Events
+Collection ID: GoCardlessWebhookEvents
+-----------------------------
+(New 2026-07-30 - idempotency log so backend/http-functions.js can check "have I
+already processed this event id" before acting, since GoCardless webhooks are
+documented to retry/duplicate deliveries. Grows every payment event, every month,
+for every child, forever - backend/gocardlessCleanup.jsw's pruneGoCardlessWebhookEvents
+job (weekly, see backend/jobs.config) deletes rows older than 30 days, well past
+GoCardless's own retry window, added 2026-07-31.)
+Fields:
+- _id (TEXT)
+- _createdDate (DATETIME)
+- _updatedDate (DATETIME)
+- _owner (TEXT)
+- eventId (TEXT)
+- resourceType (TEXT)
+- action (TEXT)
+- receivedDate (DATETIME)         [defaults via _createdDate]
 
 
 Collection: Parent Notifications

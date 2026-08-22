@@ -1,0 +1,231 @@
+// =====================================================================
+//  recruitment.jsw — recruitment posters
+// =====================================================================
+//  A manager fills in a short form, the element draws a poster on a canvas,
+//  and this saves it and publishes it.
+//
+//  THE PIPELINE, and why each piece is where it is:
+//    element  draws the poster on <canvas> and exports a base64 PNG
+//    here     uploads it to the Media Manager and records the post
+//    blog.jsw publishes to the club website (already working - it's what
+//             the news form uses)
+//    later    Facebook, once the route is proven
+//
+//  Drawn on a canvas rather than rasterised from HTML because the element
+//  runs in a sandboxed iframe where external libraries are a fight, and a
+//  templated poster doesn't need DOM rendering. It also gives exact output
+//  dimensions, which matters to Facebook.
+//
+//  ⚠️ POSTERS ARE PUBLIC FILES, deliberately. Facebook has to be able to
+//  fetch the image by URL, and the club website shows it to anyone. That's
+//  fine for a poster - it contains a squad name, a position and a manager's
+//  club contact number, all of which are already public. It is NOT a
+//  precedent for the children's ID documents in mediaUpload.jsw, which is a
+//  separate and still-open decision.
+//
+//  ⚠️ FACEBOOK IS NOT WIRED. `toFacebook` is recorded and the post is held
+//  at `pending`, but nothing sends. Deliberate: the visual and the approval
+//  step get built with everything else, and posting is wired last once the
+//  route is proven. See docs/MANAGER_HUB_V2_ELEMENTS.md.
+// =====================================================================
+
+import wixData from 'wix-data';
+import { mediaManager } from 'wix-media-backend';
+import { assertTeamAccess } from 'backend/managerData.jsw';
+
+const OPTIONS = { suppressAuth: true };
+
+// A poster is around 200-400KB at the size the element exports. This is a
+// long way clear of that while still refusing anything that could only be a
+// mistake or an attempt to fill the Media Manager.
+const MAX_BYTES = 5 * 1024 * 1024;
+
+const FOLDER = "/Recruitment Posters";
+
+// Everything the poster needs that shouldn't be typed: the squad's own
+// details and the manager's real contact number. A poster with a wrong phone
+// number is worse than no poster, and typing it is exactly how that happens.
+export async function getRecruitContext(teamId) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+        const ctx = access.ctx;
+
+        // .include rather than a second get(): the age group is a reference
+        // and one query is both fewer round trips and immune to getting the
+        // collection name wrong (it's AgeGroup, singular).
+        const teamRes = await wixData.query("Teams")
+            .eq("_id", teamId)
+            .include("AG_ageGroup")
+            .find(OPTIONS);
+        const team = teamRes.items[0];
+        if (!team) return { success: false, error: "Team not found." };
+
+        // ClubDictionary category `position`. Falls back to an empty list
+        // rather than erroring - a missing dictionary shouldn't stop a
+        // manager making a general recruitment poster.
+        let positions = [];
+        try {
+            const posRes = await wixData.query("ClubDictionary")
+                .eq("category", "position")
+                .ascending("order")
+                .limit(100)
+                .find(OPTIONS);
+            positions = posRes.items.map(r => ({ value: r.label || r.value || "", label: r.label || r.value || "" }))
+                .filter(p => p.value);
+        } catch (err) {
+            console.error("[recruitment] position dictionary unavailable:", err.message);
+        }
+
+        // Seasons for the "FOR 2026/27 SEASON" line. Descending, so the
+        // current one is first and becomes the default - a manager shouldn't
+        // have to know what this season is called to make a poster.
+        let seasons = [];
+        try {
+            const seasonRes = await wixData.query("ClubDictionary")
+                .eq("category", "season")
+                .descending("order")
+                .limit(20)
+                .find(OPTIONS);
+            seasons = seasonRes.items.map(r => r.label || r.value || "").filter(Boolean);
+        } catch (err) {
+            console.error("[recruitment] season dictionary unavailable:", err.message);
+        }
+
+        return {
+            success: true,
+            teamId,
+            seasons,
+            season: seasons.length ? seasons[0] : "",
+            teamName: team.T_teamName || "",
+            ageGroup: (team.AG_ageGroup && team.AG_ageGroup.AG_ageGroup) || "",
+            trainingDay: team.T_trainingDay || "",
+            trainingTime: team.T_trainingStartTime || "",
+            trainingPitch: team.trainingPitch || "",
+            trainingLocation: (team.trainingLocation && team.trainingLocation.formatted) ||
+                              (typeof team.trainingLocation === "string" ? team.trainingLocation : ""),
+            managerName: ctx.name,
+            managerPhone: ctx.mobile,
+            positions
+        };
+    } catch (error) {
+        console.error("getRecruitContext error:", error);
+        return { success: false, error: "Couldn't load the poster details." };
+    }
+}
+
+// base64 is the whole PNG, without the `data:image/png;base64,` prefix.
+export async function publishRecruitmentPost(teamId, payload = {}) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+        const ctx = access.ctx;
+
+        const toWebsite = payload.toWebsite === true;
+        const toFacebook = payload.toFacebook === true;
+        if (!toWebsite && !toFacebook) {
+            return { success: false, error: "Pick at least one place to publish it." };
+        }
+
+        const base64 = String(payload.imageBase64 || "");
+        if (!base64) return { success: false, error: "The poster image didn't come through." };
+
+        // base64 inflates by roughly 4/3, so this checks the real decoded size
+        // rather than the string length.
+        const bytes = Math.floor(base64.length * 3 / 4);
+        if (bytes > MAX_BYTES) {
+            return { success: false, error: "That image is too big to upload." };
+        }
+
+        const stamp = new Date().toISOString().slice(0, 10);
+        const safeTeam = String(payload.teamName || "team").replace(/[^A-Za-z0-9]+/g, "-").toLowerCase();
+        const fileName = `recruit-${safeTeam}-${stamp}.png`;
+
+        const uploaded = await mediaManager.upload(
+            FOLDER,
+            Buffer.from(base64, "base64"),
+            fileName,
+            {
+                mediaOptions: { mimeType: "image/png", mediaType: "image" },
+                // Public because Facebook must be able to fetch it and the
+                // website shows it publicly anyway. See the header note.
+                metadataOptions: { isPrivate: false, isVisitorUpload: false }
+            }
+        );
+
+        // fileUrl is the wix:image:// URI; the https one is what an <img> and
+        // an external service can actually load. Both are kept - Wix APIs
+        // (like the Blog cover image) want the URI form, everything else
+        // wants the URL.
+        const posterUri = uploaded.fileUrl || uploaded.fileName || "";
+        const posterUrl = (uploaded.fileUrl && uploaded.fileUrl.startsWith("http"))
+            ? uploaded.fileUrl
+            : "";
+
+        const row = {
+            team: teamId,
+            // Joined from the chips, e.g. "Midfielders, Strikers". Kept as the
+            // existing Text column rather than adding an array field - it's for
+            // a human reading the list of past posters, not for querying.
+            position: String(payload.position || "").trim(),
+            extraLine: String(payload.extraLine || "").trim(),
+            posterUrl: posterUri,
+            toWebsite,
+            toFacebook,
+            // Anything bound for Facebook waits for approval. That's the
+            // club's public voice and twenty managers would otherwise have
+            // one-tap access with no undo. Website-only can go straight out -
+            // the news form already works that way.
+            status: toFacebook ? "pending" : "published",
+            createdByStaff: ctx.staffId,
+            publishedDate: new Date()
+        };
+
+        const saved = await wixData.insert("RecruitmentPosts", row, OPTIONS);
+
+        return {
+            success: true,
+            id: saved._id,
+            posterUri,
+            posterUrl,
+            status: row.status,
+            message: toFacebook
+                ? (toWebsite
+                    ? "Saved and sent for approval before it goes on Facebook."
+                    : "Sent for approval before it goes on Facebook.")
+                : "Poster saved and ready for the website."
+        };
+    } catch (error) {
+        console.error("publishRecruitmentPost error:", error);
+        return { success: false, error: "Couldn't publish that poster." };
+    }
+}
+
+// What a manager has made before, so they can reuse or check one.
+export async function getRecruitmentPosts(teamId) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+
+        const res = await wixData.query("RecruitmentPosts")
+            .eq("team", teamId)
+            .descending("publishedDate")
+            .limit(30)
+            .find(OPTIONS);
+
+        return {
+            success: true,
+            posts: res.items.map(p => ({
+                id: p._id,
+                position: p.position || "",
+                status: p.status || "",
+                toWebsite: p.toWebsite === true,
+                toFacebook: p.toFacebook === true,
+                date: p.publishedDate || p._createdDate || null
+            }))
+        };
+    } catch (error) {
+        console.error("getRecruitmentPosts error:", error);
+        return { success: false, posts: [] };
+    }
+}

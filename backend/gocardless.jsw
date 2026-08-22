@@ -1,0 +1,145 @@
+import { getSecret } from 'wix-secrets-backend';
+import gocardless from 'gocardless-nodejs';
+import { Environments } from 'gocardless-nodejs/constants';
+
+// =====================================================================
+//  GOCARDLESS API WRAPPER — every GoCardless call in the codebase goes
+//  through this one file. registration.jsw and backend/http-functions.js
+//  never touch the SDK directly, so if the SDK ever turns out to have
+//  packaging problems in Velo, only the insides of these functions need
+//  to change (e.g. to raw wix-fetch calls) - nothing that calls them does.
+// =====================================================================
+
+// Live as of 2026-08 - _GOCARDLESS_ACCESS_TOKEN and _GOCARDLESS_WEBHOOK_SECRET
+// in Wix Secrets Manager were swapped to live values at the same time this
+// flipped, so both sides of the switch landed together.
+const GC_ENVIRONMENT = Environments.Live;
+
+async function getClient() {
+    const accessToken = await getSecret('_GOCARDLESS_ACCESS_TOKEN');
+    return gocardless(accessToken, GC_ENVIRONMENT);
+}
+
+// Kicks off the hosted mandate-setup flow for one child's payment setup. internalRef is
+// the matching GoCardlessSubscriptions row's _id, stamped into metadata here - this is
+// what comes back on every later webhook event, and is what lets us match a payment to
+// the right child without any of the FIFO guesswork the old Wix Pricing Plans/events.js
+// integration needed for two kids on the same fee tier.
+//
+// extraMetadata (optional) - playerName/membershipNo, so the GoCardless dashboard itself
+// shows something human-identifiable instead of just internalRef's opaque GUID. ⚠️
+// GoCardless metadata is capped at 3 key/value pairs total - internalRef + these 2 already
+// fills that, confirm against current GoCardless docs before adding a 4th anywhere.
+export async function createBillingRequestFlow(internalRef, redirectUri, extraMetadata = {}) {
+    const client = await getClient();
+
+    const billingRequest = await client.billingRequests.create({
+        mandate_request: {
+            scheme: "bacs",
+            currency: "GBP"
+        },
+        metadata: { internalRef, ...extraMetadata }
+    });
+
+    const flow = await client.billingRequestFlows.create({
+        redirect_uri: redirectUri,
+        links: { billing_request: billingRequest.id }
+    });
+
+    return {
+        billingRequestId: billingRequest.id,
+        authorisationUrl: flow.authorisation_url
+    };
+}
+
+// Turns any thrown GoCardless SDK error into one readable string. err.message
+// alone is just the generic top-level text ("Validation failed") - the actual
+// field/reason is nested in err.errors (their shape for a 422 response). Real
+// incident, 2026-08-10: this was getting logged as just "Validation failed"
+// everywhere with no way to tell what had actually failed.
+function describeGcError(err) {
+    return (err.errors && JSON.stringify(err.errors)) || (err.response && JSON.stringify(err.response.body)) || err.message;
+}
+
+// Called once a mandate has gone active (from the webhook handler, or from
+// ensureSubscriptionCreated's one-off-then-subscription path in
+// registration.jsw) - creates the actual recurring collection against it.
+// startDate must already be a valid date for this mandate (on or after its
+// next_possible_charge_date) AND fall on day_of_month (15) - the caller
+// (ensureSubscriptionCreated) works that out; this function just makes the
+// call, it doesn't guess dates itself (see the 2026-08-10 incident notes in
+// registration.jsw for why that guessing lived there before and got moved out).
+// extraMetadata - see createBillingRequestFlow above, same playerName/membershipNo intent.
+export async function createSubscription(mandateId, schedule, internalRef, extraMetadata = {}) {
+    const client = await getClient();
+    const amount = Math.round(schedule.perPayment * 100); // GoCardless amounts are integer minor units (pence)
+
+    try {
+        const subscription = await client.subscriptions.create({
+            amount,
+            currency: "GBP",
+            name: "Club fees",
+            interval_unit: "monthly",
+            interval: 1,
+            day_of_month: 15, // buildFeeSchedule's instalments always fall on the 15th
+            count: schedule.count,
+            start_date: schedule.firstDate.toISOString().slice(0, 10),
+            metadata: { internalRef, ...extraMetadata },
+            links: { mandate: mandateId }
+        });
+        return { subscriptionId: subscription.id, status: subscription.status };
+    } catch (err) {
+        throw new Error(`GoCardless subscription create failed: ${describeGcError(err)}`);
+    }
+}
+
+// One-off catch-up payment against a mandate - no subscription involved. Used
+// when the mandate confirmed too close to the 15th for the normal monthly
+// subscription to start this month (real incident, 2026-08-10: GoCardless
+// requires a mandate's first collection to be on or after its own
+// next_possible_charge_date, which varies per mandate and is often later than
+// "a few working days" - see ensureSubscriptionCreated in registration.jsw).
+// chargeDate should be that mandate's real next_possible_charge_date, passed
+// in as a "YYYY-MM-DD" string - not guessed here.
+export async function createOneOffPayment(mandateId, amountPounds, chargeDate, internalRef, extraMetadata = {}) {
+    const client = await getClient();
+    const amount = Math.round(amountPounds * 100);
+
+    try {
+        const payment = await client.payments.create({
+            amount,
+            currency: "GBP",
+            links: { mandate: mandateId },
+            charge_date: chargeDate,
+            metadata: { internalRef, ...extraMetadata }
+        });
+        return { paymentId: payment.id, status: payment.status, chargeDate: payment.charge_date };
+    } catch (err) {
+        throw new Error(`GoCardless one-off payment create failed: ${describeGcError(err)}`);
+    }
+}
+
+export async function cancelSubscription(gcSubscriptionId) {
+    const client = await getClient();
+    const subscription = await client.subscriptions.cancel(gcSubscriptionId);
+    return { status: subscription.status };
+}
+
+// Fallback for reading metadata/links back off a billing request, if a webhook payload
+// ever arrives "thin" (just an id) rather than carrying metadata inline.
+export async function getBillingRequest(billingRequestId) {
+    const client = await getClient();
+    return client.billingRequests.find(billingRequestId);
+}
+
+export async function getMandate(mandateId) {
+    const client = await getClient();
+    return client.mandates.find(mandateId);
+}
+
+// Payment webhook events are thin (just an id + status) - fetch the full resource for
+// its charge_date/amount when logging a row to the GoCardlessPayments ledger.
+export async function getPayment(paymentId) {
+    const client = await getClient();
+    return client.payments.find(paymentId);
+}

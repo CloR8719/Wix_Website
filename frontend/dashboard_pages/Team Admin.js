@@ -1,6 +1,6 @@
 import wixData from 'wix-data';
 import wixWindow from 'wix-window';
-import wixLocation from 'wix-location'; 
+import wixLocation from 'wix-location';
 import { getTeamsExportUrl } from 'backend/exportCsv';
 
 let staffOptions = [];
@@ -26,8 +26,8 @@ $w.onReady(async function () {
             const toInsert = { T_teamName: result.name, AG_ageGroup: result.ageGroup };
             try {
                 await wixData.insert("Teams", toInsert);
-                await loadTeamOptions(); 
-                $w("#teamSearch").value = ""; 
+                await loadTeamOptions();
+                $w("#teamSearch").value = "";
                 $w("#ageGroupFilter").value = "";
                 loadTeamHub(); // Refresh list (Newest appears at top)
             } catch (err) { console.error("Creation failed", err); }
@@ -173,7 +173,7 @@ $w("#teamRepeater").onItemReady(async ($item, itemData) => {
     $item("#deleteBtn").onClick(async () => {
         if ($item("#deleteBtn").label === "Confirm?") {
             await wixData.remove("Teams", itemData._id);
-            loadTeamHub(); 
+            loadTeamHub();
             loadTeamOptions();
         } else {
             $item("#deleteBtn").label = "Confirm?";

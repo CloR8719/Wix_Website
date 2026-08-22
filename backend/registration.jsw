@@ -1,5 +1,6 @@
 import wixData from 'wix-data';
 import { currentMember, members } from 'wix-members-backend';
+import { createBillingRequestFlow, cancelSubscription, createSubscription, createOneOffPayment, getMandate } from 'backend/gocardless.jsw';
 
 // 1. Verifies the token securely
 export async function verifyTokenSecurely(token) {
@@ -315,7 +316,15 @@ export async function getSecureManagerName(managerId) {
 }
 // 6. Securely updates the logged-in parent's own profile details, and syncs
 // the name/phone to every player record linked to them (primary or secondary)
-export async function secureUpdateParentProfile(fullName, phoneNumber) {
+// `email` added 2026-08-15. IMPORTANT: this is the club's CONTACT email, not
+// the parent's Wix login email - a Velo function can't change that, and
+// hubEmailSweep still links players off `member.loginEmail`. So changing this
+// does NOT affect how they sign in, and does NOT affect child linking. The
+// Parent Hub field needs a label saying so or it generates support questions.
+//
+// Optional param: called as (name, phone) from anywhere older, email is left
+// untouched rather than blanked.
+export async function secureUpdateParentProfile(fullName, phoneNumber, email) {
     try {
         const member = await currentMember.getMember();
         if (!member) throw new Error("Security Block: Not logged in.");
@@ -331,10 +340,29 @@ export async function secureUpdateParentProfile(fullName, phoneNumber) {
         }
 
         const profile = profileResults.items[0];
-        console.log("[secureUpdateParentProfile] called for profile", { profileId: profile._id, memberId: member._id, fullName, phoneNumber });
 
         profile.PP_fullName = fullName;
         profile.PP_phoneNumber = phoneNumber;
+        // Only write email when one was actually passed - an older caller
+        // using the 2-arg signature must not blank it out.
+        const emailProvided = typeof email === "string" && email.length > 0;
+
+        // emailProvided is logged explicitly because name/phone/email are all
+        // written in the same branch below - so "name and phone saved but
+        // email didn't" can ONLY mean this was false. Logging the raw type
+        // and length separates "the field was empty" from "the frontend
+        // never sent the argument at all", which look identical in the CMS.
+        console.log("[secureUpdateParentProfile] called for profile", {
+            profileId: profile._id,
+            memberId: member._id,
+            fullName,
+            phoneNumber,
+            emailType: typeof email,
+            emailLength: typeof email === "string" ? email.length : null,
+            emailProvided
+        });
+
+        if (emailProvided) profile.PP_email = email;
         await wixData.update("ParentProfiles", profile, options);
 
         // Sync to every player this parent is linked to, primary or secondary
@@ -357,11 +385,13 @@ export async function secureUpdateParentProfile(fullName, phoneNumber) {
             if (player.primaryParentId === profile._id) {
                 player.parentsName = fullName;
                 player.parentPhone = phoneNumber;
+                if (emailProvided) player.parentEmail = email;
                 needsUpdate = true;
             }
             if (player.secondaryParentId === profile._id) {
                 player.secondaryParentName = fullName;
                 player.secondaryParentMobile = phoneNumber;
+                if (emailProvided) player.secondaryParentEmail = email;
                 needsUpdate = true;
             }
 
@@ -428,7 +458,11 @@ export async function findPlayerByFanNumberAndDob(fanNumber, dob, parentRoleId) 
     const MAX_ATTEMPTS = 3;
 
     try {
-        const member = await currentMember.getMember();
+        // FULL fieldset, not the default: the default omits loginEmail and
+        // reading it comes back undefined without complaint (confirmed live
+        // 2026-08-17 - it silently left parentEmail blank on a relink and made
+        // hubEmailSweep skip auto-linking).
+        const member = await currentMember.getMember({ fieldsets: ["FULL"] });
         if (!member) throw new Error("Security Block: Not logged in.");
 
         const options = { suppressAuth: true };
@@ -509,14 +543,17 @@ export async function findPlayerByFanNumberAndDob(fanNumber, dob, parentRoleId) 
 // its primary parent, bypassing verification entirely.
 export async function confirmPlayerLink(playerId, fanNumber, dob, parentRoleId) {
     try {
-        const member = await currentMember.getMember();
+        // FULL fieldset, not the default: the default omits loginEmail and
+        // reading it comes back undefined without complaint (confirmed live
+        // 2026-08-17 - it silently left parentEmail blank on a relink and made
+        // hubEmailSweep skip auto-linking).
+        const member = await currentMember.getMember({ fieldsets: ["FULL"] });
         if (!member) throw new Error("Security Block: Not logged in.");
 
         const options = { suppressAuth: true };
         const loginEmail = member.loginEmail;
         const firstName = member.contactDetails ? member.contactDetails.firstName : "";
         const lastName = member.contactDetails ? member.contactDetails.lastName : "";
-        const resolvedName = `${firstName || ""} ${lastName || ""}`.trim();
 
         const profileResults = await wixData.query("ParentProfiles")
             .eq("memberId", member._id)
@@ -525,7 +562,29 @@ export async function confirmPlayerLink(playerId, fanNumber, dob, parentRoleId) 
         if (profileResults.items.length === 0) {
             return { success: false, error: "Could not find your parent profile. Please try again." };
         }
-        const parentProfileId = profileResults.items[0]._id;
+        const profile = profileResults.items[0];
+        const parentProfileId = profile._id;
+
+        // Name resolution mirrors hubEmailSweep's chain instead of trusting
+        // member.contactDetails alone (fixed 2026-08-16). A Wix member who
+        // signed up with just an email has NO first/last name - common here -
+        // and the old single-source version then silently left parentsName
+        // blank on a freshly linked player.
+        //
+        // The profile is usually the better source: hubEmailSweep already ran
+        // its full resolution chain to populate PP_fullName, and the parent
+        // may since have set it themselves in More > My Details.
+        let resolvedName = `${firstName || ""} ${lastName || ""}`.trim();
+        if (isEmailLike(resolvedName)) resolvedName = "";
+        if (!resolvedName && profile.PP_fullName && !isEmailLike(profile.PP_fullName)) {
+            resolvedName = profile.PP_fullName.trim();
+        }
+        // PP_fullName can legitimately still be the loginEmail placeholder a
+        // profile is seeded with when no name was knowable. isEmailLike above
+        // refuses it on purpose - a blank name is recoverable (the parent
+        // fills it in on their first form save), an email masquerading as a
+        // name spreads to every child record and looks broken to the club.
+        const resolvedPhone = (profile.PP_phoneNumber || "").trim();
 
         // Re-verify the Fan Number/DOB match (re-fetches the player too, so
         // this also reflects the latest ownership state since the preview)
@@ -543,8 +602,29 @@ export async function confirmPlayerLink(playerId, fanNumber, dob, parentRoleId) 
         }
 
         player.primaryParentId = parentProfileId;
+
+        // parentEmail is set UNCONDITIONALLY and deliberately. Claiming
+        // primary means this account is now the contact of record; leaving a
+        // previous parent's address behind would let hubEmailSweep re-link
+        // the wrong account on their next login.
         player.parentEmail = loginEmail;
-        if (!player.parentsName && resolvedName) player.parentsName = resolvedName;
+
+        // Everything else FILLS BLANKS ONLY - never overwrite a value that is
+        // already there. The secretary or the other parent may have entered
+        // something better than anything we can derive, and a re-link must not
+        // clobber it. The one exception is a name that's actually an email
+        // address, which is never right and is always safe to replace.
+        if ((!player.parentsName || isEmailLike(player.parentsName)) && resolvedName) {
+            player.parentsName = resolvedName;
+        }
+        if (!player.parentPhone && resolvedPhone) player.parentPhone = resolvedPhone;
+
+        console.log("[confirmPlayerLink] linking", {
+            playerId: player._id,
+            parentProfileId,
+            wroteName: player.parentsName || "(left blank - no usable source)",
+            wrotePhone: player.parentPhone || "(none)"
+        });
 
         await wixData.update("SignolPlayers", player, options);
 
@@ -594,6 +674,16 @@ export async function secureUpdatePlayerRegistration(playerData, parentProfileId
             playerData.sp_membership_no = await generateUniqueMembershipNumber();
         }
 
+        // Strip anything that isn't a real SignolPlayers column before the
+        // update - Wix Data rejects unknown fields. `viewerIsPrimaryParent`
+        // is computed by getKidsForParent for the frontend's benefit and
+        // travels back in the same object; SP_address/SP_Address are the
+        // long-standing rogue keys Wix keeps trying to recreate as columns.
+        // Done here rather than in each caller so registration save, profile
+        // save and the consent write are all covered by one guard.
+        const NON_CMS_KEYS = ["viewerIsPrimaryParent", "SP_address", "SP_Address"];
+        NON_CMS_KEYS.forEach(key => { delete playerData[key]; });
+
         // 3. If ownership matches, perform the secure update
         const updatedPlayer = await wixData.update("SignolPlayers", playerData, { suppressAuth: true });
         return { success: true, data: updatedPlayer };
@@ -618,14 +708,41 @@ export async function getKidsForParent(parentProfileId) {
         const secondaryQuery = wixData.query("SignolPlayers").eq("secondaryParentId", parentProfileId);
 
         const results = await primaryQuery.or(secondaryQuery)
-            .include("SP_team", "ageGroup")
+            .include("SP_team", "ageGroup", "sp_fee_category")
             .find({ suppressAuth: true });
 
         const kids = results.items.map(kid => {
             const primaryId = kid.primaryParentId ? (kid.primaryParentId._id || kid.primaryParentId) : "";
-            if (primaryId !== parentProfileId) {
+            const isPrimary = primaryId === parentProfileId;
+
+            // Explicit flag so the frontend never has to re-derive this - and
+            // so "is this person the primary parent" has exactly one answer,
+            // decided server-side.
+            kid.viewerIsPrimaryParent = isPrimary;
+
+            if (!isPrimary) {
+                // Extended 2026-08-14 (was just the two sp_parent_* fields).
+                // A secondary parent must not receive the PRIMARY parent's
+                // personal contact details, nor the emergency contact - these
+                // are hidden in the v2 UI, but hiding client-side alone is
+                // cosmetic: without this the full values still sit in the
+                // network response, readable from dev tools. Same reasoning
+                // that put the original sp_parent_dob/address redaction here.
                 delete kid.sp_parent_dob;
                 delete kid.sp_parent_address;
+                delete kid.parentsName;
+                delete kid.parentPhone;
+                delete kid.parentEmail;
+                delete kid.SP_emergContactName;
+                delete kid.SP_emergContactNumber;
+                delete kid.SP_emergContactRelationship;
+
+                if (!primaryId) {
+                    // No primaryParentId on the record at all - everyone gets
+                    // treated as secondary, which also blocks registration.
+                    // Legacy rows predating primaryParentId would land here.
+                    console.warn("getKidsForParent: player has no primaryParentId, treating viewer as secondary -", kid._id);
+                }
             }
             return kid;
         });
@@ -654,6 +771,43 @@ const NOTIFY_EMAIL_ENABLED = true;
 
 // Fee instalment calendar: 10 monthly payments, July → April (JS month indexes).
 const FEE_PAYMENT_MONTHS = [6, 7, 8, 9, 10, 11, 0, 1, 2, 3];
+
+// A one-off catch-up payment (see ensureSubscriptionCreated) is only used if
+// GoCardless's real earliest date lands within this many days AFTER the 15th
+// - close enough that catching up still looks like the planned schedule.
+// Rob's explicit call, 2026-08-10: this is a fixed window anchored to the
+// 15th, not a "days from today" floor - a days-from-today floor doesn't
+// actually prevent short notice if a record's sat stuck for a while and
+// GoCardless's answer has drifted close to "now". Beyond this window, don't
+// bother with a one-off at all - just run the normal full-count subscription
+// from next month's 15th, same as if the mandate had confirmed too late to
+// try a catch-up.
+const ONEOFF_CATCHUP_WINDOW_DAYS = 5; // 15th + 5 = 20th
+// Every month gets a label now, not just the original Jul-Apr set - a schedule
+// that starts late (a one-off in August then a subscription running Sep-May,
+// say) can run into May/June, which the original fixed calendar never needed
+// to label.
+const FEE_MONTH_LABELS = { 6: "Jul", 7: "Aug", 8: "Sep", 9: "Oct", 10: "Nov", 11: "Dec", 0: "Jan", 1: "Feb", 2: "Mar", 3: "Apr", 4: "May", 5: "Jun" };
+
+// Shared by getSecretaryPaymentsOverview (per player, for the roster mini-strip)
+// and getPlayerPaymentTimeline (one player, for PlayerRecord's detail view).
+// 2026-08-11: takes the PLAYER'S OWN start month + instalment count, rather
+// than always assuming the club-wide Jul-Apr default - Rob's ask, since a
+// one-off/late-start schedule can genuinely run e.g. Aug-May, and the tick
+// strip should show that player's real months, not a fixed calendar.
+function buildMonthlyTicks(startMonth, count, paidMonths, failedMonths) {
+    const todayMonth = new Date().getMonth();
+    const months = [];
+    for (let i = 0; i < count; i++) months.push((startMonth + i) % 12);
+    return months.map(m => {
+        let status;
+        if (paidMonths.has(m)) status = "paid";
+        else if (failedMonths.has(m)) status = "failed";
+        else if (m === todayMonth) status = "due";
+        else status = "future";
+        return { month: FEE_MONTH_LABELS[m], status };
+    });
+}
 
 // Single swappable notification point. kind = "sent_back" | "fee_schedule".
 export async function notifyParent(playerId, kind, payload = {}) {
@@ -748,22 +902,67 @@ export async function countRenewalTargets(teamId, ageGroupId) {
     }
 }
 
+// Football season = Jul Y → Jun Y+1, labelled "Y-(Y+1 short)". Shared by buildFeeSchedule
+// below and by the GoCardlessSubscriptions season tag, so both always agree on which
+// season a given date belongs to - including the May/Jun off-season gap, which belongs
+// to the UPCOMING July season, not the one that just finished (Jan-Apr, by contrast, are
+// still inside the season that started the PREVIOUS July).
+function getSeasonInfo(date) {
+    const d = date ? new Date(date) : new Date();
+    const m = d.getMonth();
+    const startYear = m >= 6 ? d.getFullYear() : (m <= 3 ? d.getFullYear() - 1 : d.getFullYear());
+    return {
+        label: `${startYear}-${String((startYear + 1) % 100).padStart(2, '0')}`,
+        startDate: new Date(startYear, 6, 1),
+        endDate: new Date(startYear + 1, 5, 30)
+    };
+}
+
+// Public wrapper for getSeasonInfo() above - just the label ("2026-27"), for
+// display purposes like Player Admin's top-bar season indicator. getSeasonInfo()
+// itself stays private since every other caller only needs the label too, or
+// computes it for a specific date rather than "right now".
+export function getCurrentSeasonLabel() {
+    return getSeasonInfo().label;
+}
+
 // Pure pro-rata schedule: every player pays the same monthly amount
-// (annual / 10); late joiners simply get fewer instalments.
-function buildFeeSchedule(registrationDate, annualAmount) {
-    const reg = registrationDate ? new Date(registrationDate) : new Date();
+// (annual / 10); late joiners simply get fewer instalments. anchorDate is normally
+// registrationDate, but callers pass resolveScheduleAnchorDate(player)'s result, which
+// prefers sp_paymentStartOverride when the secretary's set one.
+//
+// countOverride (optional) forces a specific instalment count instead of the auto
+// pro-rata reduction - needed for the 2026-27 GoCardless rollout, where a team migrated
+// onto GoCardless mid-season (e.g. an August start) still owes the full 10 instalments,
+// not the ~9 the normal "fewer months left in the fixed Jul-Apr season" logic would give.
+// When set, the schedule is N CONSECUTIVE months from the anchor date - deliberately NOT
+// constrained to the fixed Jul-Apr calendar, since 10 months from an August start runs
+// into May the following year.
+function buildFeeSchedule(anchorDate, annualAmount, countOverride) {
+    const reg = anchorDate ? new Date(anchorDate) : new Date();
     const perPayment = Math.round((Number(annualAmount) / FEE_PAYMENT_MONTHS.length) * 100) / 100;
 
-    let startIdx = FEE_PAYMENT_MONTHS.indexOf(reg.getMonth());
-    if (startIdx === -1) startIdx = 0; // off-season (May/Jun) joiner → full season from July
-    const months = FEE_PAYMENT_MONTHS.slice(startIdx);
+    let schedule;
+    if (countOverride) {
+        schedule = [];
+        let y = reg.getFullYear(), m = reg.getMonth();
+        for (let i = 0; i < countOverride; i++) {
+            schedule.push({ date: new Date(y, m, 15), amount: perPayment });
+            m++; if (m > 11) { m = 0; y++; }
+        }
+    } else {
+        let startIdx = FEE_PAYMENT_MONTHS.indexOf(reg.getMonth());
+        if (startIdx === -1) startIdx = 0; // off-season (May/Jun) joiner → full season from July
+        const months = FEE_PAYMENT_MONTHS.slice(startIdx);
 
-    // Season spans two calendar years (Jul Y → Apr Y+1).
-    const seasonStartYear = reg.getMonth() >= 6 ? reg.getFullYear() : reg.getFullYear() - 1;
-    const schedule = months.map(m => ({
-        date: new Date(m >= 6 ? seasonStartYear : seasonStartYear + 1, m, 1),
-        amount: perPayment
-    }));
+        // Instalments fall on the 15th (not the 1st) - see backend/gocardless.jsw's
+        // createSubscription, which mirrors this day-of-month for the real collection.
+        const seasonStartYear = getSeasonInfo(reg).startDate.getFullYear();
+        schedule = months.map(m => ({
+            date: new Date(m >= 6 ? seasonStartYear : seasonStartYear + 1, m, 15),
+            amount: perPayment
+        }));
+    }
 
     return {
         perPayment,
@@ -772,6 +971,26 @@ function buildFeeSchedule(registrationDate, annualAmount) {
         firstDate: schedule.length ? schedule[0].date : null,
         schedule
     };
+}
+
+// Normally the schedule is anchored to when the player joined the club
+// (player.registrationDate) - right for a genuine new mid-season signup, where fewer
+// remaining months should mean a smaller total owed. That anchor is WRONG for the
+// 2026-27 GoCardless rollout itself though: existing players are being migrated onto
+// GoCardless team-by-team, independent of their (possibly years-old) original join date,
+// and most should still pay the full 10 instalments regardless of which calendar month
+// their team gets switched over in. sp_paymentStartOverride (set via
+// secretarySetFeeCategory) lets the secretary anchor the schedule explicitly per player
+// for exactly that case - if unset, behaviour is unchanged from before.
+function resolveScheduleAnchorDate(player) {
+    return player.sp_paymentStartOverride || player.registrationDate;
+}
+
+// Companion to resolveScheduleAnchorDate above - sp_paymentCountOverride lets the
+// secretary force a specific instalment count (e.g. 10, even from an August anchor)
+// instead of the normal auto pro-rata reduction. Unset = unchanged old behaviour.
+function resolveScheduleCountOverride(player) {
+    return player.sp_paymentCountOverride || null;
 }
 
 // Preview the schedule for a tier without saving anything (drives the lightbox preview).
@@ -784,15 +1003,23 @@ export async function getFeeSchedule(playerId, feeCategoryId) {
         ]);
         if (!player || !cat) return { success: false, error: "Missing player or fee category" };
         const annual = Number(cat.F_annual_amount) || 0;
-        return { success: true, label: cat.F_label, annualAmount: annual, ...buildFeeSchedule(player.registrationDate, annual) };
+        return { success: true, label: cat.F_label, annualAmount: annual, ...buildFeeSchedule(resolveScheduleAnchorDate(player), annual, resolveScheduleCountOverride(player)) };
     } catch (err) {
         console.error("getFeeSchedule error:", err);
         return { success: false, error: err.message };
     }
 }
 
-// Save the chosen tier on the player, and optionally send the schedule to the parent.
-export async function secretarySetFeeCategory(playerId, feeCategoryId, sendToParent) {
+// Saves the chosen tier on the player AND flips sp_paymentschedulesentdate, which
+// is the one flag that makes #btnPayment appear on the parent's Dashboard card
+// (see resolvePlanId in Parent Hub.js). One action, no separate silent-save step -
+// there's no email step to gate anymore, the parent finds out by seeing the button
+// in their own Hub next time they log in.
+//
+// startDateOverride (optional, "YYYY-MM-DD" string) / countOverride (optional number) -
+// see resolveScheduleAnchorDate/resolveScheduleCountOverride above. Only written when
+// provided, so leaving either blank never disturbs a player's existing override.
+export async function secretarySetFeeCategory(playerId, feeCategoryId, startDateOverride, countOverride) {
     try {
         if (!feeCategoryId) return { success: false, error: "No fee category selected" };
 
@@ -802,31 +1029,679 @@ export async function secretarySetFeeCategory(playerId, feeCategoryId, sendToPar
         ]);
         if (!player || !cat) return { success: false, error: "Missing player or fee category" };
 
+        if (startDateOverride) player.sp_paymentStartOverride = new Date(startDateOverride);
+        if (countOverride) player.sp_paymentCountOverride = Number(countOverride);
+
         const annual = Number(cat.F_annual_amount) || 0;
-        const schedule = buildFeeSchedule(player.registrationDate, annual);
+        const schedule = buildFeeSchedule(resolveScheduleAnchorDate(player), annual, resolveScheduleCountOverride(player));
 
         player.sp_fee_category = feeCategoryId; // single-reference field set by id
-        if (sendToParent) {
-            // Store a clean YYYY-MM-DD date string (matches the taster/reg date pattern)
-            // instead of a full `new Date()` timestamp, so the CMS shows a tidy date.
-            const now = new Date();
-            player.sp_paymentschedulesentdate =
-                `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-        }
-        await wixData.update("SignolPlayers", player, { suppressAuth: true });
 
-        if (sendToParent) {
-            const lines = schedule.schedule
-                .map(s => `£${s.amount.toFixed(2)} on ${new Date(s.date).toLocaleDateString('en-GB')}`)
-                .join("; ");
-            await notifyParent(playerId, "fee_schedule", {
-                message: `${cat.F_label}: ${schedule.count} payment(s) of £${schedule.perPayment.toFixed(2)} (total £${schedule.total.toFixed(2)}). Schedule — ${lines}. Payments are collected by monthly Direct Debit.`
-            });
-        }
+        // Store a clean YYYY-MM-DD date string (matches the taster/reg date pattern)
+        // instead of a full `new Date()` timestamp, so the CMS shows a tidy date.
+        const now = new Date();
+        player.sp_paymentschedulesentdate =
+            `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+
+        await wixData.update("SignolPlayers", player, { suppressAuth: true });
 
         return { success: true, label: cat.F_label, annualAmount: annual, ...schedule };
     } catch (err) {
         console.error("secretarySetFeeCategory error:", err);
+        return { success: false, error: err.message };
+    }
+}
+
+// =====================================================================
+//  CHILD PAYMENT TRACKING — links a Wix Pricing Plan subscription back to
+//  the specific child it's for (Wix's own order data only knows the buying
+//  member + plan, not which of their kids it's for). See backend/events.js
+//  for the other half of this: the order-created/cycle-started handlers
+//  that confirm + keep this record in sync.
+// =====================================================================
+
+// Called right before the parent is sent to Wix Pricing Plans checkout.
+// Writes an unconfirmed "pending" marker so the order-purchased event (fired
+// once they complete checkout) can be matched back to this exact child -
+// matched on memberId + planId, oldest-pending-first (see wixPricingPlans_onOrderPurchased
+// in events.js). Not a real subscription yet, just a marker.
+export async function markPendingPayment(playerId, planId) {
+    try {
+        const member = await currentMember.getMember();
+        if (!member) throw new Error("Security Block: Not logged in.");
+        if (!planId) return { success: false, error: "No plan selected" };
+
+        await wixData.insert("ChildSubscriptions", {
+            player: playerId,
+            memberId: member._id,
+            wixPlanId: planId,
+            status: "pending",
+            confirmed: false
+        }, { suppressAuth: true });
+
+        return { success: true };
+    } catch (err) {
+        console.error("markPendingPayment error:", err);
+        return { success: false, error: err.message };
+    }
+}
+
+// Reads back the current subscription/payment status for a child, for display
+// on Parent Hub's statePayment and the secretary's Player Record.
+export async function getChildSubscriptionStatus(playerId) {
+    try {
+        const res = await wixData.query("ChildSubscriptions")
+            .eq("player", playerId)
+            .eq("confirmed", true)
+            .descending("_createdDate")
+            .limit(1)
+            .find({ suppressAuth: true });
+
+        if (!res.items.length) return { success: true, found: false };
+
+        const sub = res.items[0];
+        return {
+            success: true,
+            found: true,
+            orderId: sub.orderId, // needed to cancel THIS specific order via
+            // orders.requestCurrentMemberOrderCancellation on the frontend, if the
+            // secretary's since assigned a different tier (see Parent Hub.js)
+            wixPlanId: sub.wixPlanId,
+            status: sub.status,
+            lastPaymentStatus: sub.lastPaymentStatus,
+            currentCycleIndex: sub.currentCycleIndex,
+            currentCycleStart: sub.currentCycleStart,
+            currentCycleEnd: sub.currentCycleEnd
+        };
+    } catch (err) {
+        console.error("getChildSubscriptionStatus error:", err);
+        return { success: false, error: err.message };
+    }
+}
+
+// =====================================================================
+//  GOCARDLESS PAYMENT TRACKING — replaces the Wix Pricing Plans-based
+//  markPendingPayment/getChildSubscriptionStatus pair above with a GoCardless
+//  Direct Debit equivalent. See backend/gocardless.jsw for the API wrapper and
+//  backend/http-functions.js for the webhook handler that keeps this in sync.
+//  The old functions/collection above are left in place, unused, until the
+//  GoCardless path has been live and collected at least one real monthly cycle.
+// =====================================================================
+
+// Called when the parent taps "Set Up Payment". Computes the fee schedule (the same
+// buildFeeSchedule() the secretary's preview uses), snapshots it onto a new
+// GoCardlessSubscriptions row, then kicks off GoCardless's hosted mandate-setup flow
+// tagged with that row's _id as metadata - this is what lets the webhook handler match
+// every later event back to this exact child, with none of the FIFO guesswork the old
+// Wix Pricing Plans flow needed for two kids on the same fee tier.
+export async function startGoCardlessSetup(playerId, feeCategoryId, returnUrl) {
+    try {
+        const member = await currentMember.getMember();
+        if (!member) throw new Error("Security Block: Not logged in.");
+        if (!feeCategoryId) return { success: false, error: "No fee category selected" };
+
+        // Guard against a double-click/retry creating a SECOND live mandate for the same
+        // child (double billing) - scoped to THIS player, not memberId, since one parent
+        // legitimately sets this up once per child. CANCELED/ENDED rows don't block a
+        // fresh setup (e.g. after a tier change cancel, or a genuinely ended plan).
+        // PENDING only blocks while recent (1hr) - an abandoned GoCardless hosted flow
+        // (parent closes the tab before finishing bank details) would otherwise leave a
+        // stale PENDING row that permanently locks the child out of ever retrying.
+        const staleCutoff = new Date();
+        staleCutoff.setHours(staleCutoff.getHours() - 1);
+        const activeQuery = wixData.query("GoCardlessSubscriptions").eq("player", playerId).eq("status", "ACTIVE");
+        const recentPendingQuery = wixData.query("GoCardlessSubscriptions").eq("player", playerId).eq("status", "PENDING").gt("_createdDate", staleCutoff);
+        const existing = await activeQuery.or(recentPendingQuery).limit(1).find({ suppressAuth: true });
+        if (existing.items.length > 0) {
+            return { success: false, error: "This child already has a payment plan set up or in progress. Refresh the page to see its current status." };
+        }
+
+        const [player, cat] = await Promise.all([
+            wixData.get("SignolPlayers", playerId, { suppressAuth: true }),
+            wixData.get("FeeCategories", feeCategoryId, { suppressAuth: true })
+        ]);
+        if (!player || !cat) return { success: false, error: "Missing player or fee category" };
+
+        const annual = Number(cat.F_annual_amount) || 0;
+        const anchorDate = resolveScheduleAnchorDate(player); // registrationDate, unless the secretary set an explicit override
+        const schedule = buildFeeSchedule(anchorDate, annual, resolveScheduleCountOverride(player));
+        // Same anchor date as the schedule itself, so the season tag always matches what's
+        // actually being billed - not "today" (setup could happen days/weeks after
+        // registration), and not independently recomputed.
+        const season = getSeasonInfo(anchorDate);
+
+        // Denormalized onto the record (not just sent to GoCardless) so ensureSubscriptionCreated
+        // in http-functions.js can re-send the same identifying metadata when it later creates
+        // the actual subscription, without a second SignolPlayers lookup at that point.
+        const playerName = `${player.SP_firstName || ""} ${player.SP_lastName || ""}`.trim();
+        const membershipNo = player.sp_membership_no ? String(player.sp_membership_no) : "";
+
+        // Free tier (e.g. managers' own kids) - GoCardless requires a minimum £1
+        // transaction and never activates a £0 subscription (confirmed against
+        // their own docs, 2026-08 - a real test got stuck PENDING forever since
+        // there's nothing for it to actually collect). Skip GoCardless entirely:
+        // record it straight as ACTIVE/confirmed so the secretary's Payments
+        // overview and the parent's Hub both see it as done, no bank details or
+        // mandate needed. `free: true` in the response tells the frontend not to
+        // redirect anywhere.
+        if (annual <= 0) {
+            await wixData.insert("GoCardlessSubscriptions", {
+                player: playerId,
+                memberId: member._id,
+                feeCategoryId: feeCategoryId,
+                perPayment: 0,
+                scheduleCount: 0,
+                firstDate: null,
+                season: season.label,
+                seasonStartDate: season.startDate,
+                seasonEndDate: season.endDate,
+                playerName,
+                membershipNo,
+                status: "ACTIVE",
+                lastPaymentStatus: "N/A",
+                paymentsCollectedCount: 0,
+                confirmed: true
+            }, { suppressAuth: true });
+            return { success: true, free: true };
+        }
+
+        const record = await wixData.insert("GoCardlessSubscriptions", {
+            player: playerId,
+            memberId: member._id,
+            feeCategoryId: feeCategoryId,
+            perPayment: schedule.perPayment,
+            scheduleCount: schedule.count,
+            firstDate: schedule.firstDate,
+            season: season.label,
+            seasonStartDate: season.startDate,
+            seasonEndDate: season.endDate,
+            playerName,
+            membershipNo,
+            status: "PENDING",
+            lastPaymentStatus: "UNPAID",
+            paymentsCollectedCount: 0,
+            confirmed: false
+        }, { suppressAuth: true });
+
+        const gcMetadata = {};
+        if (playerName) gcMetadata.playerName = playerName;
+        if (membershipNo) gcMetadata.membershipNo = membershipNo;
+        const { billingRequestId, authorisationUrl } = await createBillingRequestFlow(record._id, returnUrl, gcMetadata);
+
+        record.gcBillingRequestId = billingRequestId;
+        await wixData.update("GoCardlessSubscriptions", record, { suppressAuth: true });
+
+        return { success: true, authorisationUrl };
+    } catch (err) {
+        console.error("startGoCardlessSetup error:", err);
+        return { success: false, error: err.message };
+    }
+}
+
+// Reads back the current GoCardless subscription status for a child, for display on
+// Parent Hub's statePayment and (eventually) the secretary's Player Record. Field names
+// deliberately mirror the old getChildSubscriptionStatus's shape so Parent Hub.js's
+// status-label logic needs minimal changes.
+export async function getGoCardlessStatus(playerId) {
+    try {
+        const res = await wixData.query("GoCardlessSubscriptions")
+            .eq("player", playerId)
+            .descending("_createdDate")
+            .limit(1)
+            .find({ suppressAuth: true });
+
+        if (!res.items.length) return { success: true, found: false };
+
+        const sub = res.items[0];
+        return {
+            success: true,
+            found: true,
+            recordId: sub._id, // needed to cancel THIS specific record via cancelGoCardlessSubscription
+            feeCategoryId: sub.feeCategoryId,
+            status: sub.status,
+            lastPaymentStatus: sub.lastPaymentStatus,
+            paymentsCollectedCount: sub.paymentsCollectedCount,
+            createdDate: sub._createdDate // lets the frontend tell a genuinely-in-progress
+            // PENDING apart from an abandoned one (matches startGoCardlessSetup's 1hr
+            // staleness window) and offer a retry instead of a permanent dead end
+        };
+    } catch (err) {
+        console.error("getGoCardlessStatus error:", err);
+        return { success: false, error: err.message };
+    }
+}
+
+// Cancels the parent's active GoCardless subscription for this child - called when the
+// secretary's assigned a different fee tier while one's already active (mirrors the old
+// #btnCancelOldPlan flow). Verifies the caller actually owns the record first, since
+// GoCardless's secret API key means this can never be a direct frontend call the way
+// Wix's member-authenticated order-cancellation API could.
+export async function cancelGoCardlessSubscription(recordId) {
+    try {
+        const member = await currentMember.getMember();
+        if (!member) throw new Error("Security Block: Not logged in.");
+
+        const record = await wixData.get("GoCardlessSubscriptions", recordId, { suppressAuth: true });
+        if (!record) return { success: false, error: "Subscription record not found" };
+        if (record.memberId !== member._id) throw new Error("Security Block: Not your subscription.");
+        if (!record.gcSubscriptionId) return { success: false, error: "No active GoCardless subscription to cancel" };
+
+        const { status } = await cancelSubscription(record.gcSubscriptionId);
+
+        record.subscriptionStatus = status;
+        record.status = "CANCELED";
+        await wixData.update("GoCardlessSubscriptions", record, { suppressAuth: true });
+
+        return { success: true };
+    } catch (err) {
+        console.error("cancelGoCardlessSubscription error:", err);
+        return { success: false, error: err.message };
+    }
+}
+
+export function normalizeSubscriptionStatus(gcStatus) {
+    if (gcStatus === "active") return "ACTIVE";
+    if (gcStatus === "cancelled") return "CANCELED";
+    if (gcStatus === "finished") return "ENDED";
+    return "PENDING";
+}
+
+// Moved here from backend/http-functions.js (2026-08) so it can also be called
+// from retryStuckSubscriptions() below, not just from a live webhook - a mandate
+// going active and the subscription actually getting created are two separate
+// GoCardless API calls, and the second one can fail (rejected request, network
+// blip, timeout) even though the first one, and the CMS write recording the
+// mandate as active, both already succeeded. When that happens the webhook
+// handler's own try/catch swallows the error and still returns 200 OK, so
+// GoCardless never retries - the record is stuck with a live mandate but no
+// subscription, silently, until someone notices (real incident, 2026-08-10:
+// see retryStuckSubscriptions()).
+//
+// Real incident, 2026-08-10, part 2: buildFeeSchedule's instalments always land
+// on the 15th, but GoCardless requires a mandate's first collection to be on or
+// after that specific mandate's own next_possible_charge_date - which varies
+// per mandate and is often later than the 15th when the mandate confirms close
+// to it (this is GoCardless's real rule, not something we can shortcut with a
+// fixed number of days - see the removed addWorkingDays logic this replaced).
+// Three paths, decided automatically per record, no manual choice needed either
+// way (Rob's requirement, 2026-08-10):
+//   - Normal case: the 15th is still reachable -> one subscription, full count,
+//     starting the 15th. Nothing different from before.
+//   - Close-but-late case: the 15th's gone but GoCardless's real earliest date
+//     is still within ONEOFF_CATCHUP_WINDOW_DAYS of it (on or before the 20th)
+//     -> a ONE-OFF payment on that real date, so the family isn't left with a
+//     payment-free month, then a subscription for the REMAINING instalments
+//     starting the following month's 15th.
+//   - Too-late case: real earliest date is past the 20th -> skip the one-off
+//     entirely (not worth an oddly-timed catch-up that far out), just run the
+//     normal FULL-count subscription from next month's 15th instead.
+export async function ensureSubscriptionCreated(record) {
+    // record.confirmed, not gcSubscriptionId, is the real "already handled"
+    // flag - the one-off-only edge case below (scheduleCount was already 1,
+    // fully covered by the catch-up payment) never sets gcSubscriptionId at
+    // all, so checking that alone would make retryStuckSubscriptions() retry
+    // it forever, creating a duplicate one-off payment every single sweep.
+    if (record.confirmed) return;
+    if (!record.gcMandateId) return; // mandate not confirmed yet
+
+    const gcMetadata = {};
+    if (record.playerName) gcMetadata.playerName = record.playerName;
+    if (record.membershipNo) gcMetadata.membershipNo = record.membershipNo;
+
+    const mandate = await getMandate(record.gcMandateId);
+    const earliestPossible = new Date(mandate.next_possible_charge_date);
+    const nominalFirst = record.firstDate ? new Date(record.firstDate) : null;
+
+    let subscriptionFirstDate = nominalFirst;
+    let subscriptionCount = record.scheduleCount;
+
+    if (!nominalFirst || nominalFirst < earliestPossible) {
+        // The 15th isn't reachable. Rob's rule, 2026-08-10: only bother with a
+        // one-off catch-up if GoCardless's real earliest date is still close
+        // to the 15th (within ONEOFF_CATCHUP_WINDOW_DAYS - i.e. on or before
+        // the 20th) - close enough that catching up still looks like the
+        // planned schedule. Anything later than that, don't force an oddly-
+        // timed one-off just to save a month - run the normal full-count
+        // subscription from next month's 15th instead, same as any other
+        // late-joiner.
+        const baseMonth = nominalFirst || earliestPossible;
+        const catchupCutoff = new Date(baseMonth.getFullYear(), baseMonth.getMonth(), 15 + ONEOFF_CATCHUP_WINDOW_DAYS);
+
+        if (earliestPossible <= catchupCutoff) {
+            // Build the date string from local Y/M/D, not .toISOString() -
+            // that converts to UTC first and can shift the date by a day
+            // depending on timezone (same rule as toDateOnlyString() elsewhere
+            // in this project).
+            const oneOffDateStr = `${earliestPossible.getFullYear()}-${String(earliestPossible.getMonth() + 1).padStart(2, '0')}-${String(earliestPossible.getDate()).padStart(2, '0')}`;
+            await createOneOffPayment(record.gcMandateId, record.perPayment, oneOffDateStr, record._id, gcMetadata);
+            subscriptionCount = Math.max(0, record.scheduleCount - 1);
+        }
+        // Full count if no one-off happened, one fewer if it did - either way
+        // the subscription itself always resumes on next month's 15th.
+        subscriptionFirstDate = new Date(baseMonth.getFullYear(), baseMonth.getMonth() + 1, 15);
+    }
+
+    let updates;
+    if (subscriptionCount > 0) {
+        const schedule = { perPayment: record.perPayment, count: subscriptionCount, firstDate: subscriptionFirstDate };
+        const { subscriptionId, status } = await createSubscription(record.gcMandateId, schedule, record._id, gcMetadata);
+        updates = { gcSubscriptionId: subscriptionId, subscriptionStatus: status, status: normalizeSubscriptionStatus(status) };
+    } else {
+        // Edge case: the whole fee (scheduleCount was already 1) got covered
+        // by the one-off above - there's no subscription at all, so there's
+        // nothing to normalize a status FROM. Mark it active directly so the
+        // Payments dashboard doesn't show this player as stuck "Pending"
+        // forever despite their fee being fully collected.
+        updates = { status: "ACTIVE" };
+    }
+
+    // Re-fetch fresh right before writing, rather than reusing the `record`
+    // passed in - real incident, 2026-08-10: this function makes up to three
+    // slow external calls (getMandate, createOneOffPayment, createSubscription)
+    // before reaching this point, which is exactly the gap another handler's
+    // near-simultaneous webhook update can land in. Writing back the original
+    // stale copy here would silently revert that other handler's change -
+    // apply only the specific fields THIS function is responsible for onto
+    // whatever's actually there right now. Only matters when multiple webhook
+    // events land within seconds of each other (e.g. rapid manual testing) - a
+    // real signup's events are naturally spaced out enough that this never
+    // bites in practice, but worth closing properly.
+    const fresh = await wixData.get("GoCardlessSubscriptions", record._id, { suppressAuth: true });
+    if (!fresh) return; // record was deleted between fetch and write - nothing to update
+    Object.assign(fresh, updates, { confirmed: true });
+    await wixData.update("GoCardlessSubscriptions", fresh, { suppressAuth: true });
+
+    // Verify-after-write safety net, 2026-08-11: `status` has been observed
+    // landing as a bare `{}` on live signups (2026-08-10 and again 2026-08-11)
+    // despite every write path in this file only ever assigning one of the 4
+    // fixed strings below - root cause not yet found despite extensive
+    // investigation (see project memory for the full trail). This doesn't fix
+    // the unknown cause, but it stops the bad value from persisting, and logs
+    // the actual raw value/type so the next occurrence finally gives us real
+    // diagnostic evidence instead of another dead end.
+    const VALID_STATUSES = ["PENDING", "ACTIVE", "CANCELED", "ENDED"];
+    const verify = await wixData.get("GoCardlessSubscriptions", record._id, { suppressAuth: true });
+    if (verify && !VALID_STATUSES.includes(verify.status)) {
+        console.error("ensureSubscriptionCreated: status wrote back invalid - raw:", JSON.stringify(verify.status), "typeof:", typeof verify.status, "recordId:", record._id, "intended:", updates.status);
+        verify.status = updates.status;
+        await wixData.update("GoCardlessSubscriptions", verify, { suppressAuth: true });
+    }
+}
+
+// Self-healing sweep for exactly the stuck state described above: a mandate
+// that's live (gcMandateId set) but not yet confirmed (record.confirmed still
+// false). Safe to call repeatedly - ensureSubscriptionCreated re-checks
+// record.confirmed itself and does nothing if a row's already been fixed (by
+// a previous sweep, or a webhook that eventually got through). Call this from
+// a button (secretary-facing "Retry Stuck Payments" tool) or manually.
+export async function retryStuckSubscriptions() {
+    try {
+        // Fetch-then-filter in JS rather than .isNotEmpty()/.isEmpty() query
+        // filters - same reasoning as the sp_fee_category fix earlier this
+        // session: not used anywhere else in this codebase, not worth the risk
+        // on a money-handling sweep when this scale (subscriptions collection,
+        // not the 300+ player roster) doesn't need query-side filtering anyway.
+        const all = await wixData.query("GoCardlessSubscriptions").limit(1000).find({ suppressAuth: true });
+        const stuck = all.items.filter(r => r.gcMandateId && !r.confirmed);
+
+        let fixed = 0;
+        const errors = [];
+        for (const record of stuck) {
+            try {
+                await ensureSubscriptionCreated(record);
+                if (record.confirmed) fixed++;
+            } catch (err) {
+                console.error("retryStuckSubscriptions: failed for record", record._id, err);
+                errors.push({ recordId: record._id, playerName: record.playerName, error: err.message });
+            }
+        }
+        return { success: true, checked: stuck.length, fixed, errors };
+    } catch (err) {
+        console.error("retryStuckSubscriptions error:", err);
+        return { success: false, error: err.message };
+    }
+}
+
+// Club-wide GoCardless overview for the secretary's Player Admin dashboard (statePayments
+// + the Dashboard "Payment Issues" KPI/widget) - first-ever secretary-facing view of
+// payment status; previously only visible one player at a time via PlayerRecord's fee tab.
+// Read-only for v1 - any action (cancel, fix) still happens via the existing PlayerRecord
+// flow, this just gives visibility into who needs it.
+export async function getSecretaryPaymentsOverview() {
+    try {
+        // A player can have more than one GoCardlessSubscriptions row over time (e.g. a
+        // cancelled-then-replaced tier change) - same "most recent per player wins" rule
+        // getGoCardlessStatus uses for one player, applied here across all of them.
+        const all = await wixData.query("GoCardlessSubscriptions")
+            .descending("_createdDate")
+            .limit(1000)
+            .find({ suppressAuth: true });
+
+        const latestByPlayer = new Map();
+        for (const sub of all.items) {
+            const playerId = sub.player;
+            if (!latestByPlayer.has(playerId)) latestByPlayer.set(playerId, sub);
+        }
+        const current = Array.from(latestByPlayer.values());
+
+        const playerIds = current.map(s => s.player).filter(Boolean);
+        const players = playerIds.length
+            ? await wixData.query("SignolPlayers")
+                .hasSome("_id", playerIds)
+                .include("SP_team")
+                .limit(1000)
+                .find({ suppressAuth: true })
+            : { items: [] };
+        const teamByPlayer = new Map(players.items.map(p => [p._id, p.SP_team ? p.SP_team.T_teamName : "—"]));
+
+        // One season-wide GoCardlessPayments fetch, reused two ways below: the
+        // existing "Collected by Month" club total, and (2026-08) a per-player
+        // paid/failed month breakdown for each roster row's mini tick-strip -
+        // no extra query added for the tick-strip, it's the same rows already
+        // being pulled for the chart.
+        const season = getSeasonInfo();
+        const seasonPayments = await wixData.query("GoCardlessPayments")
+            .ge("chargeDate", season.startDate)
+            .le("chargeDate", season.endDate)
+            .limit(1000)
+            .find({ suppressAuth: true });
+
+        const paidMonthsByPlayer = new Map(), failedMonthsByPlayer = new Map();
+        seasonPayments.items.forEach(p => {
+            if (!p.chargeDate || !p.player) return;
+            const m = new Date(p.chargeDate).getMonth();
+            const target = p.status === "PAID" ? paidMonthsByPlayer : p.status === "FAILED" ? failedMonthsByPlayer : null;
+            if (!target) return;
+            if (!target.has(p.player)) target.set(p.player, new Set());
+            target.get(p.player).add(m);
+        });
+
+        let activeCount = 0, pendingCount = 0, failedCount = 0;
+        const items = current.map(sub => {
+            if (sub.lastPaymentStatus === "FAILED") failedCount++;
+            else if (sub.status === "ACTIVE") activeCount++;
+            else if (sub.status === "PENDING") pendingCount++;
+
+            return {
+                _id: sub._id, // required for the Wix repeater to bind each row correctly - without
+                              // a unique _id, .data still renders the right NUMBER of rows but can't
+                              // reliably bind each one's fields, which showed as every row just
+                              // keeping its placeholder text
+                playerId: sub.player,
+                playerName: sub.playerName || "—",
+                team: teamByPlayer.get(sub.player) || "—",
+                status: sub.status,
+                lastPaymentStatus: sub.lastPaymentStatus,
+                perPayment: sub.perPayment || 0, // the monthly amount - already on this record, no extra query
+                // sub.firstDate/scheduleCount are this player's OWN real schedule
+                // (may not be Jul-Apr - see buildMonthlyTicks). firstDate is always
+                // set at fee-assignment time, well before this row exists.
+                monthlyTicks: buildMonthlyTicks(
+                    sub.firstDate ? new Date(sub.firstDate).getMonth() : FEE_PAYMENT_MONTHS[0],
+                    sub.scheduleCount || 10,
+                    paidMonthsByPlayer.get(sub.player) || new Set(),
+                    failedMonthsByPlayer.get(sub.player) || new Set()
+                )
+            };
+        });
+
+        // "True pending" - a fee category has been saved on the player (she's
+        // committed them to a tier/schedule) but no GoCardlessSubscriptions row
+        // exists at all yet (parent never started setup, as opposed to PENDING
+        // above where they started but the mandate isn't active yet). Both read
+        // as "pending" to her, but this half was previously invisible - these
+        // players just didn't appear anywhere in the payments overview.
+        // Filtering "fee category is set" in JS rather than a query filter
+        // (.isNotEmpty on a single-reference field isn't used anywhere else in
+        // this codebase and isn't proven reliable here) - same "fetch then
+        // filter" approach the rest of this function already uses.
+        const feeAssigned = await wixData.query("SignolPlayers")
+            .ne("SP_status", LEFT_STATUS_ID)
+            .include("SP_team", "sp_fee_category")
+            .limit(1000)
+            .find({ suppressAuth: true });
+
+        const alreadyTracked = new Set(current.map(s => s.player));
+        const notSetUp = feeAssigned.items
+            .filter(p => p.sp_fee_category && !alreadyTracked.has(p._id))
+            .map(p => {
+                pendingCount++;
+                return {
+                    _id: `notsetup-${p._id}`,
+                    playerId: p._id,
+                    playerName: `${p.SP_firstName || ""} ${p.SP_lastName || ""}`.trim() || "—",
+                    team: p.SP_team ? p.SP_team.T_teamName : "—",
+                    status: "NOT_SETUP",
+                    lastPaymentStatus: null,
+                    perPayment: (p.sp_fee_category && p.sp_fee_category.F_annual_amount) ? p.sp_fee_category.F_annual_amount / 10 : 0,
+                    // Never set up yet - no real firstDate to anchor to, fall back
+                    // to the club's default season start (July) and standard count.
+                    monthlyTicks: buildMonthlyTicks(FEE_PAYMENT_MONTHS[0], 10, new Set(), new Set())
+                };
+            });
+        items.push(...notSetUp);
+
+        // Failed/pending first (what she actually needs to look at), then active.
+        const rank = { FAILED: 0, PENDING: 1, NOT_SETUP: 1, ACTIVE: 2, CANCELED: 3, ENDED: 3 };
+        items.sort((a, b) => {
+            const ra = a.lastPaymentStatus === "FAILED" ? 0 : (rank[a.status] ?? 4);
+            const rb = b.lastPaymentStatus === "FAILED" ? 0 : (rank[b.status] ?? 4);
+            return ra - rb;
+        });
+
+        // Dashboard "Collected by Month" mini bar chart (2026-08) - actual paid
+        // amounts, grouped by calendar month, across the current season's Jul-Apr
+        // window (same months buildFeeSchedule already bills against). Reuses
+        // seasonPayments fetched above for the per-player tick-strips - same rows,
+        // just summed instead of bucketed by player. Mostly empty early in the
+        // season - fills in as months pass, that's expected, not a bug.
+        const monthlyTotals = new Map(FEE_PAYMENT_MONTHS.map(m => [m, 0]));
+        seasonPayments.items.forEach(p => {
+            if (!p.chargeDate || p.status !== "PAID") return;
+            const m = new Date(p.chargeDate).getMonth();
+            if (monthlyTotals.has(m)) monthlyTotals.set(m, monthlyTotals.get(m) + (Number(p.amount) || 0));
+        });
+        const monthlyIncome = FEE_PAYMENT_MONTHS.map(m => ({
+            month: FEE_MONTH_LABELS[m],
+            amount: Math.round(monthlyTotals.get(m) * 100) / 100
+        }));
+        // "Collected This Month" widget row - the current calendar month's total,
+        // computed server-side (not derived from monthlyIncome's labels on the
+        // frontend) to avoid any locale-format month-name mismatch risk.
+        const thisMonthCollected = Math.round((monthlyTotals.get(new Date().getMonth()) || 0) * 100) / 100;
+
+        return { success: true, activeCount, pendingCount, failedCount, items, monthlyIncome, thisMonthCollected };
+    } catch (err) {
+        console.error("getSecretaryPaymentsOverview error:", err);
+        return { success: false, error: err.message };
+    }
+}
+
+// One player's payment "proof" for PlayerRecord's Fees & Payments tab (2026-08)
+// - the season tick-strip (same shape/helper as getSecretaryPaymentsOverview's
+// per-row version above) plus the last few actual charges, so she's looking at
+// real GoCardlessPayments rows rather than just a status word.
+export async function getPlayerPaymentTimeline(playerId) {
+    try {
+        const season = getSeasonInfo();
+        const [subRes, payments] = await Promise.all([
+            wixData.query("GoCardlessSubscriptions").eq("player", playerId).descending("_createdDate").limit(1).find({ suppressAuth: true }),
+            wixData.query("GoCardlessPayments")
+                .eq("player", playerId)
+                .ge("chargeDate", season.startDate)
+                .le("chargeDate", season.endDate)
+                .descending("chargeDate")
+                .limit(100)
+                .find({ suppressAuth: true })
+        ]);
+        const sub = subRes.items[0];
+
+        const paidMonths = new Set(), failedMonths = new Set();
+        payments.items.forEach(p => {
+            if (!p.chargeDate) return;
+            const m = new Date(p.chargeDate).getMonth();
+            if (p.status === "PAID") paidMonths.add(m);
+            else if (p.status === "FAILED") failedMonths.add(m);
+        });
+
+        const recent = payments.items.slice(0, 3).map(p => ({
+            chargeDate: p.chargeDate,
+            amount: p.amount || 0,
+            status: p.status
+        }));
+
+        // This player's own real start month/count, same as
+        // getSecretaryPaymentsOverview's per-row version - not always Jul-Apr.
+        const startMonth = sub && sub.firstDate ? new Date(sub.firstDate).getMonth() : FEE_PAYMENT_MONTHS[0];
+        const count = (sub && sub.scheduleCount) || 10;
+
+        return { success: true, monthlyTicks: buildMonthlyTicks(startMonth, count, paidMonths, failedMonths), recent };
+    } catch (err) {
+        console.error("getPlayerPaymentTimeline error:", err);
+        return { success: false, error: err.message };
+    }
+}
+
+// Club-wide staff qualification compliance for the secretary's Dashboard widget
+// (2026-08) - a legal/safeguarding requirement (DBS, First Aid, Safeguarding,
+// Coaching), tracked today only as per-record expiry dates on SignolStaff (see
+// stateStaff/stateTeams's individual traffic lights) with no club-wide aggregate
+// view until now. Buckets are simpler/uniform here than the individual traffic
+// lights' slightly different per-qualification thresholds - deliberately, so this
+// summary reads as one consistent scale rather than matching each light exactly.
+export async function getStaffComplianceOverview() {
+    try {
+        const res = await wixData.query("SignolStaff").limit(1000).find({ suppressAuth: true });
+
+        const today = new Date();
+        const oneMonth = new Date(today); oneMonth.setMonth(oneMonth.getMonth() + 1);
+        const threeMonths = new Date(today); threeMonths.setMonth(threeMonths.getMonth() + 3);
+
+        const bucketFor = (dateVal) => {
+            const d = dateVal ? new Date(dateVal) : null;
+            if (!d || d < today) return "expired";
+            if (d < oneMonth) return "oneMonth";
+            if (d < threeMonths) return "threeMonths";
+            return "compliant";
+        };
+
+        const QUALS = [
+            { key: "dbs", field: "dbsExpiry" },
+            { key: "firstAid", field: "firstAidExpiry" },
+            { key: "safeguarding", field: "safeGuardingExpiry" },
+            { key: "coaching", field: "coachingExpiry" }
+        ];
+
+        const counts = {};
+        QUALS.forEach(q => { counts[q.key] = { expired: 0, oneMonth: 0, threeMonths: 0, compliant: 0 }; });
+
+        res.items.forEach(staff => {
+            QUALS.forEach(q => { counts[q.key][bucketFor(staff[q.field])]++; });
+        });
+
+        return { success: true, counts };
+    } catch (err) {
+        console.error("getStaffComplianceOverview error:", err);
         return { success: false, error: err.message };
     }
 }

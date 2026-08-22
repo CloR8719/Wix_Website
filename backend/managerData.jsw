@@ -1,0 +1,691 @@
+// =====================================================================
+//  managerData.jsw — who the manager is, what they can do, and Home
+// =====================================================================
+//  Every Manager Hub v2 screen starts here. Three jobs:
+//
+//    1. Resolve the signed-in member to their SignolStaff record.
+//    2. Decide what they're allowed to do (see PERMISSIONS below).
+//    3. Build the Home dashboard in ONE round trip.
+//
+//  ⚠️ PERMISSIONS ARE READ BY LABEL, NOT GUID. `SignolStaff.accessLevel` is a
+//  REFERENCE to `SiteAccess`, whose own `accessLevel` TEXT field holds the
+//  label ("Team" / "Limited" / "Admin"). The old Manager Hub compared
+//  hardcoded GUID constants instead - two of them, with no comment saying
+//  which row was which. Reading the label survives a row being recreated and
+//  is checkable against the CMS by eye.
+//
+//  Anything unrecognised - a missing reference, a typo'd label, a new row
+//  nobody told us about - resolves to the MOST restricted level. A permission
+//  system that fails open is worse than none, because it looks like it works.
+//
+//  ⚠️ NOTHING HERE TRUSTS THE BROWSER. Every exported function re-resolves the
+//  caller from currentMember and re-checks team membership server-side. The
+//  page hides buttons as a convenience; that is not a security boundary,
+//  because any exported .jsw function can be called from a console.
+// =====================================================================
+
+import wixData from 'wix-data';
+import { currentMember } from 'wix-members-backend';
+
+// ⚠️ DELIBERATELY DOES NOT IMPORT registration.jsw. Doing so caused a
+// ModuleLoadError that took the whole Hub down on load (2026-08-19):
+// registration.jsw imports gocardless.jsw, which imports the gocardless-nodejs
+// npm package - so the entire payment SDK became a load-time dependency of
+// simply opening the Manager Hub.
+//
+// This module runs on every page view, so it stays light. The two payment
+// collections are read directly below - they're the same rows
+// getGoCardlessStatus and getPlayerPaymentTimeline read, minus the SDK.
+
+const OPTIONS = { suppressAuth: true };
+
+// ClubDictionary player_status. Same GUIDs as everywhere else in the project.
+const ENQUIRY_STATUS_ID    = "e4c79abb-e591-44c3-98a9-e111f276bdd2";
+const TRIAL_STATUS_ID      = "5f21b19d-878a-4042-a8ec-c1c0a66812b9";
+const INVITED_STATUS_ID    = "184b5a98-37c8-41a6-bc58-5a1c17827f04";
+const READY_FOR_FA_ID      = "95978c83-70fc-4bd7-bd75-12f43216a0d7";
+const FA_COMPLETE_ID       = "af2bef8c-1caa-4bf8-8dce-321d19723741";
+const ACTIVE_ID            = "705c0b66-d5d5-47b6-b828-98a94c670f1f";
+const LEFT_STATUS_ID       = "d78cb8b0-3b3b-4439-b889-fd36dc434781";
+const RENEWAL_STATUS_ID    = "4d354c43-c893-4bc8-8415-18cfc32b3236";
+const DRAFT_STATUS_ID      = "ad6fe8f3-c82e-45ae-b688-89d53c3f0a9f";
+const ACTION_REQUIRED_ID   = "d5bd1c0f-e19e-4318-a8d3-d5d6fe63b274";
+
+// Squad list order: whatever needs chasing floats to the top, settled players
+// sink. Deliberately NOT alphabetical - the list exists to surface work.
+const STATUS_SORT_ORDER = {
+    [INVITED_STATUS_ID]: 1,
+    [ACTION_REQUIRED_ID]: 2,
+    [DRAFT_STATUS_ID]: 3,
+    [RENEWAL_STATUS_ID]: 4,
+    [READY_FOR_FA_ID]: 5,
+    [FA_COMPLETE_ID]: 6,
+    [ACTIVE_ID]: 7
+};
+
+const STATUS_LABEL = {
+    [ENQUIRY_STATUS_ID]:    { label: "Enquiry",          tone: "neutral" },
+    [TRIAL_STATUS_ID]:      { label: "On trial",         tone: "violet" },
+    [INVITED_STATUS_ID]:    { label: "Form with parent", tone: "warning" },
+    [DRAFT_STATUS_ID]:      { label: "Not submitted",    tone: "warning" },
+    [ACTION_REQUIRED_ID]:   { label: "Action required",  tone: "critical" },
+    [RENEWAL_STATUS_ID]:    { label: "Renewal due",      tone: "warning" },
+    [READY_FOR_FA_ID]:      { label: "Ready for FA",     tone: "info" },
+    [FA_COMPLETE_ID]:       { label: "FA complete",      tone: "info" },
+    [ACTIVE_ID]:            { label: "Active",           tone: "success" },
+    [LEFT_STATUS_ID]:       { label: "Left",             tone: "neutral" }
+};
+
+// Statuses that mean "the ball is with the parent" - what the Home card
+// counts as needing a chase.
+const CHASE_STATUSES = [INVITED_STATUS_ID, DRAFT_STATUS_ID, RENEWAL_STATUS_ID, ACTION_REQUIRED_ID];
+
+// What a manager should actually DO about each onboarding status. Ported from
+// the old squad repeater, which is the one thing on that screen worth keeping
+// verbatim: "needs you" and "just FYI" have to be distinguishable without
+// reading every word. `needs` drives the icon and colour.
+function nextStepFor(player) {
+    const pct = player.registrationProgress || 0;
+    switch (player.SP_status) {
+        case INVITED_STATUS_ID:
+            return { needs: true, text: `Follow up — registration form with parent (${pct}% complete)` };
+        case RENEWAL_STATUS_ID:
+            return { needs: true, text: `Follow up — renewal form with parent (${pct}% complete)` };
+        case DRAFT_STATUS_ID:
+            return { needs: true, text: "Nudge parent — form complete but not submitted yet" };
+        case ACTION_REQUIRED_ID:
+            return { needs: true, text: "With parent — the secretary returned the form for a fix" };
+        case READY_FOR_FA_ID:
+            return { needs: false, text: "No action — with the club secretary for FA registration" };
+        case FA_COMPLETE_ID:
+            return { needs: false, text: "No action — final club checks before going Active" };
+        default:
+            return null;
+    }
+}
+
+// Medical info is RICH_TEXT, so it arrives as HTML and an "empty" field can
+// still be "<p></p>". Strip tags before deciding whether anything was
+// actually written - otherwise every player shows a medical alert.
+function medicalText(value) {
+    if (!value) return "";
+    return String(value).replace(/<[^>]*>?/gm, "").replace(/&nbsp;/g, " ").trim();
+}
+
+// ---------------------------------------------------------------------
+//  PERMISSIONS
+// ---------------------------------------------------------------------
+//  Team    — runs a squad. Everything, including fees and the team profile.
+//  Limited — helps with a squad. Day-to-day only.
+//  Admin   — club-wide. Everything, plus the full staff list.
+//
+//  The team profile matters more than it looks: it feeds a DYNAMIC PUBLIC
+//  PAGE on the website, so editing it is publishing, not note-keeping. That's
+//  why it sits with fees rather than with the everyday screens.
+// ---------------------------------------------------------------------
+const PERMS = {
+    Admin:   { payments: true,  editTeam: true,  allStaff: true,  allTeams: true },
+    Team:    { payments: true,  editTeam: true,  allStaff: false, allTeams: false },
+    Limited: { payments: false, editTeam: false, allStaff: false, allTeams: false }
+};
+
+// The safe default. Used for an unset reference, an unknown label, or a typo -
+// all of which should quietly reduce access rather than quietly grant it.
+const PERMS_NONE = { payments: false, editTeam: false, allStaff: false, allTeams: false };
+
+function refId(value) {
+    if (!value) return "";
+    return (typeof value === "string") ? value : (value._id || "");
+}
+
+// SiteAccess rows carry the label in their own `accessLevel` TEXT field, so an
+// included reference reads as staff.accessLevel.accessLevel. Reads the raw id
+// as a last resort so a non-included query doesn't silently become "no access".
+function accessLabel(staff) {
+    if (!staff || !staff.accessLevel) return "";
+    const a = staff.accessLevel;
+    if (typeof a === "string") return "";       // id only, not resolvable here
+    return String(a.accessLevel || "").trim();
+}
+
+function permsFor(label) {
+    return PERMS[label] || PERMS_NONE;
+}
+
+// ---------------------------------------------------------------------
+//  Context — resolve member -> staff -> teams -> permissions
+// ---------------------------------------------------------------------
+// Private. Every exported function starts with this rather than accepting a
+// staffId from the caller, which would be trivially forgeable.
+async function resolveContext() {
+    const member = await currentMember.getMember({ fieldsets: ["FULL"] });
+    if (!member) return { ok: false, error: "Not signed in." };
+
+    const staffRes = await wixData.query("SignolStaff")
+        .eq("memberId", member._id)
+        .include("SS_team", "accessLevel", "SS_role")
+        .find(OPTIONS);
+
+    if (staffRes.items.length === 0) {
+        return { ok: false, error: "No staff record is linked to your account." };
+    }
+
+    const staff = staffRes.items[0];
+    const label = accessLabel(staff);
+
+    const teamsRaw = staff.SS_team;
+    const teams = Array.isArray(teamsRaw) ? teamsRaw : (teamsRaw ? [teamsRaw] : []);
+
+    return {
+        ok: true,
+        memberId: member._id,
+        staff,
+        staffId: staff._id,
+        name: staff.SS_name || `${staff.SS_firstName || ""} ${staff.SS_lastName || ""}`.trim(),
+        mobile: staff.mobile || "",
+        accessLabel: label,
+        perms: permsFor(label),
+        teams,
+        teamIds: teams.map(t => refId(t)).filter(Boolean)
+    };
+}
+
+// Shared by every function that takes a teamId from the browser. An Admin
+// passes automatically; everyone else must actually be on that team.
+function canTouchTeam(ctx, teamId) {
+    if (!teamId) return false;
+    if (ctx.perms.allTeams) return true;
+    return ctx.teamIds.includes(teamId);
+}
+
+// ---------------------------------------------------------------------
+//  Exported: who am I
+// ---------------------------------------------------------------------
+export async function getManagerContext() {
+    try {
+        const ctx = await resolveContext();
+        if (!ctx.ok) return { success: false, error: ctx.error };
+
+        return {
+            success: true,
+            staffId: ctx.staffId,
+            // The Wix MEMBER id, not the staff record id. Needed as the author
+            // when publishing to the Wix Blog - createBlogPost throws without it.
+            memberId: ctx.memberId,
+            name: ctx.name,
+            firstName: ctx.staff.SS_firstName || "",
+            mobile: ctx.mobile,
+            accessLevel: ctx.accessLabel,
+            perms: ctx.perms,
+            teams: ctx.teams.map(t => ({
+                id: refId(t),
+                name: t.T_teamName || "Team",
+                ageGroupId: refId(t.AG_ageGroup)
+            }))
+        };
+    } catch (error) {
+        console.error("getManagerContext error:", error);
+        return { success: false, error: "Couldn't load your details just now." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Exported: Home
+// ---------------------------------------------------------------------
+// One call for every team's counts. The old version fired three queries PER
+// TEAM from page code and then recomputed the same numbers again the moment
+// the manager opened a squad.
+// 60 days matches EXPIRY_WARN_DAYS in managerHubStaff.js. Two different
+// definitions of "expiring soon" in one system means Home and the staff
+// record disagree about the same certificate, which reads as a bug in
+// whichever one the manager looked at second.
+const EXPIRY_WARN_DAYS = 60;
+
+const COMPLIANCE_FIELDS = [
+    ["dbsExpiry", "DBS check"],
+    ["safeGuardingExpiry", "Safeguarding"],
+    ["firstAidExpiry", "First aid"],
+    ["coachingExpiry", "Coaching badge"]
+];
+
+// Only ever returns things that are WRONG. A valid certificate needs no
+// space on a home page - listing all four every week teaches a manager to
+// scroll past the block, which is exactly when the expired one appears in it.
+//
+// A BLANK DATE IS NOT A WARNING. Plenty of these are genuinely unset for
+// volunteers who don't need them, and "First aid missing" against someone who
+// was never required to have it is noise that makes the real ones ignorable.
+function complianceWarnings(staff) {
+    if (!staff) return [];
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const out = [];
+    COMPLIANCE_FIELDS.forEach(function (pair) {
+        const raw = staff[pair[0]];
+        if (!raw) return;
+
+        const when = new Date(raw);
+        if (isNaN(when.getTime())) return;
+
+        const days = Math.round((when.getTime() - today.getTime()) / 86400000);
+        if (days < 0) {
+            out.push({ label: pair[1], state: "expired", days,
+                       date: when.toISOString().slice(0, 10) });
+        } else if (days <= EXPIRY_WARN_DAYS) {
+            out.push({ label: pair[1], state: "soon", days,
+                       date: when.toISOString().slice(0, 10) });
+        }
+    });
+
+    // Worst first - an expired certificate matters more than one with seven
+    // weeks left, and only the top of this list is likely to be read.
+    return out.sort((a, b) => a.days - b.days);
+}
+
+export async function getManagerDashboard() {
+    try {
+        const ctx = await resolveContext();
+        if (!ctx.ok) return { success: false, error: ctx.error };
+        if (ctx.teamIds.length === 0) {
+            return { success: true, name: ctx.name, perms: ctx.perms, teams: [] };
+        }
+
+        const ageGroupIds = [...new Set(ctx.teams.map(t => refId(t.AG_ageGroup)).filter(Boolean))];
+
+        // Two queries total, whatever the team count. Everything on these
+        // teams, plus every open enquiry in the age groups they cover -
+        // enquiries sit against an AGE GROUP, not a team, which is what makes
+        // them shareable and is why claiming exists (see pipeline.jsw).
+        const [squadRes, enquiryRes] = await Promise.all([
+            wixData.query("SignolPlayers")
+                .hasSome("SP_team", ctx.teamIds)
+                .ne("SP_status", LEFT_STATUS_ID)
+                .limit(1000)
+                .find(OPTIONS),
+            ageGroupIds.length
+                ? wixData.query("SignolPlayers")
+                    .eq("SP_status", ENQUIRY_STATUS_ID)
+                    .hasSome("ageGroup", ageGroupIds)
+                    .limit(1000)
+                    .find(OPTIONS)
+                : Promise.resolve({ items: [] })
+        ]);
+
+        const teams = ctx.teams.map(team => {
+            const teamId = refId(team);
+            const ageGroupId = refId(team.AG_ageGroup);
+
+            const onTeam = squadRes.items.filter(p => refId(p.SP_team) === teamId);
+            const trials = onTeam.filter(p => p.SP_status === TRIAL_STATUS_ID);
+            const squad  = onTeam.filter(p =>
+                p.SP_status !== TRIAL_STATUS_ID && p.SP_status !== ENQUIRY_STATUS_ID);
+
+            const chase = squad.filter(p => CHASE_STATUSES.includes(p.SP_status));
+            const enquiries = enquiryRes.items.filter(p => refId(p.ageGroup) === ageGroupId);
+
+            // Spelled out rather than "3 need attention" - a manager can act on
+            // "2 forms with parents", not on a number.
+            const bits = [];
+            const n = (id) => chase.filter(p => p.SP_status === id).length;
+            const plural = (c, one, many) => `${c} ${c === 1 ? one : many}`;
+            if (n(INVITED_STATUS_ID))  bits.push(plural(n(INVITED_STATUS_ID),  "registration form with a parent", "registration forms with parents"));
+            if (n(DRAFT_STATUS_ID))    bits.push(plural(n(DRAFT_STATUS_ID),    "form finished but not submitted", "forms finished but not submitted"));
+            if (n(RENEWAL_STATUS_ID))  bits.push(plural(n(RENEWAL_STATUS_ID),  "renewal still with a parent", "renewals still with parents"));
+            if (n(ACTION_REQUIRED_ID)) bits.push(plural(n(ACTION_REQUIRED_ID), "form sent back for changes", "forms sent back for changes"));
+
+            return {
+                id: teamId,
+                name: team.T_teamName || "Team",
+                ageGroupId,
+                squadCount: squad.length,
+                trialCount: trials.length,
+                enquiryCount: enquiries.length,
+                chaseCount: chase.length,
+                chaseText: bits.length ? bits.join(", ") : ""
+            };
+        });
+
+        // COSTS NO EXTRA QUERY - resolveContext() already loaded this staff
+        // row to work out which teams the manager is on.
+        //
+        // Surfaced on Home because an expired DBS or safeguarding certificate
+        // STOPS SOMEONE COACHING. It was already shown, correctly, inside the
+        // staff record - but that's More -> My staff record, which nobody
+        // opens unprompted, so the first anyone heard of it was being pulled
+        // off the touchline.
+        const compliance = complianceWarnings(ctx.staff);
+
+        return { success: true, name: ctx.name, perms: ctx.perms, teams, compliance };
+    } catch (error) {
+        console.error("getManagerDashboard error:", error);
+        return { success: false, error: "Couldn't load your teams just now." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Exported: the squad board
+// ---------------------------------------------------------------------
+// All three tabs in one call. They're always shown together and a manager
+// flips between them constantly; three separate round trips would make every
+// tap feel slower than the tab switch it looks like.
+export async function getSquadBoard(teamId) {
+    try {
+        const ctx = await resolveContext();
+        if (!ctx.ok) return { success: false, error: ctx.error };
+        if (!canTouchTeam(ctx, teamId)) {
+            return { success: false, error: "That isn't one of your teams." };
+        }
+
+        const team = ctx.teams.find(t => refId(t) === teamId);
+        const ageGroupId = refId(team && team.AG_ageGroup);
+
+        const [onTeamRes, enquiryRes] = await Promise.all([
+            wixData.query("SignolPlayers")
+                .eq("SP_team", teamId)
+                .ne("SP_status", LEFT_STATUS_ID)
+                .limit(1000)
+                .find(OPTIONS),
+            ageGroupId
+                ? wixData.query("SignolPlayers")
+                    .eq("SP_status", ENQUIRY_STATUS_ID)
+                    .eq("ageGroup", ageGroupId)
+                    // Without these two, ageGroup and SP_relationship come back
+                    // as bare ids and read as blank on the card - a silent
+                    // failure that looks like missing data rather than a
+                    // missing include.
+                    .include("ageGroup", "SP_relationship")
+                    .descending("_createdDate")
+                    .limit(200)
+                    .find(OPTIONS)
+                : Promise.resolve({ items: [] })
+        ]);
+
+        const trials = onTeamRes.items
+            .filter(p => p.SP_status === TRIAL_STATUS_ID)
+            .map(p => ({
+                id: p._id,
+                name: `${p.SP_firstName || ""} ${p.SP_lastName || ""}`.trim(),
+                firstName: p.SP_firstName || "",
+                parentName: p.parentsName || "",
+                parentEmail: p.parentEmail || "",
+                parentPhone: p.parentPhone || "",
+                trainingOnly: p.SP_trainingOnly === true
+            }));
+
+        const squad = onTeamRes.items
+            .filter(p => p.SP_status !== TRIAL_STATUS_ID && p.SP_status !== ENQUIRY_STATUS_ID)
+            .map(p => {
+                const meta = STATUS_LABEL[p.SP_status] || { label: "Unknown", tone: "neutral" };
+                const step = nextStepFor(p);
+                return {
+                    id: p._id,
+                    name: `${p.SP_firstName || ""} ${p.SP_lastName || ""}`.trim(),
+                    kit: p.kitNumber || "",
+                    statusLabel: meta.label,
+                    statusTone: meta.tone,
+                    sort: STATUS_SORT_ORDER[p.SP_status] || 99,
+                    needsChase: CHASE_STATUSES.includes(p.SP_status),
+                    trainingOnly: p.SP_trainingOnly === true,
+                    hasMedical: (p.SP_hasMedical === true) ||
+                        (p.SP_hasMedical == null && medicalText(p.SP_medicalInfo).length > 0),
+                    nextStep: step ? step.text : "",
+                    nextStepNeeds: step ? step.needs : false
+                };
+            })
+            // Work first, then playing before training-only, then name.
+            // Status stays the primary key on purpose: the list exists to
+            // surface who needs chasing, and a training-only child with a
+            // form outstanding still needs chasing.
+            .sort((a, b) =>
+                (a.sort - b.sort) ||
+                (Number(a.trainingOnly) - Number(b.trainingOnly)) ||
+                a.name.localeCompare(b.name));
+
+        // ⚠️ A claimed enquiry is deliberately returned WITHOUT parent contact
+        // details unless this manager is the one who claimed it. The whole
+        // point of claiming is that two managers don't both ring the same
+        // family - so the phone number has to be genuinely absent from the
+        // payload, not just hidden by CSS. Anything sent to the browser is
+        // readable in the browser.
+        const enquiries = enquiryRes.items.map(p => {
+            const claimedBy = p.claimedBy || "";
+            const mine = !claimedBy || claimedBy === ctx.staffId;
+
+            const base = {
+                id: p._id,
+                name: `${p.SP_firstName || ""} ${p.SP_lastName || ""}`.trim(),
+                firstName: p.SP_firstName || "",
+                ageGroup: (p.ageGroup && p.ageGroup.AG_ageGroup) || "",
+                position: p.position || "",
+                experience: p.footballExperience || "",
+                claimed: !!claimedBy,
+                claimedByMe: !!claimedBy && mine,
+                claimedByName: claimedBy ? (p.claimedByName || "another manager") : "",
+                claimedDate: p.claimedDate || null
+            };
+
+            if (!mine) return base;
+
+            return Object.assign(base, {
+                dob: p.SP_dob || "",
+                parentName: p.parentsName || "",
+                parentEmail: p.parentEmail || "",
+                parentPhone: p.parentPhone || "",
+                relationship: (p.SP_relationship && p.SP_relationship.label) || ""
+            });
+        });
+
+        return {
+            success: true,
+            teamId,
+            teamName: (team && team.T_teamName) || "Team",
+            perms: ctx.perms,
+            staffId: ctx.staffId,
+            enquiries,
+            trials,
+            squad
+        };
+    } catch (error) {
+        console.error("getSquadBoard error:", error);
+        return { success: false, error: "Couldn't load the squad just now." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Exported: dropdown options
+// ---------------------------------------------------------------------
+// ClubDictionary rows, same shape as loadClubDictionary() used. `position`
+// drives the recruitment poster; `leave_reason` the archive flow.
+export async function getDictionary(category) {
+    try {
+        const res = await wixData.query("ClubDictionary")
+            .eq("category", category)
+            .ascending("order")
+            .limit(200)
+            .find(OPTIONS);
+        return {
+            success: true,
+            options: res.items.map(r => ({ value: r._id, label: r.label || r.value || "" }))
+        };
+    } catch (error) {
+        console.error("getDictionary error:", category, error);
+        return { success: false, options: [] };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Payment status — deliberately not payment DETAIL
+// ---------------------------------------------------------------------
+//  A manager is a volunteer, usually another parent at the club. They need
+//  to know whether a family needs chasing. They do NOT need the amount, the
+//  fee tier, or the ledger:
+//
+//    - the tier name leaks a family's finances ("Hardship — free" tells a
+//      coach something that gets repeated at the side of a pitch),
+//    - the amount is the secretary's conversation to have,
+//    - the ledger is a report, not a prompt to act.
+//
+//  So this returns ONE line and a tone. Rob's call, 2026-08-18: "its not
+//  coaches job, the secretary can discuss amounts if needed."
+//
+//  ⚠️ Don't add amounts back without deciding that again on purpose.
+async function paymentStatusFor(player) {
+    const cat = player.sp_fee_category;
+    const catId = (typeof cat === "string") ? cat : (cat && cat._id) || "";
+
+    if (!catId) {
+        // Not a problem the manager can fix - it's waiting on the secretary.
+        return { tone: "neutral", label: "The club hasn't set a fee for them yet" };
+    }
+
+    // A free tier never reaches GoCardless - no mandate, no payments, nothing
+    // to chase. Phrased without naming the tier.
+    const annual = Number(cat && cat.F_annual_amount);
+    if (!isNaN(annual) && annual <= 0) {
+        return { tone: "success", label: "Nothing to pay" };
+    }
+
+    // Read straight from the collections rather than through registration.jsw -
+    // see the note at the top of this file. Same rows, no SDK.
+    try {
+        const subRes = await wixData.query("GoCardlessSubscriptions")
+            .eq("player", player._id)
+            .descending("_createdDate")
+            .limit(1)
+            .find(OPTIONS);
+
+        if (subRes.items.length === 0) {
+            // The actionable one, and the most common: registered, but the
+            // Direct Debit was never finished. Nobody notices today until the
+            // secretary runs a report.
+            return { tone: "warning", label: "No payment plan set up yet" };
+        }
+
+        // Set up - so the only remaining question is whether one has bounced.
+        const failedRes = await wixData.query("GoCardlessPayments")
+            .eq("player", player._id)
+            .eq("status", "FAILED")
+            .descending("chargeDate")
+            .limit(12)
+            .find(OPTIONS);
+
+        if (failedRes.items.length > 0) {
+            const months = [...new Set(failedRes.items
+                .filter(x => x.chargeDate)
+                .map(x => new Date(x.chargeDate).toLocaleDateString('en-GB', { month: 'long' })))];
+            const when = months.length ? ` (${months.join(", ")})` : "";
+            return {
+                tone: "critical",
+                label: failedRes.items.length === 1
+                    ? `A payment didn't go through${when} — worth a quiet word`
+                    : `${failedRes.items.length} payments didn't go through${when} — worth a quiet word`
+            };
+        }
+
+        return { tone: "success", label: "Payments set up and up to date" };
+    } catch (err) {
+        // A failed lookup must never turn a healthy plan into an alarm, and
+        // must never take the player record down with it.
+        console.error("[managerData] payment status lookup failed:", err.message);
+        return { tone: "neutral", label: "Couldn't check payments just now" };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Exported: one player, in full
+// ---------------------------------------------------------------------
+// Replaces the PlayerProfile Lightbox. Everything a manager needs about a
+// child on one screen, with the fee section omitted entirely for anyone
+// without the payments permission - omitted from the PAYLOAD, not hidden by
+// the element, since anything sent to a browser is readable there.
+export async function getPlayerRecord(teamId, playerId) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+        const ctx = access.ctx;
+
+        // ⚠️ query().include(), NOT get(). wixData.get() does NOT resolve
+        // REFERENCE fields - it returns the raw id - so sp_fee_category.F_label
+        // was undefined and every player read as "no fee set by the club yet".
+        // registration.jsw already does it this way; this didn't.
+        const playerRes = await wixData.query("SignolPlayers")
+            .eq("_id", playerId)
+            .include("sp_fee_category", "SP_team")
+            .find(OPTIONS);
+        const player = playerRes.items[0];
+        if (!player) return { success: false, error: "Player not found." };
+        if (refId(player.SP_team) !== teamId) {
+            return { success: false, error: "That player isn't in this team." };
+        }
+
+        const meta = STATUS_LABEL[player.SP_status] || { label: "Unknown", tone: "neutral" };
+        const step = nextStepFor(player);
+        const medicalNote = medicalText(player.SP_medicalInfo);
+        const hasMedical = (player.SP_hasMedical === true) ||
+            (player.SP_hasMedical == null && medicalNote.length > 0);
+
+        // Both parents, in the order that matters to a manager ringing round.
+        const parents = [];
+        if (player.parentsName || player.parentEmail || player.parentPhone) {
+            parents.push({
+                name: player.parentsName || "",
+                email: player.parentEmail || "",
+                phone: player.parentPhone || "",
+                primary: true
+            });
+        }
+        if (player.secondaryParentName || player.secondaryParentEmail || player.secondaryParentMobile) {
+            parents.push({
+                name: player.secondaryParentName || "",
+                email: player.secondaryParentEmail || "",
+                phone: player.secondaryParentMobile || "",
+                primary: false
+            });
+        }
+
+        const record = {
+            success: true,
+            perms: ctx.perms,
+            id: player._id,
+            teamId,
+            name: `${player.SP_firstName || ""} ${player.SP_lastName || ""}`.trim(),
+            firstName: player.SP_firstName || "",
+            dob: player.SP_dob || "",
+            kit: player.kitNumber || "",
+            membershipNo: player.sp_membership_no || "",
+            statusLabel: meta.label,
+            statusTone: meta.tone,
+            trainingOnly: player.SP_trainingOnly === true,
+            hasMedical,
+            medical: medicalNote,
+            returnNote: player.SP_status === ACTION_REQUIRED_ID ? (player.sp_return_note || "") : "",
+            nextStep: step ? step.text : "",
+            nextStepNeeds: step ? step.needs : false,
+            parents
+        };
+
+        // Fees are a manager-level thing. A Limited coach gets no payment block
+        // at all rather than an empty one - see PERMS at the top of this file.
+        // Note this is a STATUS, not a statement of account: no amounts, no
+        // tier name, no ledger. See paymentStatusFor above.
+        if (ctx.perms.payments) {
+            record.payment = await paymentStatusFor(player);
+        }
+
+        return record;
+    } catch (error) {
+        console.error("getPlayerRecord error:", error);
+        return { success: false, error: "Couldn't load that player just now." };
+    }
+}
+
+// Exposed so pipeline.jsw and the other Manager Hub modules resolve the caller
+// exactly the same way rather than each rolling their own.
+export async function assertTeamAccess(teamId) {
+    const ctx = await resolveContext();
+    if (!ctx.ok) return { ok: false, error: ctx.error };
+    if (!canTouchTeam(ctx, teamId)) return { ok: false, error: "That isn't one of your teams." };
+    return { ok: true, ctx };
+}

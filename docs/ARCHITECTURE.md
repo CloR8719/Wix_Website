@@ -30,6 +30,9 @@ The Signol Football Club CRM is a comprehensive WIX-based system designed to man
                 │  │ notifications.jsw  │ │
                 │  │ queueMonitor.jsw   │ │
                 │  │ exportCsv.jsw      │ │
+                │  │ events.js          │ │
+                │  │ gocardless.jsw     │ │
+                │  │ http-functions.js  │ │
                 │  └────────────────────┘ │
                 └───────────┬──────────────┘
                             │
@@ -41,7 +44,8 @@ The Signol Football Club CRM is a comprehensive WIX-based system designed to man
     │ (Database)│  │ • Twilio SMS    │  │ • API Keys│
     │           │  │ • Email Service │  │ • Tokens  │
     └───────────┘  │ • FA Fixtures   │  │           │
-                   │ • Stripe (soon) │  └───────────┘
+                   │ • GoCardless    │  └───────────┘
+                   │   (in progress) │
                    └─────────────────┘
 ```
 
@@ -56,7 +60,7 @@ The Signol Football Club CRM is a comprehensive WIX-based system designed to man
 - View child's registration status
 - Submit registration form
 - View team assignments
-- Make payments (Stripe - coming soon)
+- Make payments (GoCardless Direct Debit - in progress, see "GoCardless (Payments)" below)
 - Receive notifications (email + SMS)
 
 **Frontend Files:** `frontend/members_pages/`
@@ -262,7 +266,7 @@ The Signol Football Club CRM is a comprehensive WIX-based system designed to man
 **Members Pages** (`frontend/members_pages/`)
 - Player registration form
 - Parent profile management
-- Payment portal (coming soon)
+- Payment setup/status (Parent Hub's `statePayment`, GoCardless-backed - see "GoCardless (Payments)" below)
 
 **Dashboard Pages** (`frontend/dashboard_pages/`)
 - Manager dashboard
@@ -337,11 +341,22 @@ EmailQueue ──→ SignolPlayers (registration link)
 - **Planned by:** New backend function
 - **Challenge:** Match FA fixtures to club Teams
 
-### Stripe (Payments)
+### GoCardless (Payments)
 - **Status:** ⏳ In Development
-- **Purpose:** Process team fees & payments
-- **Planned by:** New payments.jsw file
-- **Secrets:** STRIPE_API_KEY, STRIPE_SECRET
+- **Purpose:** Collect registration fees via Direct Debit, replacing an earlier Wix
+  Pricing Plans/Stripe integration (cheaper per-transaction fees, plus a discount
+  GoCardless offers football clubs)
+- **Built by:** `backend/gocardless.jsw` (API wrapper), `backend/http-functions.js`
+  (webhook receiver - Wix's reserved filename for exposing an inbound endpoint),
+  new functions in `registration.jsw` (`startGoCardlessSetup`, `getGoCardlessStatus`,
+  `cancelGoCardlessSubscription`)
+- **Secrets:** `_GOCARDLESS_ACCESS_TOKEN`, `_GOCARDLESS_WEBHOOK_SECRET`
+- **Collections:** `GoCardlessSubscriptions`, `GoCardlessWebhookEvents`,
+  `GoCardlessPayments` (see `database/CMS_SCHEMA.txt`)
+- The older Wix Pricing Plans/Stripe path (`backend/events.js`, `ChildSubscriptions`
+  collection) is left in place, dormant, until GoCardless has been live and collected
+  at least one real monthly cycle - see `docs/PARENT_HUB_ELEMENTS.md`'s "Payment
+  tracking" section for the full mechanism.
 
 ---
 

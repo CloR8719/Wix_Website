@@ -48,7 +48,9 @@ export async function getTeamsExportUrl() {
       }
     );
 
-    return uploadResult.fileUrl;
+    // uploadResult.fileUrl is a wix:document:// URI, not a browsable link -
+    // resolve it to a real HTTPS download URL (same gotcha as getPlayerFaFiles).
+    return await mediaManager.getDownloadUrl(uploadResult.fileUrl);
   } catch (err) {
     console.error("Ultimate Export Error:", err);
     return null;
@@ -61,13 +63,190 @@ async function getAll(collectionId) {
     .include("T_teamManager", "AG_ageGroup")
     .limit(1000)
     .find({ suppressAuth: true });
-    
+
   items = items.concat(res.items);
   while (res.hasNext()) {
     res = await res.next();
     items = items.concat(res.items);
   }
   return items;
+}
+
+// --- PLAYER FA FILES (Club Secretary) ---
+// Returns short-lived download URLs for a player's ID photo + ID document so the
+// secretary can pull them off the CMS and re-upload to the FA portal (the site is
+// not linked to the FA). Returns null fields when a file hasn't been uploaded.
+export async function getPlayerFaFiles(playerId) {
+  try {
+    const player = await wixData.get("SignolPlayers", playerId, { suppressAuth: true });
+    if (!player) return null;
+
+    const result = { photoUrl: null, documentUrl: null };
+
+    // Resolve each file independently so a failure on one doesn't null out the
+    // other, and log the raw stored value so we can tell "no file uploaded" apart
+    // from "file exists but the download URL failed".
+    // If a file is stored, always return a usable link. Prefer a fresh signed
+    // download URL, but if getDownloadUrl fails (it can't resolve some stored
+    // values) fall back to the raw wix: URI so the file is still available and
+    // we DON'T mislabel a present file as "missing".
+    if (player.SP_idPhoto) {
+      try { result.photoUrl = await mediaManager.getDownloadUrl(player.SP_idPhoto); }
+      catch (e) { console.error("Photo download URL failed for", playerId, "->", player.SP_idPhoto, e); }
+      if (!result.photoUrl) result.photoUrl = player.SP_idPhoto;
+    } else {
+      console.log("getPlayerFaFiles: SP_idPhoto empty for", playerId);
+    }
+
+    if (player.SP_idDocument) {
+      try { result.documentUrl = await mediaManager.getDownloadUrl(player.SP_idDocument); }
+      catch (e) { console.error("ID doc download URL failed for", playerId, "->", player.SP_idDocument, e); }
+      if (!result.documentUrl) result.documentUrl = player.SP_idDocument;
+    } else {
+      console.log("getPlayerFaFiles: SP_idDocument empty for", playerId);
+    }
+
+    return result;
+  } catch (err) {
+    console.error("FA files error:", err);
+    return null;
+  }
+}
+
+// --- PLAYER REGISTER EXPORT (Club Secretary) ---
+// scope: "all" (default, every player except permanently left), "fa" (Ready for FA
+// queue only), or "leavers" (everyone marked Left). Used by the Player Admin dashboard.
+// playerId (optional): exports just that one player instead - used by the
+// PlayerRecord lightbox's "Download CSV" button (2026-08). Reuses the exact
+// same field list/CSV-building below rather than a separate function, so the
+// single-player export always matches the bulk one automatically.
+export async function getPlayersExportUrl(scope = "all", playerId = null) {
+  try {
+    const READY_FOR_FA_ID = "95978c83-70fc-4bd7-bd75-12f43216a0d7";
+    const LEFT_STATUS_ID = "d78cb8b0-3b3b-4439-b889-fd36dc434781";
+
+    let query = wixData.query("SignolPlayers")
+      .include("SP_team", "ageGroup", "SP_status", "SP_relationship",
+                "secondaryParentRelation", "sp_gender", "sp_sibling_team")
+      .ascending("SP_lastName")
+      .limit(1000);
+
+    if (playerId) query = query.eq("_id", playerId);
+    else if (scope === "fa") query = query.eq("SP_status", READY_FOR_FA_ID);
+    else if (scope === "leavers") query = query.eq("SP_status", LEFT_STATUS_ID);
+    else query = query.ne("SP_status", LEFT_STATUS_ID); // "all" = active register
+
+    let players = [];
+    let res = await query.find({ suppressAuth: true });
+    players = players.concat(res.items);
+    while (res.hasNext()) {
+      res = await res.next();
+      players = players.concat(res.items);
+    }
+
+    if (!players.length) return null;
+
+    const esc = (v) => {
+      if (v === null || v === undefined) return "";
+      return `"${String(v).replace(/"/g, '""')}"`;
+    };
+    const formatDate = (date) => date ? new Date(date).toLocaleDateString('en-GB') : "";
+    const cleanText = (html) => html ? String(html).replace(/<[^>]*>?/gm, '').trim() : "";
+    // Tri-state consent text — an unanswered consent must read differently from
+    // a genuine "Declined". Same rule as Player Record.js / Player Profile.js.
+    const consentText = (v) => v === true ? "Given" : v === false ? "Declined" : "Not Yet Provided";
+    const boolMark = (v) => v === true ? "Yes" : v === false ? "No" : "";
+    const fmtAddr = (addr) => {
+      if (!addr) return "";
+      if (typeof addr === "string") return addr;
+      if (addr.formatted) return addr.formatted;
+      const parts = [];
+      if (addr.streetAddress) parts.push([addr.streetAddress.number, addr.streetAddress.name].filter(Boolean).join(" "));
+      if (addr.city) parts.push(addr.city);
+      if (addr.subdivision) parts.push(addr.subdivision);
+      if (addr.postalCode) parts.push(addr.postalCode);
+      return parts.filter(Boolean).join(", ");
+    };
+
+    let csvLines = [
+      [
+        "First Name", "Last Name", "DOB", "FAN Number", "Status", "Team", "Age Group",
+        "Parent", "Parent Email", "Parent Phone", "Medical", "Registration Date",
+        "Leaving Date", "Leave Reason",
+        "Gender", "Address", "Parent Relation", "Parent DOB", "Parent Address",
+        "Lives With Both Parents", "Secondary Parent Name", "Secondary Parent Relation",
+        "Secondary Parent Phone", "Secondary Parent Email", "Secondary Parent DOB",
+        "Secondary Parent Address", "Membership No", "Sibling At Club", "Sibling Team",
+        "Photo Consent", "Social Media Consent", "Medical Consent", "FA Consent",
+        "Signed By", "Signed Date", "Confirmed Parent Conduct", "Confirmed Player Conduct",
+        "Confirmed Details Correct", "Payment Schedule Sent Date"
+      ].join(",")
+    ];
+
+    players.forEach(p => {
+      csvLines.push([
+        esc(p.SP_firstName),
+        esc(p.SP_lastName),
+        esc(formatDate(p.SP_dob)),
+        esc(p.SP_fanNumber),
+        esc(p.SP_status ? p.SP_status.label : ""),
+        esc(p.SP_team ? p.SP_team.T_teamName : ""),
+        esc(p.ageGroup ? p.ageGroup.AG_ageGroup : ""),
+        esc(p.parentsName),
+        esc(p.parentEmail),
+        esc(p.parentPhone),
+        esc(cleanText(p.SP_medicalInfo)),
+        esc(formatDate(p.registrationDate)),
+        esc(formatDate(p.SPleavingDate)),
+        esc(p.leaveReason),
+        esc(p.sp_gender ? p.sp_gender.label : ""),
+        esc(fmtAddr(p.mainAddress)),
+        esc(p.SP_relationship ? p.SP_relationship.label : ""),
+        esc(formatDate(p.sp_parent_dob)),
+        esc(p.sp_parent_address ? fmtAddr(p.sp_parent_address) : "Same as player's"),
+        esc(boolMark(p.livesWithBothParents)),
+        esc(p.secondaryParentName),
+        esc(p.secondaryParentRelation ? p.secondaryParentRelation.label : ""),
+        esc(p.secondaryParentMobile),
+        esc(p.secondaryParentEmail),
+        esc(formatDate(p.sp_secparent_dob)),
+        esc(p.sp_secparent_address ? fmtAddr(p.sp_secparent_address) : "Same as player's"),
+        esc(p.sp_membership_no),
+        esc(boolMark(p.sp_has_sibling)),
+        esc(p.sp_sibling_team ? p.sp_sibling_team.T_teamName : ""),
+        esc(consentText(p.sp_consent_photo)),
+        esc(consentText(p.socialMedia)),
+        esc(consentText(p.sp_consent_medical)),
+        esc(consentText(p.sp_consent_fa)),
+        esc(p.registrationPrintNameSignature),
+        esc(formatDate(p.registrationDateTimeStampSigned)),
+        esc(boolMark(p.registrationConductParent)),
+        esc(boolMark(p.registrationConductPlayer)),
+        esc(boolMark(p.registrationConfirmCorrect)),
+        esc(formatDate(p.sp_paymentschedulesentdate))
+      ].join(","));
+    });
+
+    const csvString = csvLines.join("\n");
+    const buffer = Buffer.from(csvString, 'utf8');
+    const label = playerId
+      ? `${players[0].SP_firstName || "Player"}_${players[0].SP_lastName || ""}`.trim().replace(/\s+/g, "_")
+      : (scope === "fa" ? "FA_Registration" : scope === "leavers" ? "Leavers" : "Player_Register");
+
+    const uploadResult = await mediaManager.upload(
+      "/PlayerReports",
+      buffer,
+      `${label}_${Date.now()}.csv`,
+      { mediaOptions: { mimeType: "text/csv" } }
+    );
+
+    // uploadResult.fileUrl is a wix:document:// URI, not a browsable link -
+    // resolve it to a real HTTPS download URL (same gotcha as getPlayerFaFiles).
+    return await mediaManager.getDownloadUrl(uploadResult.fileUrl);
+  } catch (err) {
+    console.error("Player Export Error:", err);
+    return null;
+  }
 }
 // Add this to your existing backend/exportCsv.jsw file
 export async function getStaffExportUrl() {
@@ -86,10 +265,21 @@ export async function getStaffExportUrl() {
       return `"${String(v).replace(/"/g, '""')}"`;
     };
 
-    const formatDate = (date) => date ? new Date(date).toISOString().split('T')[0] : "N/A";
+    // Build the date string from local year/month/day, not .toISOString() -
+    // that converts to UTC first and can silently shift the date by a day
+    // depending on timezone (same gotcha documented on toDateOnlyString() in
+    // Staff Record.js).
+    const formatDate = (date) => {
+      if (!date) return "N/A";
+      const d = new Date(date);
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${y}-${m}-${day}`;
+    };
 
     let csvLines = [
-        "Name,Teams,Roles,FAN Number,DOB,Address,Mobile,Email,Qualifications,DBS Expiry,Safeguarding Expiry,First Aid Expiry,Coaching Expiry"
+        "Name,Teams,Roles,FAN Number,DOB,Address,Mobile,Email,Qualifications,DBS Expiry,Safeguarding Expiry,First Aid Expiry,Coaching Expiry,Status,Start Date,Emergency Contact Name,Emergency Contact Relation,Emergency Contact Phone,Notes"
     ];
 
     staff.forEach(person => {
@@ -110,7 +300,13 @@ export async function getStaffExportUrl() {
         esc(formatDate(person.dbsExpiry)),
         esc(formatDate(person.safeGuardingExpiry)),
         esc(formatDate(person.firstAidExpiry)),
-        esc(formatDate(person.coachingExpiry))
+        esc(formatDate(person.coachingExpiry)),
+        esc(person.status || ""),
+        esc(formatDate(person.startDate)),
+        esc(person.emergencyContactName),
+        esc(person.emergencyContactRelation),
+        esc(person.emergencyContactPhone),
+        esc(person.notes)
       ].join(","));
     });
 

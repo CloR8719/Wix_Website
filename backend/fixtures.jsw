@@ -1,0 +1,1139 @@
+// =====================================================================
+//  fixtures.jsw — Parent Hub fixtures + RSVP
+// =====================================================================
+//  Reads Team Fixtures (collection ID `fixtures`) for a parent's children
+//  and records their responses.
+//
+//  ⚠️ TWO FIXTURE-SHAPED COLLECTIONS EXIST. Build on `fixtures`, displayed
+//  as "Team Fixtures". The other one is called "Fixtures" with the
+//  auto-generated ID `input1`, left over from early FA-import experiments.
+//  The display names are one word apart; always check the ID.
+//
+//  STORAGE MODEL (agreed 2026-08-17)
+//  ---------------------------------
+//  At ~230 children with training and a match most weeks, one row per
+//  response per fixture would be ~17,000 rows a season, compounding every
+//  year. So responses are HOT then COLD:
+//
+//    HOT   FixtureResponses - one row per response, upcoming fixtures only.
+//          Steady state ~860 rows, never growing.
+//    COLD  Once a fixture has passed, a nightly job writes the three lists
+//          plus three counts onto the fixture row and DELETES the hot rows.
+//          The fixture row is the archive - no separate storage collection.
+//
+//  The point of all this is simply so a manager can see how many are
+//  coming. It is NOT an attendance register: these are what parents SAID,
+//  not who turned up. Don't let the two be conflated - an "attendance"
+//  figure built from RSVPs rewards whoever taps yes most reliably.
+// =====================================================================
+
+import wixData from 'wix-data';
+import { currentMember } from 'wix-members-backend';
+// Shared with fixturesRollup.jsw so "who is this fixture for" has exactly
+// one answer. See backend/squadRules.js for why that matters.
+import { NOT_ATTENDING_STATUSES, isExpectedAtFixture, STATUS_NAMES, effectiveAudience, PLAYING_EVENT_TYPES } from 'backend/squadRules.js';
+// Manager-side entry points below re-check team ownership through this rather
+// than trusting the teamId the browser sent.
+import { assertTeamAccess, getManagerContext } from 'backend/managerData.jsw';
+
+const OPTIONS = { suppressAuth: true };
+
+// SEE far ahead, ANSWER near. Parents asked for a season view to plan
+// around; managers need answers they can act on. A reply given four months
+// out isn't information, it's a guess - and it would sit in FixtureResponses
+// for four months to say so.
+//
+// The volume falls out of the second number, not the first: only answerable
+// fixtures hold rows. At 20 teams that's ~1,900 rows steady state on a 6-week
+// window, against ~12,000 if everything published were answerable.
+const VIEW_WEEKS = 16;
+const RSVP_WEEKS = 6;
+
+// `date_only` is Wix's date-only field type, which returns a plain
+// "YYYY-MM-DD" string rather than a Date. Normalises either shape so
+// comparisons and sorting work regardless.
+function toEventDate(value) {
+    if (!value) return null;
+    const d = (value instanceof Date) ? value : new Date(String(value).slice(0, 10) + "T00:00:00");
+    return isNaN(d.getTime()) ? null : d;
+}
+
+// Address-type field: `.formatted` is the display string, but fall back to
+// the raw value in case a row was saved as plain text before the field type
+// was switched.
+function venueText(venue) {
+    if (!venue) return "";
+    if (typeof venue === "string") return venue;
+    return venue.formatted || "";
+}
+
+function refId(value) {
+    if (!value) return "";
+    return (typeof value === "string") ? value : (value._id || "");
+}
+
+// "Today" and "Tomorrow" rather than a date, because the most urgent thing on
+// the list should read as urgent - "Monday 17 August" looks identical to
+// something three weeks out. A fixture stays listed and answerable all day,
+// so today's genuinely still needs an answer.
+function dayLabel(eventDate, today) {
+    if (!eventDate) return "";
+    const days = Math.round((eventDate.getTime() - today.getTime()) / 86400000);
+    if (days === 0) return "Today";
+    if (days === 1) return "Tomorrow";
+    // Within the week, the weekday alone is enough and reads faster.
+    if (days > 1 && days < 7) return eventDate.toLocaleDateString('en-GB', { weekday: 'long' });
+    return eventDate.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
+}
+
+// Returns every upcoming fixture for this parent's children, each with the
+// children it applies to and their current response.
+export async function getParentFixtures(parentProfileId) {
+    try {
+        if (!parentProfileId) return { success: false, error: "No parent profile." };
+
+        const member = await currentMember.getMember();
+        if (!member) return { success: false, error: "Not signed in." };
+
+        // Kids this parent can see, either side of the relationship.
+        const primary = wixData.query("SignolPlayers").eq("primaryParentId", parentProfileId);
+        const secondary = wixData.query("SignolPlayers").eq("secondaryParentId", parentProfileId);
+        const kidsRes = await primary.or(secondary)
+            .include("SP_team")
+            .find(OPTIONS);
+
+        // Filtered here rather than in the query: .ne() doesn't match an
+        // UNSET status, so a row whose status was never written would drop out
+        // of a .ne() filter entirely and the parent would silently lose their
+        // child's fixtures. isAttendingSquadMember counts unset as attending.
+        const kids = kidsRes.items.filter(k => {
+            const status = (typeof k.SP_status === "string") ? k.SP_status : (k.SP_status && k.SP_status._id) || "";
+            return !status || !NOT_ATTENDING_STATUSES.includes(status);
+        });
+        if (kids.length === 0) return { success: true, fixtures: [] };
+
+        const teamIds = [...new Set(kids.map(k => refId(k.SP_team)).filter(Boolean))];
+        if (teamIds.length === 0) return { success: true, fixtures: [] };
+
+        // Date filtering happens in JS below, NOT in the query: date_only comes
+        // back as a string, and comparing a string-typed field against a JS
+        // Date in a wixData query silently matches nothing.
+        const fixturesRes = await wixData.query("fixtures")
+            .hasSome("club_team", teamIds)
+            // Without this, club_team is just an id and T_teamName is
+            // undefined - so a Training card would read "Training" with no
+            // squad on it. Harmless for a parent with one child; actively
+            // confusing for one with children in two squads, who'd get two
+            // identical-looking cards on the same day.
+            .include("club_team")
+            .limit(1000)
+            .find(OPTIONS);
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const horizon = new Date(today);
+        horizon.setDate(horizon.getDate() + VIEW_WEEKS * 7);
+
+        const rsvpHorizon = new Date(today);
+        rsvpHorizon.setDate(rsvpHorizon.getDate() + RSVP_WEEKS * 7);
+
+        const upcoming = fixturesRes.items
+            .filter(f => {
+                const d = toEventDate(f.date_only);
+                return d && d >= today && d <= horizon;
+            })
+            .sort((a, b) => toEventDate(a.date_only).getTime() - toEventDate(b.date_only).getTime());
+
+        if (upcoming.length === 0) return { success: true, fixtures: [] };
+
+        // One query for every response across all of it, rather than one per
+        // fixture - a parent with three children over six weeks would
+        // otherwise be dozens of round trips.
+        const fixtureIds = upcoming.map(f => f._id);
+        const playerIds = kids.map(k => k._id);
+        let responses = [];
+        try {
+            const resRes = await wixData.query("FixtureResponses")
+                .hasSome("fixtureReference", fixtureIds)
+                .hasSome("playerReference", playerIds)
+                .limit(1000)
+                .find(OPTIONS);
+            responses = resRes.items;
+        } catch (err) {
+            // The collection may not exist yet. Fixtures still list; they just
+            // all read as unanswered, which is honest rather than broken.
+            console.error("[fixtures] FixtureResponses unavailable:", err.message);
+        }
+
+        const responseFor = (fixtureId, playerId) => {
+            const row = responses.find(r =>
+                refId(r.fixtureReference) === fixtureId && refId(r.playerReference) === playerId);
+            return row ? row.response : "Pending";
+        };
+
+        const out = upcoming.map(f => {
+            const teamId = refId(f.club_team);
+            // Which of this parent's children this fixture actually applies to.
+            // A parent with two children in one squad gets one card with two
+            // sets of buttons, not the same fixture twice.
+            const forKids = kids
+                .filter(k => refId(k.SP_team) === teamId && isExpectedAtFixture(f, k))
+                .map(k => ({
+                    id: k._id,
+                    name: `${k.SP_firstName || ""} ${k.SP_lastName || ""}`.trim(),
+                    firstName: k.SP_firstName || "",
+                    response: responseFor(f._id, k._id)
+                }));
+
+            if (forKids.length === 0) return null;
+
+            const eventDate = toEventDate(f.date_only);
+            return {
+                id: f._id,
+                eventType: f.eventType || "Event",
+                dateIso: eventDate ? eventDate.toISOString().slice(0, 10) : "",
+                dateLabel: dayLabel(eventDate, today),
+                startTime: f.startTime || "",
+                stopTime: f.stopTime || "",
+                homeTeam: f.homeTeam || "",
+                awayTeam: f.awayTeam || "",
+                venue: venueText(f.venue),
+                notes: f.notes || "",
+                // Beyond the window the card still shows everything - date,
+                // time, venue - just without buttons. A parent can plan
+                // around it, they just can't commit yet.
+                canRespond: eventDate ? eventDate <= rsvpHorizon : false,
+                teamName: (f.club_team && f.club_team.T_teamName) ? f.club_team.T_teamName : "",
+                kids: forKids
+            };
+        }).filter(Boolean);
+
+        return { success: true, fixtures: out };
+    } catch (error) {
+        console.error("getParentFixtures error:", error);
+        return { success: false, error: "Couldn't load fixtures just now." };
+    }
+}
+
+// Records one child's answer to one fixture. Upserts: a parent changing
+// their mind updates the existing row rather than adding a second.
+export async function respondToFixture(playerId, fixtureId, response) {
+    try {
+        if (!playerId || !fixtureId) return { success: false, error: "Missing details." };
+        if (response !== "Accepted" && response !== "Declined") {
+            return { success: false, error: "Unrecognised response." };
+        }
+
+        const member = await currentMember.getMember();
+        if (!member) return { success: false, error: "Not signed in." };
+
+        // Ownership check server-side: a parent may only answer for a child
+        // actually linked to them. The element sends ids, so this can't be
+        // left to the frontend.
+        const profileRes = await wixData.query("ParentProfiles")
+            .eq("memberId", member._id).find(OPTIONS);
+        if (profileRes.items.length === 0) return { success: false, error: "No parent profile." };
+        const parentProfileId = profileRes.items[0]._id;
+
+        const player = await wixData.get("SignolPlayers", playerId, OPTIONS);
+        const owns = player &&
+            (refId(player.primaryParentId) === parentProfileId ||
+             refId(player.secondaryParentId) === parentProfileId);
+        if (!owns) return { success: false, error: "That player isn't linked to your account." };
+
+        // Refuse once the nightly job has archived the fixture - the hot rows
+        // are gone by then and a late write would never be counted.
+        const fixture = await wixData.get("fixtures", fixtureId, OPTIONS);
+        if (!fixture) return { success: false, error: "That fixture no longer exists." };
+        if (fixture.rsvpRolledUp === true) {
+            return { success: false, error: "This event has already taken place." };
+        }
+
+        const eventDate = toEventDate(fixture.date_only);
+        if (eventDate) {
+            const limit = new Date();
+            limit.setHours(0, 0, 0, 0);
+            limit.setDate(limit.getDate() + RSVP_WEEKS * 7);
+            if (eventDate > limit) {
+                return { success: false, error: "This one opens for replies nearer the time." };
+            }
+        }
+
+        const existingRes = await wixData.query("FixtureResponses")
+            .eq("fixtureReference", fixtureId)
+            .eq("playerReference", playerId)
+            .limit(1)
+            .find(OPTIONS);
+
+        if (existingRes.items.length > 0) {
+            const row = existingRes.items[0];
+            row.response = response;
+            row.responseDate = new Date();
+            await wixData.update("FixtureResponses", row, OPTIONS);
+        } else {
+            await wixData.insert("FixtureResponses", {
+                fixtureReference: fixtureId,
+                playerReference: playerId,
+                response,
+                responseDate: new Date()
+            }, OPTIONS);
+        }
+
+        // Keep the counts on the fixture row current, so a manager's fixture
+        // LIST can show "12 of 16 replied" from one query instead of one
+        // lookup per fixture. Done on response rather than nightly: a manager
+        // checking numbers the day before a match needs who replied this
+        // morning, not who had replied by 2am.
+        await refreshFixtureCounts(fixtureId);
+
+        return { success: true, response };
+    } catch (error) {
+        console.error("respondToFixture error:", error);
+        return { success: false, error: "Couldn't save your answer — please try again." };
+    }
+}
+
+// Recomputes the three counts from scratch and writes them to the fixture.
+// Recalculated rather than incremented on purpose - a parent changing their
+// mind moves a number between two buckets, and incrementing would drift out
+// of true the first time anything was missed.
+//
+// Deliberately NOT writing the name lists here. Those are what the nightly
+// rollup produces, and only once, when the answer is final. Rewriting three
+// JSON blobs on every tap would be a lot of churn for data nobody reads
+// until the event has happened - a manager opening a single upcoming fixture
+// gets the live names from getFixtureResponses() below instead.
+async function refreshFixtureCounts(fixtureId) {
+    try {
+        const responsesRes = await wixData.query("FixtureResponses")
+            .eq("fixtureReference", fixtureId)
+            .limit(1000)
+            .find(OPTIONS);
+
+        const accepted = responsesRes.items.filter(r => r.response === "Accepted").length;
+        const declined = responsesRes.items.filter(r => r.response === "Declined").length;
+
+        const fixture = await wixData.get("fixtures", fixtureId, OPTIONS);
+        if (!fixture || fixture.rsvpRolledUp === true) return;
+
+        // No reply is the squad minus everyone who answered - so the manager
+        // sees "4 still to reply" rather than having to work it out.
+        let squadSize = 0;
+        const teamId = refId(fixture.club_team);
+        if (teamId) {
+            // No .ne("SP_status", …) on the query: it doesn't match an UNSET
+            // status, which would silently shrink the squad. Filter in JS with
+            // the shared rule, which is also what the rollup uses - otherwise
+            // the live count a manager reads on Tuesday and the archived one
+            // they read on Thursday disagree for no visible reason.
+            const squadRes = await wixData.query("SignolPlayers")
+                .eq("SP_team", teamId)
+                .limit(1000)
+                .find(OPTIONS);
+            const squad = squadRes.items.filter(p => isExpectedAtFixture(fixture, p));
+            squadSize = squad.length;
+
+            // Every count on this screen is squadSize minus the answers, so
+            // when the number looks wrong it is almost always squadSize that
+            // is wrong. Printing the split turns "12 looks like one too many"
+            // into a specific row you can go and look at.
+            const excluded = squadRes.items.filter(p => !isExpectedAtFixture(fixture, p));
+            const label = (p) => STATUS_NAMES[
+                (typeof p.SP_status === "string") ? p.SP_status : (p.SP_status && p.SP_status._id)
+            ] || "unset/unknown";
+            const tally = (arr) => arr.reduce((acc, p) => {
+                const k = label(p) + (p.SP_trainingOnly === true ? " (training only)" : "");
+                acc[k] = (acc[k] || 0) + 1;
+                return acc;
+            }, {});
+
+            console.log(`[fixtures] counts for ${fixtureId} | eventType=${fixture.eventType || "?"} ` +
+                `audience=${effectiveAudience(fixture)}${fixture.audience ? "" : " (derived, field blank)"} ` +
+                `| ${squadRes.items.length} on team -> ${squadSize} counted, ${excluded.length} excluded`);
+            console.log("[fixtures]   counted :", JSON.stringify(tally(squad)));
+            console.log("[fixtures]   excluded:", JSON.stringify(tally(excluded)));
+            console.log(`[fixtures]   answers : ${accepted} going, ${declined} can't ` +
+                `-> noReply ${Math.max(0, squadSize - accepted - declined)}`);
+        }
+
+        fixture.rsvpAcceptedCount = accepted;
+        fixture.rsvpDeclinedCount = declined;
+        fixture.rsvpNoReplyCount = Math.max(0, squadSize - accepted - declined);
+
+        await wixData.update("fixtures", fixture, OPTIONS);
+    } catch (err) {
+        // A count that didn't update must never fail the parent's answer -
+        // their response is already saved, and the nightly rollup rewrites
+        // all three from scratch anyway.
+        console.error("[fixtures] refreshFixtureCounts failed for", fixtureId, err.message);
+    }
+}
+
+// Live names for ONE fixture, for a manager opening it before the event.
+// Reads the hot store, so it's current to the second rather than to the last
+// nightly run. After rollup the hot rows are gone and the fixture row's JSON
+// lists are the record instead - which is why this reports rolledUp back.
+export async function getFixtureResponses(fixtureId) {
+    try {
+        if (!fixtureId) return { success: false, error: "No fixture." };
+
+        const fixture = await wixData.get("fixtures", fixtureId, OPTIONS);
+        if (!fixture) return { success: false, error: "That fixture no longer exists." };
+
+        if (fixture.rsvpRolledUp === true) {
+            const parse = (raw) => { try { return JSON.parse(raw || "[]"); } catch (e) { return []; } };
+            return {
+                success: true, rolledUp: true,
+                accepted: parse(fixture.rsvpAccepted),
+                declined: parse(fixture.rsvpDeclined),
+                noReply: parse(fixture.rsvpNoReply)
+            };
+        }
+
+        const responsesRes = await wixData.query("FixtureResponses")
+            .eq("fixtureReference", fixtureId)
+            .limit(1000)
+            .find(OPTIONS);
+
+        const teamId = refId(fixture.club_team);
+        let squad = [];
+        if (teamId) {
+            const squadRes = await wixData.query("SignolPlayers")
+                .eq("SP_team", teamId)
+                .limit(1000)
+                .find(OPTIONS);
+            squad = squadRes.items.filter(p => isExpectedAtFixture(fixture, p));
+        }
+
+        const byId = {};
+        responsesRes.items.forEach(r => { byId[refId(r.playerReference)] = r.response; });
+
+        const accepted = [], declined = [], noReply = [];
+        squad.forEach(p => {
+            const entry = { id: p._id, name: `${p.SP_firstName || ""} ${p.SP_lastName || ""}`.trim() };
+            const answer = byId[p._id];
+            if (answer === "Accepted") accepted.push(entry);
+            else if (answer === "Declined") declined.push(entry);
+            else noReply.push(entry);
+        });
+
+        return { success: true, rolledUp: false, accepted, declined, noReply };
+    } catch (error) {
+        console.error("getFixtureResponses error:", error);
+        return { success: false, error: "Couldn't load responses." };
+    }
+}
+
+// =====================================================================
+//  MANAGER SIDE
+// =====================================================================
+//  Everything above serves parents. Below is what managers need: seeing
+//  their own fixtures with reply counts, and creating them.
+//
+//  Managers currently add fixtures DIRECTLY IN THE CMS, which is why the
+//  `audience` column is blank on every existing row and matches were
+//  counting training-only children until effectiveAudience() was added to
+//  compensate. createFixture sets audience properly at source, which turns
+//  that fallback back into what it was meant to be: cover for legacy rows.
+// =====================================================================
+
+const EVENT_TYPES = ["Match", "Training", "Tournament", "Event"];
+
+// Match and Tournament exclude training-only players unless the manager says
+// otherwise; Training and Event include everyone. Documented in
+// docs/fixtures.md and previously specced to live in a form that never got
+// built.
+function defaultAudience(eventType) {
+    return (eventType === "Match" || eventType === "Tournament") ? "Playing Only" : "All";
+}
+
+// Everything a manager should see for their teams: upcoming first, plus
+// recent past ones so they can check who actually replied.
+export async function getTeamFixtures(teamId) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+
+        const res = await wixData.query("fixtures")
+            .eq("club_team", teamId)
+            .include("club_team")
+            .limit(500)
+            .find(OPTIONS);
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        // Four weeks back is enough to check attendance on anything a manager
+        // still cares about, without turning the screen into an archive.
+        const backTo = new Date(today);
+        backTo.setDate(backTo.getDate() - 28);
+
+        const rows = res.items
+            .map(f => {
+                const d = toEventDate(f.date_only);
+                return { f, d };
+            })
+            .filter(x => x.d && x.d >= backTo)
+            .sort((a, b) => a.d.getTime() - b.d.getTime())
+            .map(({ f, d }) => ({
+                id: f._id,
+                eventType: f.eventType || "Event",
+                dateIso: d.toISOString().slice(0, 10),
+                dateLabel: dayLabel(d, today),
+                past: d < today,
+                startTime: f.startTime || "",
+                stopTime: f.stopTime || "",
+                homeTeam: f.homeTeam || "",
+                awayTeam: f.awayTeam || "",
+                venue: venueText(f.venue),
+                notes: f.notes || "",
+                audience: effectiveAudience(f),
+                audienceSet: !!f.audience,
+                accepted: Number(f.rsvpAcceptedCount) || 0,
+                declined: Number(f.rsvpDeclinedCount) || 0,
+                noReply: Number(f.rsvpNoReplyCount) || 0,
+                rolledUp: f.rsvpRolledUp === true
+            }));
+
+        return { success: true, teamId, fixtures: rows };
+    } catch (error) {
+        console.error("getTeamFixtures error:", error);
+        return { success: false, error: "Couldn't load fixtures just now." };
+    }
+}
+
+// Named fields only, never a spread - an unrecognised key in a Wix Data
+// payload silently becomes a real new column on the collection.
+function fixtureFields(teamId, form) {
+    const eventType = EVENT_TYPES.includes(form.eventType) ? form.eventType : "Event";
+    const audience = (form.audience === "All" || form.audience === "Playing Only")
+        ? form.audience
+        : defaultAudience(eventType);
+
+    return {
+        club_team: teamId,
+        eventType,
+        audience,
+        // date_only is Wix's date-only type and wants a plain YYYY-MM-DD
+        // string. A Date object or a display-formatted string both fail
+        // silently here.
+        date_only: String(form.date || "").slice(0, 10),
+        startTime: String(form.startTime || "").trim(),
+        stopTime: String(form.stopTime || "").trim(),
+        homeTeam: String(form.homeTeam || "").trim(),
+        awayTeam: String(form.awayTeam || "").trim(),
+        venue: String(form.venue || "").trim(),
+        notes: String(form.notes || "").trim(),
+        source: "Manual"
+    };
+}
+
+function validateFixture(fields) {
+    if (!fields.date_only || !/^\d{4}-\d{2}-\d{2}$/.test(fields.date_only)) {
+        return "Pick a date for this fixture.";
+    }
+    if (!fields.startTime) return "Add a start time.";
+    if (fields.eventType === "Match" && !fields.awayTeam && !fields.homeTeam) {
+        return "Add who you're playing.";
+    }
+    return "";
+}
+
+export async function createFixture(teamId, form) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+
+        const fields = fixtureFields(teamId, form || {});
+        const problem = validateFixture(fields);
+        if (problem) return { success: false, error: problem };
+
+        // Counts start at zero rather than unset, so the rollup's
+        // isEmpty()/eq(false) candidate query behaves predictably and a
+        // manager sees "0 replies" rather than a blank.
+        fields.rsvpAcceptedCount = 0;
+        fields.rsvpDeclinedCount = 0;
+        fields.rsvpNoReplyCount = 0;
+        fields.rsvpRolledUp = false;
+
+        const saved = await wixData.insert("fixtures", fields, OPTIONS);
+        return { success: true, id: saved._id };
+    } catch (error) {
+        console.error("createFixture error:", error);
+        return { success: false, error: "Couldn't save that fixture." };
+    }
+}
+
+export async function updateFixture(teamId, fixtureId, form) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+
+        const existing = await wixData.get("fixtures", fixtureId, OPTIONS);
+        if (!existing) return { success: false, error: "Fixture not found." };
+        if (refId(existing.club_team) !== teamId) {
+            return { success: false, error: "That fixture belongs to another team." };
+        }
+        if (existing.rsvpRolledUp === true) {
+            // Its responses have been archived and the hot rows deleted, so
+            // editing it would leave a summary describing a different event.
+            return { success: false, error: "This one has already been archived and can't be changed." };
+        }
+
+        const fields = fixtureFields(teamId, form || {});
+        const problem = validateFixture(fields);
+        if (problem) return { success: false, error: problem };
+
+        Object.keys(fields).forEach(k => { existing[k] = fields[k]; });
+        await wixData.update("fixtures", existing, OPTIONS);
+        return { success: true, id: fixtureId };
+    } catch (error) {
+        console.error("updateFixture error:", error);
+        return { success: false, error: "Couldn't save that change." };
+    }
+}
+
+export async function deleteFixture(teamId, fixtureId) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+
+        const existing = await wixData.get("fixtures", fixtureId, OPTIONS);
+        if (!existing) return { success: false, error: "Fixture not found." };
+        if (refId(existing.club_team) !== teamId) {
+            return { success: false, error: "That fixture belongs to another team." };
+        }
+
+        // Responses go first. The other order would orphan them - rows
+        // pointing at a fixture that no longer exists, which nothing would
+        // ever clean up because the rollup only walks fixtures.
+        const responses = await wixData.query("FixtureResponses")
+            .eq("fixtureReference", fixtureId)
+            .limit(1000)
+            .find(OPTIONS);
+        for (const r of responses.items) {
+            await wixData.remove("FixtureResponses", r._id, OPTIONS);
+        }
+
+        await wixData.remove("fixtures", fixtureId, OPTIONS);
+        return { success: true };
+    } catch (error) {
+        console.error("deleteFixture error:", error);
+        return { success: false, error: "Couldn't delete that fixture." };
+    }
+}
+
+// Manager-facing wrapper around getFixtureResponses. That function is
+// deliberately left unguarded because it's also reachable from parent-side
+// code paths; this one adds the team check, so a manager can't read another
+// squad's list by passing a fixture id they happened to learn.
+export async function getTeamFixtureResponses(teamId, fixtureId) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+
+        const fixture = await wixData.get("fixtures", fixtureId, OPTIONS);
+        if (!fixture) return { success: false, error: "Fixture not found." };
+        if (refId(fixture.club_team) !== teamId) {
+            return { success: false, error: "That fixture belongs to another team." };
+        }
+
+        // Same file, so this call is NOT web-method wrapped and needs no
+        // await-for-wrapping - but it is genuinely async, so it needs one anyway.
+        return await getFixtureResponses(fixtureId);
+    } catch (error) {
+        console.error("getTeamFixtureResponses error:", error);
+        return { success: false, error: "Couldn't load replies just now." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Home teaser: what's on this week, across every team
+// ---------------------------------------------------------------------
+//  ⚠️ LIVES HERE, NOT IN managerData.jsw. That module is what this file
+//  imports assertTeamAccess FROM, so putting a fixtures query in the
+//  dashboard would make managerData -> fixtures -> managerData. The page
+//  calls this alongside getManagerDashboard() instead.
+//
+//  ONE QUERY FOR EVERY TEAM. A manager on three squads is still one round
+//  trip, because the RSVP counts are denormalised onto the fixture row by
+//  refreshFixtureCounts() each time a parent answers - so "who's coming"
+//  costs nothing extra to read here.
+//
+//  ⚠️ DATES ARE FILTERED IN JS, NEVER IN THE QUERY. date_only comes back as
+//  a plain string ("2026-08-15"), and a wixData .ge()/.le() comparing a
+//  string-typed field against a JS Date SILENTLY MATCHES NOTHING - no error,
+//  just an empty teaser nobody notices. toEventDate() handles both shapes,
+//  so this keeps working if the column is ever switched to a real Date.
+//  Same reasoning as loadFixtureTeasers() in Parent Hub v2.
+
+const TEASER_DAYS = 7;
+
+export async function getManagerWeekFixtures() {
+    try {
+        const ctx = await getManagerContext();
+        if (!ctx || !ctx.success) return { success: false, error: (ctx && ctx.error) || "Not signed in." };
+
+        const teams = ctx.teams || [];
+        if (teams.length === 0) return { success: true, fixtures: [], next: null };
+
+        const teamIds = teams.map(t => t.id).filter(Boolean);
+        const nameOf = id => {
+            const hit = teams.find(t => t.id === id);
+            return hit ? hit.name : "";
+        };
+
+        const res = await wixData.query("fixtures")
+            .hasSome("club_team", teamIds)
+            .limit(500)
+            .find(OPTIONS);
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const horizon = new Date(today);
+        horizon.setDate(horizon.getDate() + TEASER_DAYS);
+
+        const upcoming = res.items
+            .map(f => ({ f, d: toEventDate(f.date_only) }))
+            .filter(x => x.d && x.d >= today)
+            .sort((a, b) => a.d.getTime() - b.d.getTime());
+
+        const shape = ({ f, d }) => {
+            const teamId = (typeof f.club_team === "string") ? f.club_team : ((f.club_team && f.club_team._id) || "");
+            const accepted = Number(f.rsvpAcceptedCount) || 0;
+            const declined = Number(f.rsvpDeclinedCount) || 0;
+            const noReply = Number(f.rsvpNoReplyCount) || 0;
+            return {
+                id: f._id,
+                teamId,
+                teamName: nameOf(teamId),
+                // Only worth showing the team when the manager has more than
+                // one - on a single squad it's the same word on every row.
+                multiTeam: teams.length > 1,
+                eventType: f.eventType || "Event",
+                dateIso: d.toISOString().slice(0, 10),
+                dateLabel: dayLabel(d, today),
+                startTime: f.startTime || "",
+                homeTeam: f.homeTeam || "",
+                awayTeam: f.awayTeam || "",
+                venue: venueText(f.venue),
+                accepted, declined, noReply,
+                // Counts only mean something once somebody has been asked.
+                // A brand-new fixture reads "nobody has replied", which is
+                // true but not worth a nudge on the home page.
+                asked: accepted + declined + noReply > 0
+            };
+        };
+
+        const thisWeek = upcoming.filter(x => x.d < horizon).map(shape);
+
+        // Nothing in the next seven days still deserves an answer to "when am
+        // I next out?" - an empty card that says nothing sends a manager to
+        // the Fixtures tab to find out there was nothing there either.
+        const next = (thisWeek.length === 0 && upcoming.length) ? shape(upcoming[0]) : null;
+
+        return { success: true, fixtures: thisWeek, next, days: TEASER_DAYS };
+    } catch (error) {
+        console.error("getManagerWeekFixtures error:", error);
+        return { success: false, error: "Couldn't load this week's fixtures." };
+    }
+}
+
+// =====================================================================
+//  SQUAD SELECTION
+// =====================================================================
+//  Who's actually playing, on top of who said they're available.
+//
+//  ⚠️ STORED ON THE FIXTURE ROW AS JSON, no new collection. Same shape
+//  the RSVP rollup already uses (rsvpAccepted etc.) - a selection is a
+//  handful of ids that are only ever read for one fixture at a time, so a
+//  collection would buy nothing and cost a join on every read.
+//
+//  ⚠️ ONLY MATCHES AND TOURNAMENTS. PLAYING_EVENT_TYPES is the same rule
+//  that decides whether a training-only child is asked to reply at all, so
+//  a child who never gets picked for matches is never in this picker
+//  either - for free, with no second definition to keep in step.
+//
+//  A PARENT WHO SAID NO CANNOT BE PICKED. They've already told you their
+//  child isn't coming; overriding that from a phone at 8am is not a
+//  judgement call worth enabling, so it's refused server-side rather than
+//  merely greyed out in the UI. No reply is different - that's silence,
+//  not a no - and those ARE selectable, with a marker.
+
+
+// "19:00:00.000" -> "7pm". Local rather than imported from wixFormat.js:
+// this module is loaded by the live Parent Hub, and widening its import
+// graph for one string helper is not a trade worth making.
+function timeWords(value) {
+    const v = String(value || "").trim();
+    if (!v) return "";
+    const m = v.match(/^([0-9]{1,2}):([0-9]{2})/);
+    if (!m) return v;
+    let h = Number(m[1]);
+    const mins = m[2];
+    const suffix = h >= 12 ? "pm" : "am";
+    h = h % 12;
+    if (h === 0) h = 12;
+    return mins === "00" ? (h + suffix) : (h + "." + mins + suffix);
+}
+
+// A formation is just a list of row sizes. "4-4-2" is rows of 4, 4 and 2,
+// valid at 11-a-side because they sum to 10 and the keeper is the 11th.
+// That single rule covers every format and every shape, which is why there
+// is no table of formations anywhere in this file.
+export function parseShape(str) {
+    const parts = String(str || "").trim().split(/[^0-9]+/).filter(Boolean).map(Number);
+    if (!parts.length) return null;
+    if (parts.some(x => x < 1 || x > 9)) return null;
+    return parts;
+}
+
+// Keeperless football is real, but only at the smallest formats - 3v3 and
+// 4v4 are routinely played without one. Above that a keeper is a given, and
+// allowing the no-keeper reading there let "4-4-2-1" through at 11-a-side as
+// "eleven outfield players", which is arithmetically consistent and complete
+// nonsense on a pitch.
+const NO_KEEPER_MAX = 4;
+
+export function shapeFits(shape, format) {
+    const rows = parseShape(shape);
+    if (!rows) return { ok: false, error: "That formation isn't valid." };
+
+    const sum = rows.reduce((a, b) => a + b, 0);
+    if (sum === format - 1) return { ok: true, keeper: true, slots: format, rows };
+    if (sum === format && format <= NO_KEEPER_MAX) {
+        return { ok: true, keeper: false, slots: format, rows };
+    }
+
+    const want = format <= NO_KEEPER_MAX
+        ? `${format - 1} (with a keeper) or ${format} (without)`
+        : `${format - 1}, leaving one for the keeper`;
+    return { ok: false, error: `${shape} adds up to ${sum}. For ${format}-a-side it needs to be ${want}.` };
+}
+
+function readJson(raw, fallback) {
+    try {
+        const v = JSON.parse(raw || "");
+        return v === null || v === undefined ? fallback : v;
+    } catch (e) { return fallback; }
+}
+
+function defaultShapeFor(format) {
+    if (format <= 3) return "1-1-1";
+    if (format <= 5) return "1-2-1";
+    if (format <= 7) return "2-3-1";
+    if (format <= 9) return "3-2-3";
+    return "4-4-2";
+}
+
+// Loads the fixture and proves the caller manages the team it belongs to.
+// Every function below starts here, so none of them can be handed another
+// squad's fixture id from a console.
+async function loadFixtureFor(teamId, fixtureId, opts = {}) {
+    const access = await assertTeamAccess(teamId);
+    if (!access.ok) return { ok: false, error: access.error };
+
+    const fixture = await wixData.get("fixtures", fixtureId, OPTIONS);
+    if (!fixture) return { ok: false, error: "That fixture no longer exists." };
+    if (refId(fixture.club_team) !== teamId) {
+        return { ok: false, error: "That fixture belongs to another team." };
+    }
+    if (opts.playingOnly && !PLAYING_EVENT_TYPES.includes(String(fixture.eventType || "").trim())) {
+        return { ok: false, error: "Squads are only picked for matches and tournaments." };
+    }
+    return { ok: true, fixture, ctx: access.ctx };
+}
+
+export async function getSquadPicker(teamId, fixtureId) {
+    try {
+        const r = await loadFixtureFor(teamId, fixtureId, { playingOnly: true });
+        if (!r.ok) return { success: false, error: r.error };
+        const f = r.fixture;
+
+        // The team's usual format, copied onto the fixture the first time a
+        // squad is picked - so changing a team's format next season doesn't
+        // silently rewrite last year's line-ups.
+        let format = Number(f.squadFormat) || 0;
+        if (!format) {
+            const team = await wixData.get("Teams", teamId, OPTIONS);
+            format = Number(team && team.T_matchFormat) || 7;
+        }
+        const shape = f.squadShape || defaultShapeFor(format);
+
+        const [squadRes, responses] = await Promise.all([
+            wixData.query("SignolPlayers").eq("SP_team", teamId).limit(1000).find(OPTIONS),
+            getFixtureResponses(fixtureId)
+        ]);
+
+        // Names of everyone who answered, so a reply maps back to a player.
+        const yes = new Set(), no = new Set();
+        if (responses && responses.success) {
+            (responses.accepted || []).forEach(x => yes.add(String(x.id || x.name || "")));
+            (responses.declined || []).forEach(x => no.add(String(x.id || x.name || "")));
+        }
+
+        const players = squadRes.items
+            .filter(p => isExpectedAtFixture(f, p))
+            .map(p => {
+                const key = String(p._id);
+                const byName = String(`${p.SP_firstName || ""} ${p.SP_lastName || ""}`.trim());
+                const said = (yes.has(key) || yes.has(byName)) ? "yes"
+                           : (no.has(key) || no.has(byName)) ? "no" : "wait";
+                return {
+                    id: p._id,
+                    name: byName,
+                    shirt: p.kitNumber || "",
+                    rsvp: said
+                };
+            })
+            .sort((a, b) => {
+                const n = (x) => Number(x.shirt) || 999;
+                return n(a) - n(b) || a.name.localeCompare(b.name);
+            });
+
+        const eventDate = toEventDate(f.date_only);
+        const today = new Date(); today.setHours(0, 0, 0, 0);
+
+        return {
+            success: true,
+            teamId,
+            fixtureId,
+            fixture: {
+                eventType: f.eventType || "Match",
+                title: [f.homeTeam, f.awayTeam].filter(Boolean).join(" v ") || (f.eventType || "Match"),
+                dateLabel: dayLabel(eventDate, today),
+                startTime: f.startTime || "",
+                venue: venueText(f.venue)
+            },
+            format,
+            shape,
+            // Slot ids are numbered from the keeper up. See the element.
+            selected: readJson(f.squadSelected, {}),
+            subs: readJson(f.squadSubs, []),
+            meetTime: f.meetTime || "",
+            meetPlace: f.meetPlace || venueText(f.venue) || "",
+            published: f.squadPublished === true,
+            players
+        };
+    } catch (error) {
+        console.error("getSquadPicker error:", error);
+        return { success: false, error: "Couldn't load the squad picker." };
+    }
+}
+
+// Shared by save and publish, so a selection can never be stored in a state
+// that publish would then refuse.
+function validateSelection(payload, players) {
+    const format = Number(payload.format) || 0;
+    const fit = shapeFits(payload.shape, format);
+    if (!fit.ok) return { ok: false, error: fit.error };
+
+    const byId = {};
+    players.forEach(p => { byId[p.id] = p; });
+
+    const selected = {};
+    const seen = new Set();
+    const raw = payload.selected || {};
+
+    for (const slot in raw) {
+        const slotNo = Number(slot);
+        if (!(slotNo >= 0 && slotNo < fit.slots)) continue;   // a slot that no longer exists
+        const pid = String(raw[slot] || "");
+        if (!pid) continue;
+
+        const p = byId[pid];
+        if (!p) return { ok: false, error: "One of those players isn't in this squad." };
+        if (p.rsvp === "no") {
+            return { ok: false, error: `${p.name} said they can't make it, so they can't be picked.` };
+        }
+        if (seen.has(pid)) {
+            return { ok: false, error: `${p.name} is in the line-up twice.` };
+        }
+        seen.add(pid);
+        selected[slotNo] = pid;
+    }
+
+    const subs = [];
+    (payload.subs || []).forEach(pid => {
+        const p = byId[String(pid)];
+        if (!p) return;
+        if (p.rsvp === "no") return;      // quietly dropped rather than an error
+        if (seen.has(String(pid))) return; // already on the pitch
+        seen.add(String(pid));
+        subs.push(String(pid));
+    });
+
+    return { ok: true, format, shape: payload.shape, selected, subs };
+}
+
+export async function saveSquad(teamId, fixtureId, payload = {}) {
+    try {
+        const r = await loadFixtureFor(teamId, fixtureId, { playingOnly: true });
+        if (!r.ok) return { success: false, error: r.error };
+
+        const picker = await getSquadPicker(teamId, fixtureId);
+        if (!picker.success) return picker;
+
+        const v = validateSelection(payload, picker.players);
+        if (!v.ok) return { success: false, error: v.error };
+
+        const f = r.fixture;
+        f.squadFormat = v.format;
+        f.squadShape = v.shape;
+        f.squadSelected = JSON.stringify(v.selected);
+        f.squadSubs = JSON.stringify(v.subs);
+        f.meetTime = String(payload.meetTime || "").trim();
+        f.meetPlace = String(payload.meetPlace || "").trim();
+
+        await wixData.update("fixtures", f, OPTIONS);
+
+        return {
+            success: true,
+            placed: Object.keys(v.selected).length,
+            subs: v.subs.length
+        };
+    } catch (error) {
+        console.error("saveSquad error:", error);
+        return { success: false, error: "Couldn't save that squad." };
+    }
+}
+
+// Publishing writes one ParentMessages row per parent of each PICKED child.
+// Nobody else is written to at all - a child who wasn't picked generates no
+// message, so there is no notification and nothing to count yourself out of.
+export async function publishSquad(teamId, fixtureId) {
+    try {
+        const r = await loadFixtureFor(teamId, fixtureId, { playingOnly: true });
+        if (!r.ok) return { success: false, error: r.error };
+        const f = r.fixture;
+
+        const selected = readJson(f.squadSelected, {});
+        const subs = readJson(f.squadSubs, []);
+        const picked = [...new Set(Object.keys(selected).map(k => selected[k]).concat(subs))].filter(Boolean);
+
+        if (picked.length === 0) {
+            return { success: false, error: "Nobody's picked yet." };
+        }
+
+        f.squadPublished = true;
+        f.squadPublishedDate = new Date();
+        await wixData.update("fixtures", f, OPTIONS);
+
+        const when = [f.startTime ? "kick-off " + timeWords(f.startTime) : ""]
+            .filter(Boolean).join("");
+        const meet = f.meetTime
+            ? `Meet ${timeWords(f.meetTime)}${f.meetPlace ? " at " + f.meetPlace : ""}.`
+            : "";
+        const title = [f.homeTeam, f.awayTeam].filter(Boolean).join(" v ") || "Squad for the match";
+
+        let reach = 0;
+        for (const pid of picked) {
+            try {
+                const player = await wixData.get("SignolPlayers", pid, OPTIONS);
+                if (!player) continue;
+
+                const parents = [refId(player.primaryParentId), refId(player.secondaryParentId)].filter(Boolean);
+                const first = player.SP_firstName || "Your child";
+
+                // Starters and subs get the IDENTICAL message. The bench is
+                // not a tier a parent should be told about in writing.
+                const body = `${first} is in the squad for ${title}.` +
+                    (when ? ` ${when.charAt(0).toUpperCase()}${when.slice(1)}.` : "") +
+                    (meet ? ` ${meet}` : "");
+
+                for (const parentId of parents) {
+                    await wixData.insert("ParentMessages", {
+                        title: "In the squad — " + title,
+                        body,
+                        senderName: r.ctx.name || "Your manager",
+                        kind: "alert",
+                        team: teamId,
+                        player: player._id,
+                        parentProfile: parentId,
+                        publishDate: new Date()
+                    }, OPTIONS);
+                    reach++;
+                }
+            } catch (rowErr) {
+                // One family's message failing must not stop the rest going
+                // out - the squad is already published either way.
+                console.error("[squad] publish row failed for", pid, rowErr.message);
+            }
+        }
+
+        return { success: true, picked: picked.length, reach };
+    } catch (error) {
+        console.error("publishSquad error:", error);
+        return { success: false, error: "Couldn't publish that squad." };
+    }
+}
+
+// The nudge: one message to every parent who hasn't answered yet. Separate
+// from selection deliberately - it's useful on any fixture, picked or not.
+export async function nudgeNoReplies(teamId, fixtureId) {
+    try {
+        const r = await loadFixtureFor(teamId, fixtureId);
+        if (!r.ok) return { success: false, error: r.error };
+        const f = r.fixture;
+
+        const eventDate = toEventDate(f.date_only);
+        const today = new Date(); today.setHours(0, 0, 0, 0);
+        if (eventDate && eventDate < today) {
+            return { success: false, error: "That one's already been played." };
+        }
+
+        const [squadRes, responses] = await Promise.all([
+            wixData.query("SignolPlayers").eq("SP_team", teamId).limit(1000).find(OPTIONS),
+            getFixtureResponses(fixtureId)
+        ]);
+
+        const answered = new Set();
+        if (responses && responses.success) {
+            [].concat(responses.accepted || [], responses.declined || [])
+              .forEach(x => { answered.add(String(x.id || x.name || "")); });
+        }
+
+        const waiting = squadRes.items.filter(p => {
+            if (!isExpectedAtFixture(f, p)) return false;
+            const byName = `${p.SP_firstName || ""} ${p.SP_lastName || ""}`.trim();
+            return !answered.has(String(p._id)) && !answered.has(byName);
+        });
+
+        if (waiting.length === 0) return { success: true, reach: 0, asked: 0 };
+
+        const title = [f.homeTeam, f.awayTeam].filter(Boolean).join(" v ") ||
+                      (f.eventType || "the fixture");
+        const dateBit = eventDate ? dayLabel(eventDate, today) : "";
+
+        let reach = 0;
+        for (const p of waiting) {
+            try {
+                const parents = [refId(p.primaryParentId), refId(p.secondaryParentId)].filter(Boolean);
+                const first = p.SP_firstName || "your child";
+                for (const parentId of parents) {
+                    await wixData.insert("ParentMessages", {
+                        title: "Can " + first + " make it?",
+                        body: `We still need to know if ${first} is available for ${title}` +
+                              (dateBit ? " on " + dateBit : "") +
+                              (f.startTime ? ", " + timeWords(f.startTime) : "") +
+                              `. Open Fixtures in your hub to let us know.`,
+                        senderName: r.ctx.name || "Your manager",
+                        kind: "alert",
+                        team: teamId,
+                        player: p._id,
+                        parentProfile: parentId,
+                        publishDate: new Date()
+                    }, OPTIONS);
+                    reach++;
+                }
+            } catch (rowErr) {
+                console.error("[squad] nudge row failed for", p._id, rowErr.message);
+            }
+        }
+
+        return { success: true, asked: waiting.length, reach };
+    } catch (error) {
+        console.error("nudgeNoReplies error:", error);
+        return { success: false, error: "Couldn't send those reminders." };
+    }
+}

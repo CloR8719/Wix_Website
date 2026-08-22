@@ -1,0 +1,653 @@
+// =====================================================================
+//  statsData.jsw — team and player statistics
+// =====================================================================
+//  Everything behind the three Stats screens: the overview, adding records,
+//  and editing them.
+//
+//  THE AGGREGATION MOVED SERVER-SIDE. It used to run in page code across
+//  four repeaters, each with its own onItemReady rebinding on every refresh
+//  (a real bug in the old version - onItemReady was registered inside the
+//  refresh function, so handlers stacked up on repeat visits). Doing the
+//  sums here means one payload, no repeaters, and the same numbers available
+//  to anything else that ever wants them.
+//
+//  ⚠️ PLAYER STATS ARE KEYED BY NAME, NOT BY PLAYER ID. `PS_playerName` is a
+//  text field, so two spellings of the same child are two rows in the
+//  leaderboard and a renamed player loses their history. That's how the data
+//  already is and this module reproduces it faithfully rather than silently
+//  half-fixing it - see NAME KEYING below. Worth migrating one day; not
+//  worth changing underneath a manager mid-season.
+//
+//  Three collections:
+//    TeamStats        one row per match  (TS_teamName, result, goals)
+//    PlayerStats      one row per player per match
+//    Playerofthematch one row per award
+// =====================================================================
+
+import wixData from 'wix-data';
+import { mediaManager } from 'wix-media-backend';
+import { assertTeamAccess, getManagerContext } from 'backend/managerData.jsw';
+// PO_reason is a RICH_TEXT column - see backend/wixFormat.js.
+import { richToText, textToRich } from 'backend/wixFormat.js';
+// The same "who is actually in this squad" rule fixtures and messages use.
+import { isAttendingSquadMember } from 'backend/squadRules.js';
+
+const OPTIONS = { suppressAuth: true };
+
+// A downscaled photo from the element. Generous, but refuses an untouched
+// phone original.
+const MAX_PHOTO_BYTES = 4 * 1024 * 1024;
+
+// ⚠️ Deliberately a small local copy rather than importing teamAdmin.jsw's
+// version. teamAdmin imports blog.jsw, which imports the @wix/blog SDK - and
+// pulling that whole tree in just to upload one image is exactly the kind of
+// dependency that produced a ModuleLoadError and took the Hub down on load.
+// Fifteen lines duplicated beats a fragile import graph.
+async function uploadPhoto(base64, fileName) {
+    if (!base64) return "";
+    const bytes = Math.floor(base64.length * 3 / 4);
+    if (bytes > MAX_PHOTO_BYTES) throw new Error("That photo is too big — try a smaller one.");
+
+    const safe = String(fileName || "potm.jpg").replace(/[^A-Za-z0-9._-]+/g, "-");
+    const uploaded = await mediaManager.upload(
+        "/potm-photos",
+        Buffer.from(base64, "base64"),
+        safe,
+        {
+            mediaOptions: { mimeType: "image/jpeg", mediaType: "image" },
+            metadataOptions: { isPrivate: false, isVisitorUpload: false }
+        }
+    );
+    return uploaded.fileUrl || "";
+}
+
+// NAME KEYING: trimmed and lowercased for grouping so "Jack Smith" and
+// "jack smith " become one row, but the first-seen spelling is what gets
+// displayed. That's as far as it's safe to go without a real player
+// reference - anything cleverer would start merging two different children
+// who happen to share a name.
+function nameKey(value) {
+    return String(value || "Unknown").trim().toLowerCase();
+}
+function displayName(value) {
+    return String(value || "Unknown").trim() || "Unknown";
+}
+
+function num(value) {
+    const n = Number(value);
+    return isNaN(n) ? 0 : n;
+}
+
+// ---------------------------------------------------------------------
+//  Overview
+// ---------------------------------------------------------------------
+export async function getStatsOverview(teamId, season) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+        if (!season) return { success: false, error: "Pick a season first." };
+
+        const [teamRes, playerRes, potmRes] = await Promise.all([
+            wixData.query("TeamStats")
+                .eq("TS_teamName", teamId).eq("seasonLabel", season)
+                .descending("_createdDate").limit(1000).find(OPTIONS),
+            wixData.query("PlayerStats")
+                .eq("PS_teamName", teamId).eq("seasonLabel", season)
+                .limit(1000).find(OPTIONS),
+            wixData.query("Playerofthematch")
+                .eq("PO_teamName", teamId).eq("seasonLabel", season)
+                .limit(1000).find(OPTIONS)
+        ]);
+
+        // --- scorecard ---
+        let gf = 0, ga = 0, won = 0, lost = 0, drawn = 0;
+        teamRes.items.forEach(m => {
+            gf += num(m.TS_goalsFor);
+            ga += num(m.TS_goalsAgainst);
+            if (m.result === "Win") won++;
+            else if (m.result === "Lose") lost++;
+            else if (m.result === "Draw") drawn++;
+        });
+
+        // --- form ---
+        // Query is newest-first, so the last five reversed reads left-to-right
+        // as oldest-to-newest, which is how a form guide is read.
+        const form = teamRes.items.slice(0, 5).reverse().map(m => ({
+            result: m.result || "",
+            letter: m.result ? m.result.charAt(0) : "-",
+            score: `${num(m.TS_goalsFor)}-${num(m.TS_goalsAgainst)}`
+        }));
+
+        // --- leaderboards ---
+        const byPlayer = {};
+        playerRes.items.forEach(s => {
+            const key = nameKey(s.PS_playerName);
+            if (!byPlayer[key]) {
+                byPlayer[key] = {
+                    name: displayName(s.PS_playerName),
+                    goals: 0, assists: 0, tackles: 0, saves: 0, apps: 0
+                };
+            }
+            const p = byPlayer[key];
+            p.goals += num(s.goals);
+            p.assists += num(s.assists);
+            p.tackles += num(s.tackles);
+            p.saves += num(s.saves);
+            p.apps += 1;
+        });
+        const players = Object.values(byPlayer);
+
+        // --- player of the match ---
+        const byPotm = {};
+        potmRes.items.forEach(a => {
+            const key = nameKey(a.PO_playerName);
+            if (!byPotm[key]) byPotm[key] = { name: displayName(a.PO_playerName), count: 0 };
+            byPotm[key].count += 1;
+        });
+
+        return {
+            success: true,
+            teamId,
+            season,
+            played: teamRes.items.length,
+            scorecard: { won, lost, drawn, goalsFor: gf, goalsAgainst: ga, goalDiff: gf - ga },
+            form,
+            attack: players.slice()
+                .sort((a, b) => (b.goals + b.assists) - (a.goals + a.assists) || a.name.localeCompare(b.name))
+                .slice(0, 15),
+            defence: players.slice()
+                .sort((a, b) => (b.tackles + b.saves) - (a.tackles + a.saves) || a.name.localeCompare(b.name))
+                .slice(0, 15),
+            potm: Object.values(byPotm)
+                .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+        };
+    } catch (error) {
+        console.error("getStatsOverview error:", error);
+        return { success: false, error: "Couldn't load stats just now." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Options for the add/edit screens
+// ---------------------------------------------------------------------
+export async function getStatsOptions(teamId) {
+    try {
+        const ctx = await getManagerContext();
+        if (!ctx.success) return { success: false, error: ctx.error };
+
+        let players = [];
+        if (teamId) {
+            const access = await assertTeamAccess(teamId);
+            if (!access.ok) return { success: false, error: access.error };
+
+            const squad = await wixData.query("SignolPlayers")
+                .eq("SP_team", teamId)
+                .limit(1000)
+                .find(OPTIONS);
+
+            // Names, because that's what the stats collections store. Sorted
+            // so a manager scanning a dropdown mid-match finds a name fast.
+            // value is the NAME because that's what the stats collections key
+            // on, but the id rides along so new rows can also populate
+            // playerReference - see the header note on name keying.
+            // Consent rides along with every player.
+            //
+            // sp_consent_photo is website use, socialMedia is social. A player
+            // of the match photo goes to BOTH, so a manager needs to know
+            // before they pick - not after they've uploaded a photo of a child
+            // whose parents said no.
+            //
+            // Absent is treated as NOT given. Consent has to be an explicit
+            // yes; a blank field means nobody ever answered.
+            // ⚠️ Enquiries, trials, invited and left players are NOT squad
+            // members and must not appear in a stats picker. This used to
+            // filter on team alone, which put trialists in the list - and one
+            // definition of "in the squad" across the Hub is the whole point of
+            // squadRules.js.
+            players = squad.items
+                .filter(isAttendingSquadMember)
+                .map(p => ({
+                    id: p._id,
+                    name: `${p.SP_firstName || ""} ${p.SP_lastName || ""}`.trim(),
+                    photoOk: p.sp_consent_photo === true,
+                    socialOk: p.socialMedia === true
+                }))
+                .filter(p => p.name)
+                .sort((a, b) => a.name.localeCompare(b.name))
+                .map(p => ({
+                    value: p.name, label: p.name, id: p.id,
+                    photoOk: p.photoOk, socialOk: p.socialOk
+                }));
+        }
+
+        const seasons = await wixData.query("ClubDictionary")
+            .eq("category", "season")
+            .descending("order")
+            .limit(50)
+            .find(OPTIONS);
+
+        return {
+            success: true,
+            teams: ctx.teams,
+            players,
+            // Ordered by ClubDictionary's own "order" column, highest first, so
+            // the current season is whatever the club puts at the top. The
+            // recruitment poster reads the same list the same way.
+            seasons: seasons.items.map(s => ({ value: s.label || s.value || "", label: s.label || s.value || "" }))
+                .filter(s => s.value)
+        };
+    } catch (error) {
+        console.error("getStatsOptions error:", error);
+        return { success: false, error: "Couldn't load the options." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Adding records
+// ---------------------------------------------------------------------
+export async function addTeamResult(teamId, form = {}) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+
+        const result = ["Win", "Lose", "Draw"].includes(form.result) ? form.result : "";
+        if (!result) return { success: false, error: "Pick a result." };
+        if (!form.season) return { success: false, error: "Pick a season." };
+
+        // Exactly the five columns TeamStats actually has. There is no
+        // opponent field and no match date - _createdDate is what orders the
+        // form guide. Adding either here would silently create a real new CMS
+        // column, which is how a stray "Default season" column appeared once.
+        await wixData.insert("TeamStats", {
+            TS_teamName: teamId,
+            seasonLabel: String(form.season),
+            result,
+            TS_goalsFor: num(form.goalsFor),
+            TS_goalsAgainst: num(form.goalsAgainst)
+        }, OPTIONS);
+
+        return { success: true };
+    } catch (error) {
+        console.error("addTeamResult error:", error);
+        return { success: false, error: "Couldn't save that result." };
+    }
+}
+
+// ⚠️ CONSENT IS RESOLVED HERE, FROM THE DATABASE - never taken from the
+// payload. The element computes the same thing to decide what to show, but a
+// value arriving from a browser is a suggestion, and this one decides whether
+// a child's photo goes on the internet.
+//
+// Absent counts as NOT given: a blank field means nobody ever answered, not
+// that they agreed.
+async function consentForPhoto(teamId, playerIds, wholeTeam) {
+    let items = [];
+
+    if (wholeTeam) {
+        // A squad photo contains everyone, so everyone has to have said yes.
+        const squad = await wixData.query("SignolPlayers")
+            .eq("SP_team", teamId)
+            .limit(1000)
+            .find(OPTIONS);
+        items = squad.items.filter(isAttendingSquadMember);
+    } else {
+        const ids = (playerIds || []).filter(Boolean);
+        if (ids.length === 0) return { ok: false, missing: [] };
+        const res = await wixData.query("SignolPlayers")
+            .hasSome("_id", ids)
+            .limit(100)
+            .find(OPTIONS);
+        items = res.items;
+    }
+
+    if (items.length === 0) return { ok: false, missing: [] };
+
+    const missing = items
+        .filter(p => p.sp_consent_photo !== true || p.socialMedia !== true)
+        .map(p => `${p.SP_firstName || ""} ${p.SP_lastName || ""}`.trim() || "a player");
+
+    return { ok: missing.length === 0, missing };
+}
+
+// Winners can be one player, a pair, or the whole squad - all three happened
+// last season.
+//
+// ONE ROW PER NAMED WINNER, sharing the reason and the photo. The leaderboard
+// counts rows by player name, so a pair stored as a single "Alfie and Sofia"
+// row would count as one award for a player who doesn't exist and none for
+// either child. A whole-squad award is genuinely one thing, so it stays one row.
+export async function addPlayerOfTheMatch(teamId, form = {}) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+        if (!form.season) return { success: false, error: "Pick a season." };
+
+        const wholeTeam = form.wholeTeam === true;
+        const names = Array.isArray(form.playerNames)
+            ? form.playerNames.map(n => String(n || "").trim()).filter(Boolean)
+            : [];
+        const ids = Array.isArray(form.playerIds) ? form.playerIds : [];
+
+        if (!wholeTeam && names.length === 0) {
+            return { success: false, error: "Pick who won it." };
+        }
+
+        // ⚠️ A PHOTO NEEDS EITHER CONSENT ON FILE OR A RECORDED OVERRIDE.
+        //
+        // The override exists because the CMS doesn't know everything: a
+        // manager may have spoken to the parent directly, or blurred the
+        // child's face. Refusing outright would just push people to post it
+        // from their own phone instead, where the club has no record at all.
+        //
+        // But it is never silent. It requires a written reason, and the note
+        // stored on the row names WHO decided and WHY - so if a parent raises
+        // it next season, the club can answer rather than guess.
+        const overriding = form.consentOverride === true;
+        const overrideNote = String(form.overrideNote || "").trim();
+
+        // Looked up, not believed. form.consentOk is ignored entirely.
+        let consent = { ok: false, missing: [] };
+        if (form.photoBase64) {
+            consent = await consentForPhoto(teamId, ids, wholeTeam);
+        }
+
+        if (form.photoBase64 && !consent.ok && !overriding) {
+            // The element shows this before anyone gets here; this is the
+            // refusal that actually holds.
+            const who = consent.missing.length > 3
+                ? (consent.missing.length + " players")
+                : consent.missing.join(", ");
+            return {
+                success: false,
+                error: "Consent isn't on file for " + (who || "everyone in the photo") +
+                       ". Tick the override and give a reason, or remove the photo."
+            };
+        }
+        if (form.photoBase64 && !consent.ok && overriding && !overrideNote) {
+            return { success: false, error: "Say why you're publishing this photo without consent on file." };
+        }
+
+        let photoUrl = "";
+        let photoOverridden = false;
+        if (form.photoBase64) {
+            const allowed = consent.ok || (overriding && overrideNote);
+            if (allowed) {
+                try {
+                    photoUrl = await uploadPhoto(form.photoBase64, form.photoName);
+                    photoOverridden = !consent.ok;
+                } catch (upErr) {
+                    console.error("[statsData] potm photo upload failed:", upErr.message);
+                    return { success: false, error: upErr.message || "Couldn't upload that photo." };
+                }
+            } else {
+                console.warn("[statsData] potm photo dropped - no consent and no override");
+            }
+        }
+
+        const base = {
+            PO_teamName: teamId,
+            seasonLabel: String(form.season),
+            PO_reason: textToRich(form.reason)
+        };
+        if (photoUrl) base.PO_playerPhoto = photoUrl;
+
+        // The audit trail. Written on every row of the award, so it travels
+        // with whichever child's record someone later looks at.
+        if (photoOverridden) {
+            base.PO_consentOverride = true;
+            // Names who it was published without consent for, so the record is
+            // useful on its own rather than needing cross-referencing later.
+            base.PO_overrideNote =
+                (access.ctx.name || "A manager") + " on " +
+                new Date().toISOString().slice(0, 10) + ": " + overrideNote +
+                (consent.missing.length ? " [no consent: " + consent.missing.join(", ") + "]" : "");
+            console.warn("[statsData] POTM photo published WITHOUT consent on file. by=" +
+                (access.ctx.name || "?") + " team=" + teamId + " reason=" + overrideNote);
+        }
+
+        if (wholeTeam) {
+            await wixData.insert("Playerofthematch",
+                Object.assign({}, base, { PO_playerName: "The whole squad" }), OPTIONS);
+            return { success: true, saved: 1, photoSaved: !!photoUrl };
+        }
+
+        for (let i = 0; i < names.length; i++) {
+            const row = Object.assign({}, base, { PO_playerName: names[i] });
+            // Only meaningful when the element knew the id for this name.
+            if (ids[i]) row.playerReference = ids[i];
+            await wixData.insert("Playerofthematch", row, OPTIONS);
+        }
+
+        return {
+            success: true,
+            saved: names.length,
+            photoSaved: !!photoUrl,
+            photoOverridden: photoOverridden,
+            photoBlocked: !!form.photoBase64 && !photoUrl
+        };
+    } catch (error) {
+        console.error("addPlayerOfTheMatch error:", error);
+        return { success: false, error: "Couldn't save that award." };
+    }
+}
+
+// The bulk sheet: one row per player after a match. Saved one at a time so a
+// single bad row doesn't lose the other fourteen - a manager entering stats
+// after a game will not enjoy retyping them.
+export async function addPlayerStats(teamId, season, rows = []) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+        if (!season) return { success: false, error: "Pick a season." };
+
+        const usable = (rows || []).filter(r => String(r.playerName || "").trim());
+        if (usable.length === 0) return { success: false, error: "Add at least one player." };
+
+        let saved = 0;
+        const failed = [];
+        for (const r of usable) {
+            try {
+                const row = {
+                    PS_teamName: teamId,
+                    PS_playerName: String(r.playerName).trim(),
+                    seasonLabel: String(season),
+                    goals: num(r.goals),
+                    assists: num(r.assists),
+                    tackles: num(r.tackles),
+                    saves: num(r.saves)
+                };
+                if (r.playerId) row.playerReference = r.playerId;
+                await wixData.insert("PlayerStats", row, OPTIONS);
+                saved++;
+            } catch (rowErr) {
+                console.error("[statsData] row failed:", r.playerName, rowErr.message);
+                failed.push(String(r.playerName).trim());
+            }
+        }
+
+        return {
+            success: saved > 0,
+            saved,
+            failed,
+            error: saved === 0 ? "Nothing saved — please try again." : ""
+        };
+    } catch (error) {
+        console.error("addPlayerStats error:", error);
+        return { success: false, error: "Couldn't save those stats." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Editing
+// ---------------------------------------------------------------------
+// ⚠️ THERE IS NO LINK BETWEEN A RESULT AND THE PLAYER STATS FROM THAT MATCH.
+//
+// PlayerStats has no match reference and no match date; TeamStats has neither
+// either. So "Jack's stats from last Saturday" is not a question the data can
+// answer - five appearances are five indistinguishable rows.
+//
+// The one signal available is _createdDate: a bulk sheet saved in one go
+// produces rows within seconds of each other. Grouping by that recovers
+// "matches" well enough to edit by, and is honest about being a proxy.
+//
+// The real fix is a match date on both collections, or a MatchDay row they
+// both reference. That's a schema change and a migration, so it waits.
+function batchOf(row) {
+    const d = row._createdDate ? new Date(row._createdDate) : null;
+    if (!d || isNaN(d.getTime())) return { key: "unknown", label: "Undated" };
+    // To the minute: one bulk save lands inside that, two separate sittings
+    // almost never do.
+    const key = d.toISOString().slice(0, 16);
+    const label = d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' }) +
+                  ", " + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    return { key, label };
+}
+
+export async function getStatsRecords(teamId, season, kind) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+        if (!season) return { success: true, records: [] };
+
+        if (kind === "result") {
+            const res = await wixData.query("TeamStats")
+                .eq("TS_teamName", teamId).eq("seasonLabel", season)
+                .descending("_createdDate").limit(200).find(OPTIONS);
+            return {
+                success: true,
+                records: res.items.map(r => {
+                    const b = batchOf(r);
+                    return {
+                        id: r._id,
+                        result: r.result || "",
+                        goalsFor: num(r.TS_goalsFor),
+                        goalsAgainst: num(r.TS_goalsAgainst),
+                        date: r._createdDate || null,
+                        updated: r._updatedDate || null,
+                        batch: b.key, batchLabel: b.label
+                    };
+                })
+            };
+        }
+
+        if (kind === "potm") {
+            const res = await wixData.query("Playerofthematch")
+                .eq("PO_teamName", teamId).eq("seasonLabel", season)
+                .descending("_createdDate").limit(200).find(OPTIONS);
+            return {
+                success: true,
+                records: res.items.map(r => {
+                    const b = batchOf(r);
+                    return {
+                        id: r._id,
+                        playerName: r.PO_playerName || "",
+                        reason: richToText(r.PO_reason),
+                        date: r._createdDate || null,
+                        updated: r._updatedDate || null,
+                        batch: b.key, batchLabel: b.label
+                    };
+                })
+            };
+        }
+
+        const res = await wixData.query("PlayerStats")
+            .eq("PS_teamName", teamId).eq("seasonLabel", season)
+            .descending("_createdDate").limit(400).find(OPTIONS);
+
+        return {
+            success: true,
+            records: res.items.map(r => {
+                const b = batchOf(r);
+                return {
+                    id: r._id,
+                    playerName: r.PS_playerName || "",
+                    goals: num(r.goals),
+                    assists: num(r.assists),
+                    tackles: num(r.tackles),
+                    saves: num(r.saves),
+                    date: r._createdDate || null,
+                    updated: r._updatedDate || null,
+                    batch: b.key, batchLabel: b.label
+                };
+            })
+        };
+    } catch (error) {
+        console.error("getStatsRecords error:", error);
+        return { success: false, error: "Couldn't load those records." };
+    }
+}
+
+export async function updateStatRecord(teamId, kind, recordId, form = {}) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+
+        const collection = kind === "potm" ? "Playerofthematch"
+            : kind === "result" ? "TeamStats" : "PlayerStats";
+        const teamField = kind === "potm" ? "PO_teamName"
+            : kind === "result" ? "TS_teamName" : "PS_teamName";
+
+        const record = await wixData.get(collection, recordId, OPTIONS);
+        if (!record) return { success: false, error: "Record not found." };
+
+        // Without this a manager could edit another squad's stats by passing
+        // an id they happened to learn.
+        const owner = record[teamField];
+        const ownerId = (typeof owner === "string") ? owner : (owner && owner._id) || "";
+        if (ownerId !== teamId) {
+            return { success: false, error: "That record belongs to another team." };
+        }
+
+        if (kind === "result") {
+            if (["Win", "Lose", "Draw"].indexOf(form.result) !== -1) record.result = form.result;
+            record.TS_goalsFor = num(form.goalsFor);
+            record.TS_goalsAgainst = num(form.goalsAgainst);
+        } else if (kind === "potm") {
+            if (typeof form.playerName === "string") record.PO_playerName = form.playerName.trim();
+            if (typeof form.reason === "string") record.PO_reason = textToRich(form.reason);
+            // Corrected to the right player, so playerReference stops pointing
+            // at whoever the row used to be about.
+            if (form.playerId) record.playerReference = form.playerId;
+        } else {
+            if (typeof form.playerName === "string") record.PS_playerName = form.playerName.trim();
+            if (form.playerId) record.playerReference = form.playerId;
+            record.goals = num(form.goals);
+            record.assists = num(form.assists);
+            record.tackles = num(form.tackles);
+            record.saves = num(form.saves);
+        }
+
+        await wixData.update(collection, record, OPTIONS);
+        return { success: true };
+    } catch (error) {
+        console.error("updateStatRecord error:", error);
+        return { success: false, error: "Couldn't save that change." };
+    }
+}
+
+export async function deleteStatRecord(teamId, kind, recordId) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+
+        const collection = kind === "potm" ? "Playerofthematch"
+            : kind === "result" ? "TeamStats" : "PlayerStats";
+        const teamField = kind === "potm" ? "PO_teamName"
+            : kind === "result" ? "TS_teamName" : "PS_teamName";
+
+        const record = await wixData.get(collection, recordId, OPTIONS);
+        if (!record) return { success: false, error: "Record not found." };
+
+        const owner = record[teamField];
+        const ownerId = (typeof owner === "string") ? owner : (owner && owner._id) || "";
+        if (ownerId !== teamId) {
+            return { success: false, error: "That record belongs to another team." };
+        }
+
+        await wixData.remove(collection, recordId, OPTIONS);
+        return { success: true };
+    } catch (error) {
+        console.error("deleteStatRecord error:", error);
+        return { success: false, error: "Couldn't delete that record." };
+    }
+}

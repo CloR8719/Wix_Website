@@ -1,0 +1,507 @@
+// =====================================================================
+//  pipeline.jsw — enquiry -> trial -> invited -> parent registration
+// =====================================================================
+//  Every status transition a manager can make, in one place. These used to
+//  live inline in repeater handlers in Manager Hub.js, which meant:
+//    - nothing else could reuse them (the secretary's Player Admin has its
+//      own separate versions of the same actions),
+//    - the registration URL and token generator existed twice, and
+//    - nothing was callable, testable or checkable outside the page.
+//
+//  CLAIMING, AND WHY IT EXISTS
+//  ---------------------------
+//  Enquiries are attached to an AGE GROUP, not a team, because a child
+//  enquiring doesn't know which squad they'll end up in. Where an age group
+//  has two teams, both managers see the same child. Before claiming, both
+//  could press Accept: the second write silently won, the player moved teams
+//  with no record, and - worse - both managers might already have rung the
+//  same family.
+//
+//  So: claim first, act second. While an enquiry is claimed by someone else,
+//  the parent's contact details are NOT SENT TO THE BROWSER AT ALL (see
+//  getSquadBoard in managerData.jsw) and acceptEnquiry refuses. Hiding the
+//  phone number with CSS would be theatre - anything delivered to a browser
+//  is readable in that browser.
+//
+//  ⚠️ EXPLICIT FIELD WRITES, NEVER A SPREAD RECORD. The old code did
+//  `{...itemData}` minus three system fields and passed that to update(),
+//  which is how a stray "Default season" column appeared: Wix silently
+//  creates a real CMS column for any unrecognised key in the payload. Every
+//  function here patches the fetched record with named fields only.
+// =====================================================================
+
+import wixData from 'wix-data';
+import { assertTeamAccess, getManagerContext } from 'backend/managerData.jsw';
+
+const OPTIONS = { suppressAuth: true };
+
+const ENQUIRY_STATUS_ID  = "e4c79abb-e591-44c3-98a9-e111f276bdd2";
+const TRIAL_STATUS_ID    = "5f21b19d-878a-4042-a8ec-c1c0a66812b9";
+const INVITED_STATUS_ID  = "184b5a98-37c8-41a6-bc58-5a1c17827f04";
+const LEFT_STATUS_ID     = "d78cb8b0-3b3b-4439-b889-fd36dc434781";
+
+// Single source of truth for the invite link. Previously hardcoded inline in
+// Manager Hub.js AND as REG_BASE in Player Admin.js - two copies of the URL
+// that starts registration, and therefore fees.
+const REG_BASE = "https://www.signolathleticjfc.co.uk/secure-registration?token=";
+
+// A claim isn't forever. A manager who claims an enquiry and then does
+// nothing shouldn't be able to sit on a child indefinitely while another
+// squad has a place for them.
+//
+// Five days covers a normal week: claim after Tuesday training, see them at
+// the weekend, decide by the following Tuesday. Shorter and a claim would
+// lapse over a single missed session; much longer and a forgotten claim
+// costs a child a place somewhere else.
+const CLAIM_DAYS = 5;
+
+function refId(value) {
+    if (!value) return "";
+    return (typeof value === "string") ? value : (value._id || "");
+}
+
+// Replaces generateRandomToken() here and randomToken() in Player Admin.js.
+// Crypto-grade isn't required - the token is a lookup key, and the
+// registration page validates it against the player row - but it must not be
+// guessable from another token, which a timestamp-based one would be.
+function inviteToken(length = 16) {
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let out = "";
+    for (let i = 0; i < length; i++) {
+        out += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return out;
+}
+
+// A Wix Date field silently rejects a display-formatted string like
+// "05 Jul 2026" and the write appears to do nothing. Always YYYY-MM-DD.
+function toDateOnly(value) {
+    if (!value) return null;
+    const d = (value instanceof Date) ? value : new Date(value);
+    if (isNaN(d.getTime())) return null;
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${d.getFullYear()}-${m}-${day}`;
+}
+
+// True when a claim is still live. An expired claim is treated as no claim,
+// so a stale one never permanently blocks another manager.
+function claimActive(player) {
+    if (!player.claimedBy) return false;
+    if (!player.claimedDate) return true;          // claimed, no timestamp - respect it
+    const age = Date.now() - new Date(player.claimedDate).getTime();
+    return age < CLAIM_DAYS * 24 * 3600 * 1000;
+}
+
+// Shared preamble: resolve the caller, confirm the team, fetch the player,
+// and confirm the player is actually reachable by this manager.
+async function loadFor(teamId, playerId, opts = {}) {
+    const access = await assertTeamAccess(teamId);
+    if (!access.ok) return { ok: false, error: access.error };
+
+    const player = await wixData.get("SignolPlayers", playerId, OPTIONS);
+    if (!player) return { ok: false, error: "Player not found." };
+
+    // An enquiry belongs to an age group and hasn't got a team yet, so it's
+    // checked against the age group of the team being acted on. Everyone else
+    // must already be on that team - otherwise a manager could pass any
+    // playerId in the club and act on it.
+    if (opts.expectEnquiry) {
+        if (player.SP_status !== ENQUIRY_STATUS_ID) {
+            return { ok: false, error: "That player is no longer an enquiry." };
+        }
+        const team = access.ctx.teams.find(t => refId(t) === teamId);
+        const teamAgeGroup = refId(team && team.AG_ageGroup);
+        if (teamAgeGroup && refId(player.ageGroup) !== teamAgeGroup) {
+            return { ok: false, error: "That enquiry is for a different age group." };
+        }
+    } else if (refId(player.SP_team) !== teamId) {
+        return { ok: false, error: "That player isn't in this team." };
+    }
+
+    return { ok: true, ctx: access.ctx, player };
+}
+
+// ---------------------------------------------------------------------
+//  Claim / release
+// ---------------------------------------------------------------------
+export async function claimEnquiry(teamId, playerId) {
+    try {
+        const r = await loadFor(teamId, playerId, { expectEnquiry: true });
+        if (!r.ok) return { success: false, error: r.error };
+
+        if (claimActive(r.player) && r.player.claimedBy !== r.ctx.staffId) {
+            return {
+                success: false,
+                error: `Already being looked at by ${r.player.claimedByName || "another manager"}.`
+            };
+        }
+
+        r.player.claimedBy = r.ctx.staffId;
+        r.player.claimedByName = r.ctx.name;
+        r.player.claimedDate = new Date();
+        await wixData.update("SignolPlayers", r.player, OPTIONS);
+
+        return { success: true, claimedByName: r.ctx.name };
+    } catch (error) {
+        console.error("claimEnquiry error:", error);
+        return { success: false, error: "Couldn't claim that enquiry." };
+    }
+}
+
+export async function releaseEnquiry(teamId, playerId) {
+    try {
+        const r = await loadFor(teamId, playerId, { expectEnquiry: true });
+        if (!r.ok) return { success: false, error: r.error };
+
+        // Only the holder can release. Otherwise releasing would just be a
+        // way round claiming.
+        if (r.player.claimedBy && r.player.claimedBy !== r.ctx.staffId) {
+            return { success: false, error: "That isn't your claim to release." };
+        }
+
+        r.player.claimedBy = "";
+        r.player.claimedByName = "";
+        r.player.claimedDate = null;
+        await wixData.update("SignolPlayers", r.player, OPTIONS);
+
+        return { success: true };
+    } catch (error) {
+        console.error("releaseEnquiry error:", error);
+        return { success: false, error: "Couldn't release that enquiry." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Enquiry -> Trial
+// ---------------------------------------------------------------------
+export async function acceptEnquiry(teamId, playerId) {
+    try {
+        const r = await loadFor(teamId, playerId, { expectEnquiry: true });
+        if (!r.ok) return { success: false, error: r.error };
+
+        // The check that actually prevents two squads taking the same child.
+        // The UI hides the button; this refuses the action.
+        if (claimActive(r.player) && r.player.claimedBy !== r.ctx.staffId) {
+            return {
+                success: false,
+                error: `${r.player.claimedByName || "Another manager"} is already looking at this player.`
+            };
+        }
+
+        r.player.SP_status = TRIAL_STATUS_ID;
+        r.player.SP_team = teamId;
+        // The claim has done its job the moment the player lands on a team.
+        r.player.claimedBy = "";
+        r.player.claimedByName = "";
+        r.player.claimedDate = null;
+
+        await wixData.update("SignolPlayers", r.player, OPTIONS);
+        return { success: true, firstName: r.player.SP_firstName || "" };
+    } catch (error) {
+        console.error("acceptEnquiry error:", error);
+        return { success: false, error: "Couldn't move that player to trials." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Trial -> Invited  (and into the parent registration flow)
+// ---------------------------------------------------------------------
+// tasterDate / regDate arrive as ISO strings or Dates from the form.
+// playerType true = training only.
+export async function sendInvite(teamId, playerId, details = {}) {
+    try {
+        const r = await loadFor(teamId, playerId);
+        if (!r.ok) return { success: false, error: r.error };
+        if (r.player.SP_status !== TRIAL_STATUS_ID) {
+            return { success: false, error: "Only a player on trial can be invited." };
+        }
+        if (!r.player.parentEmail) {
+            // Better to stop here than to write the status change and queue an
+            // email that can never be delivered - the player would sit as
+            // Invited forever with nobody having been asked anything.
+            return { success: false, error: "No parent email on this player." };
+        }
+
+        // Reuse an existing token rather than minting a new one, so a re-send
+        // doesn't invalidate a link the parent may already have open.
+        const token = r.player.inviteToken || inviteToken(16);
+        const link = r.player.registrationLink || (REG_BASE + token);
+
+        r.player.inviteToken = token;
+        r.player.registrationLink = link;
+        r.player.SP_status = INVITED_STATUS_ID;
+        r.player.SP_trainingOnly = details.playerType === true || details.playerType === "true";
+
+        const taster = toDateOnly(details.tasterDate);
+        const reg = toDateOnly(details.regDate);
+        if (taster) r.player.firstTasterDate = taster;
+        if (reg) r.player.registrationDate = reg;
+
+        await wixData.update("SignolPlayers", r.player, OPTIONS);
+
+        // EmailQueue is watched by an existing Wix Automation which sends the
+        // registration link. Inserted AFTER the update so a failed write can't
+        // send a parent a link to a player who wasn't actually invited.
+        await wixData.insert("EmailQueue", {
+            parentEmail: r.player.parentEmail,
+            parentName: r.player.parentsName,
+            childName: r.player.SP_firstName,
+            registrationLink: link
+        }, OPTIONS);
+
+        return { success: true, firstName: r.player.SP_firstName || "" };
+    } catch (error) {
+        console.error("sendInvite error:", error);
+        return { success: false, error: "Couldn't send that invite." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Trial -> back to the shared pool
+// ---------------------------------------------------------------------
+export async function returnToPool(teamId, playerId) {
+    try {
+        const r = await loadFor(teamId, playerId);
+        if (!r.ok) return { success: false, error: r.error };
+        if (r.player.SP_status !== TRIAL_STATUS_ID) {
+            return { success: false, error: "Only a player on trial can go back to the pool." };
+        }
+
+        r.player.SP_status = ENQUIRY_STATUS_ID;
+        r.player.SP_team = null;
+        // Released as well as returned - otherwise the manager who just passed
+        // would still be holding the claim and no other squad could act.
+        r.player.claimedBy = "";
+        r.player.claimedByName = "";
+        r.player.claimedDate = null;
+
+        await wixData.update("SignolPlayers", r.player, OPTIONS);
+        return { success: true };
+    } catch (error) {
+        console.error("returnToPool error:", error);
+        return { success: false, error: "Couldn't return that player to the pool." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Archive
+// ---------------------------------------------------------------------
+// leaveReasonId is a ClubDictionary `leave_reason` row id.
+export async function archivePlayer(teamId, playerId, leaveReasonId) {
+    try {
+        const r = await loadFor(teamId, playerId, { expectEnquiry: false });
+        if (!r.ok) {
+            // An enquiry has no team, so the standard team check rejects it.
+            // Retry in enquiry mode before giving up - archiving a dead
+            // enquiry is a normal thing for a manager to want to do.
+            const alt = await loadFor(teamId, playerId, { expectEnquiry: true });
+            if (!alt.ok) return { success: false, error: r.error };
+            return await doArchive(alt, leaveReasonId);
+        }
+        return await doArchive(r, leaveReasonId);
+    } catch (error) {
+        console.error("archivePlayer error:", error);
+        return { success: false, error: "Couldn't archive that player." };
+    }
+}
+
+async function doArchive(r, leaveReasonId) {
+    if (!leaveReasonId) return { success: false, error: "Pick a reason first." };
+
+    r.player.SP_status = LEFT_STATUS_ID;
+    r.player.SP_team = null;
+    r.player.leaveReason = leaveReasonId;
+    r.player.claimedBy = "";
+    r.player.claimedByName = "";
+    r.player.claimedDate = null;
+
+    await wixData.update("SignolPlayers", r.player, OPTIONS);
+    return { success: true, firstName: r.player.SP_firstName || "" };
+}
+
+// ---------------------------------------------------------------------
+//  Kit number
+// ---------------------------------------------------------------------
+// Small, but it's the one field a manager edits constantly and it was
+// previously only reachable through the PlayerProfile Lightbox.
+export async function setKitNumber(teamId, playerId, kitNumber) {
+    try {
+        const r = await loadFor(teamId, playerId);
+        if (!r.ok) return { success: false, error: r.error };
+
+        const n = Number(kitNumber);
+        if (kitNumber !== "" && kitNumber !== null && (isNaN(n) || n < 0 || n > 999)) {
+            return { success: false, error: "Kit number must be between 0 and 999." };
+        }
+
+        r.player.kitNumber = (kitNumber === "" || kitNumber === null) ? null : n;
+        await wixData.update("SignolPlayers", r.player, OPTIONS);
+        return { success: true, kitNumber: r.player.kitNumber };
+    } catch (error) {
+        console.error("setKitNumber error:", error);
+        return { success: false, error: "Couldn't save that kit number." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Manual enquiry entry
+// ---------------------------------------------------------------------
+//  A manager taking details at the side of a pitch, on the phone, or from a
+//  parent who won't fill a form in. Same destination as the public enquiry
+//  page - one row in SignolPlayers at Enquiry status - so it lands in the
+//  same Squad > Enquiries list as everything else.
+//
+//  ⚠️ DELIBERATELY DOES NOT NOTIFY. The public form texts the age group's
+//  managers because nobody knows the enquiry exists yet. Here the manager IS
+//  the person who would be told, and texting the other managers of a child
+//  someone is already stood in front of is how two people ring the same
+//  family. Auto-claiming below is the honest version of "I've got this one".
+//
+//  (The SMS path is dead anyway - the Twilio account is unfunded, so
+//  notifyManagers returns {success:false} and nothing is sent. That's a
+//  reason not to rely on it, not a reason this function would have used it.)
+
+// The child's age group comes from their DOB, not from a dropdown - the same
+// rule the public form uses. A manager shouldn't be guessing which cohort a
+// birthday falls in, and two different answers to that question is how a
+// child ends up invisible to the manager who should see them.
+async function ageGroupForDob(dobStr) {
+    const dob = new Date(dobStr);
+    if (isNaN(dob.getTime())) return { ok: false, error: "That date of birth isn't valid." };
+
+    const res = await wixData.query("AgeGroup").limit(50).find(OPTIONS);
+    const hit = res.items.find(function (item) {
+        if (!item.dobStart || !item.dobEnd) return false;
+        return dob >= new Date(item.dobStart) && dob <= new Date(item.dobEnd);
+    });
+
+    if (!hit) {
+        return {
+            ok: false,
+            error: "That date of birth is outside the club's current age groups."
+        };
+    }
+    return { ok: true, id: hit._id, label: hit.AG_ageGroup || "" };
+}
+
+export async function getEnquiryFormOptions() {
+    try {
+        const ctx = await getManagerContext();
+        if (!ctx || !ctx.staffId) return { success: false, error: "Not signed in." };
+
+        const [dict, ages] = await Promise.all([
+            wixData.query("ClubDictionary").ascending("order").limit(200).find(OPTIONS),
+            wixData.query("AgeGroup").limit(50).find(OPTIONS)
+        ]);
+
+        const pick = cat => dict.items
+            .filter(i => i.category === cat)
+            .map(i => ({ value: i._id, label: i.label || "" }))
+            .filter(o => o.label);
+
+        // The date input's own min/max, so an out-of-range birthday can't be
+        // picked at all rather than being rejected after typing everything else.
+        let min = "", max = "";
+        ages.items.forEach(function (a) {
+            if (a.dobStart) {
+                const s = new Date(a.dobStart).toISOString().slice(0, 10);
+                if (!min || s < min) min = s;
+            }
+            if (a.dobEnd) {
+                const e = new Date(a.dobEnd).toISOString().slice(0, 10);
+                if (!max || e > max) max = e;
+            }
+        });
+
+        return {
+            success: true,
+            experience: pick("football_experience"),
+            positions: pick("position"),
+            relationships: pick("relationship"),
+            dobMin: min,
+            dobMax: max
+        };
+    } catch (error) {
+        console.error("getEnquiryFormOptions error:", error);
+        return { success: false, error: "Couldn't load the form just now." };
+    }
+}
+
+export async function addManualEnquiry(teamId, form = {}) {
+    try {
+        const access = await assertTeamAccess(teamId);
+        if (!access.ok) return { success: false, error: access.error };
+
+        const txt = v => String(v || "").trim();
+        const first = txt(form.firstName);
+        const last = txt(form.lastName);
+        const dob = txt(form.dob);
+        const parent = txt(form.parentsName);
+        const phone = txt(form.parentPhone);
+        const email = txt(form.parentEmail).toLowerCase();
+
+        // The minimum needed to ring somebody back. Position and experience are
+        // genuinely optional - a manager taking details in a car park should not
+        // be blocked because a parent doesn't know what position their child
+        // prefers.
+        if (!first || !last) return { success: false, error: "Enter the child's name." };
+        if (!dob) return { success: false, error: "Enter a date of birth." };
+        if (!parent) return { success: false, error: "Enter the parent's name." };
+        if (!phone && !email) {
+            return { success: false, error: "Enter a phone number or an email — there has to be a way to reply." };
+        }
+
+        const age = await ageGroupForDob(dob);
+        if (!age.ok) return { success: false, error: age.error };
+
+        // Labels, not ids, for experience and position - matching what the
+        // public enquiry page writes, so both sources read identically
+        // everywhere downstream. SP_relationship stores the id.
+        const dict = await wixData.query("ClubDictionary").limit(200).find(OPTIONS);
+        const labelOf = id => {
+            const hit = dict.items.find(i => i._id === id);
+            return hit ? (hit.label || "") : "";
+        };
+
+        // Named fields only - never a spread. See the header note.
+        const row = {
+            SP_firstName: first,
+            SP_lastName: last,
+            // A "YYYY-MM-DD" STRING, matching exactly what the public enquiry
+            // page writes. CMS_SCHEMA lists SP_dob as DATE, so Wix is coercing
+            // it - but whatever it does, it does the same to both sources, and
+            // a manual enquiry that stored a different type from a public one
+            // would break the first thing that compared them (registration.jsw
+            // matches on .eq("SP_dob", dob) when linking a parent to a child).
+            SP_dob: dob,
+            ageGroup: age.id,
+            footballExperience: labelOf(form.experienceId),
+            position: labelOf(form.positionId),
+            parentsName: parent,
+            parentEmail: email,
+            parentPhone: phone,
+            SP_relationship: txt(form.relationshipId),
+            SP_status: ENQUIRY_STATUS_ID,
+
+            // Claimed by whoever typed it in. They already have the family in
+            // front of them, so any other manager seeing this unclaimed would
+            // be the duplicate call the claim system exists to prevent.
+            claimedBy: access.ctx.staffId,
+            claimedByName: access.ctx.name,
+            claimedDate: new Date()
+        };
+
+        const saved = await wixData.insert("SignolPlayers", row, OPTIONS);
+
+        return {
+            success: true,
+            playerId: saved._id,
+            name: first + " " + last,
+            ageGroupLabel: age.label
+        };
+    } catch (error) {
+        console.error("addManualEnquiry error:", error);
+        return { success: false, error: "Couldn't save that enquiry." };
+    }
+}
