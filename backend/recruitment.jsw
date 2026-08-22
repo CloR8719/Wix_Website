@@ -37,6 +37,7 @@ import wixData from 'wix-data';
 import { mediaManager } from 'wix-media-backend';
 import { assertTeamAccess } from 'backend/managerData.jsw';
 import { postPhotoToPage } from 'backend/facebook.jsw';
+import { createBlogPost } from 'backend/blog.jsw';
 
 const OPTIONS = { suppressAuth: true };
 
@@ -162,22 +163,58 @@ function facebookCaption(payload, contactName) {
     return lines.join("\n\n");
 }
 
-function buildMessage(toWebsite, toFacebook, status, fb) {
-    if (!toFacebook) return "Poster saved and ready for the website.";
+// The blog post's headline. Short and factual - it appears in the news feed
+// alongside match reports, so it has to read as a club item, not a shout.
+function blogTitle(payload) {
+    const squad = [String(payload.ageGroup || "").trim(),
+                   String(payload.teamName || "").trim()].filter(Boolean).join(" ");
+    return squad ? (squad + " are looking for players") : "We are looking for players";
+}
 
-    if (status === "pending") {
-        return toWebsite
-            ? "Saved. It needs approving before it goes on Facebook."
-            : "Sent for approval before it goes on Facebook.";
+// Same words as the Facebook caption, as paragraphs. Escaped: a manager types
+// every part of this and it lands on a public page.
+function blogBody(payload, contactName) {
+    return facebookCaption(payload, contactName)
+        .split("\n\n")
+        .map(function (para) {
+            const safe = para
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;");
+            return "<p>" + safe + "</p>";
+        })
+        .join("");
+}
+
+// What the manager is told happened. Composed from what was actually
+// VERIFIED, not from what was requested.
+//
+// ⚠️ THIS USED TO LIE. Every branch said "saved for the website" whether or
+// not anything had been published - and since nothing published at all, a
+// silent no-op read as a success. Each destination now reports its own real
+// outcome and the two are joined; no branch can claim one without checking.
+function buildMessage(toWebsite, toFacebook, status, fb, blogPostId) {
+    const parts = [];
+
+    if (toWebsite) {
+        parts.push(blogPostId
+            ? "Posted to the club website."
+            : "Saved, but it didn't reach the website — check the logs.");
     }
-    if (fb && fb.success) {
-        return toWebsite
-            ? "Posted to Facebook and saved for the website."
-            : "Posted to Facebook.";
+
+    if (toFacebook) {
+        if (status === "pending") {
+            parts.push("It needs approving before it goes on Facebook.");
+        } else if (fb && fb.success) {
+            parts.push("Posted to Facebook.");
+        } else {
+            parts.push("Facebook rejected it: " + ((fb && fb.error) || "unknown reason"));
+        }
     }
-    // Saved but not sent - say so plainly rather than reporting a success
-    // that only half happened.
-    return "Saved, but Facebook rejected it: " + ((fb && fb.error) || "unknown reason");
+
+    // Neither ticked still saves the poster, which is a real outcome worth
+    // naming rather than returning an empty string.
+    return parts.length ? parts.join(" ") : "Poster saved.";
 }
 
 export async function publishRecruitmentPost(teamId, payload = {}) {
@@ -259,6 +296,44 @@ export async function publishRecruitmentPost(teamId, payload = {}) {
 
         const saved = await wixData.insert("RecruitmentPosts", row, OPTIONS);
 
+        // ⚠️ toWebsite USED TO DO NOTHING. The poster was uploaded and the row
+        // saved, and that was it - nothing on the public site reads
+        // RecruitmentPosts, so a manager ticked "post to the website", got a
+        // success message, and nothing ever appeared. The header always said
+        // blog.jsw was the route; it simply was not wired.
+        //
+        // Same pattern as teamAdmin.jsw's news publish, including its lesson:
+        // memberId is REQUIRED and createBlogPost throws without it. This block
+        // is wrapped in a catch, so passing null once failed completely
+        // silently. The catch is deliberately LOUD for that reason.
+        let blogPostId = "";
+        if (toWebsite) {
+            try {
+                const blog = await createBlogPost({
+                    title: blogTitle(payload),
+                    bodyHtml: blogBody(payload, row.contactName),
+                    // The wix:image:// URI, NOT the https URL - blog.jsw wants
+                    // the URI form for the cover image. An https one gives
+                    // "Media image not found".
+                    featuredImage: posterUri,
+                    memberId: ctx.memberId
+                });
+                blogPostId = (blog && blog.blogPostId) || "";
+                if (blogPostId) {
+                    const fresh = await wixData.get("RecruitmentPosts", saved._id, OPTIONS);
+                    fresh.blogPostId = blogPostId;
+                    await wixData.update("RecruitmentPosts", fresh, OPTIONS);
+                }
+            } catch (blogErr) {
+                // Non-fatal: the poster and the record are already saved, so a
+                // blog failure must not lose the manager's work. But it has to
+                // be loud - a silent catch here is what hid the missing-author
+                // bug on the news form.
+                console.error("[recruitment] blog publish FAILED, poster still saved. reason:",
+                    blogErr && blogErr.message, blogErr);
+            }
+        }
+
         // ⚠️ SENT AFTER THE ROW IS SAVED, ON PURPOSE. A Facebook outage must
         // not lose a poster the manager just spent ten minutes on - the record
         // and the image survive regardless, and the post can be retried.
@@ -287,11 +362,13 @@ export async function publishRecruitmentPost(teamId, payload = {}) {
             posterUri,
             posterUrl,
             status: row.status,
+            blogPostId,
+            websitePosted: toWebsite ? !!blogPostId : null,
             facebook: fbResult
                 ? { posted: fbResult.success, error: fbResult.error || "",
                     tokenProblem: !!fbResult.tokenProblem }
                 : null,
-            message: buildMessage(toWebsite, toFacebook, row.status, fbResult)
+            message: buildMessage(toWebsite, toFacebook, row.status, fbResult, blogPostId)
         };
     } catch (error) {
         console.error("publishRecruitmentPost error:", error);
