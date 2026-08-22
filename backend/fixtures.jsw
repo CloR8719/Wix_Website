@@ -606,6 +606,14 @@ export async function createFixture(teamId, form) {
         fields.rsvpRolledUp = false;
 
         const saved = await wixData.insert("fixtures", fields, OPTIONS);
+
+        // Work the counts out straight away rather than waiting for the first
+        // reply. Without this a brand-new fixture reports "0 no reply" when the
+        // truth is "nobody has been asked yet" - which read as nothing to chase
+        // and hid the nudge button. One extra squad query per fixture CREATED
+        // is not a cost worth optimising away.
+        await refreshFixtureCounts(saved._id);
+
         return { success: true, id: saved._id };
     } catch (error) {
         console.error("createFixture error:", error);

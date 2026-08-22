@@ -372,13 +372,32 @@ class ManagerHubFixtures extends HTMLElement {
                        ${f.squadPublished ? "Squad sent ✓" : "Pick squad"}
                      </button>`
                   : ""}
-              ${!f.past && f.noReply
-                  ? `<button type="button" class="btn ghost small" data-act="nudgeReplies" data-id="${esc(f.id)}">
-                       Nudge ${f.noReply}
-                     </button>`
-                  : ""}
+              ${this.nudgeBtn(f)}
             </div>
           </div>`;
+    }
+
+    // ⚠️ CANNOT JUST TEST f.noReply. The counts are only computed when a
+    // parent ANSWERS - createFixture writes three zeroes - so a fixture nobody
+    // has replied to reports "0 no reply", and gating on that hid the button
+    // on exactly the fixtures that needed it most.
+    //
+    // The TOTAL is what separates the two cases: zero across all three means
+    // the counts were never worked out, not that everybody answered.
+    nudgeBtn(f) {
+        if (f.past || f.rolledUp) return "";
+
+        const total = (Number(f.accepted) || 0) + (Number(f.declined) || 0) + (Number(f.noReply) || 0);
+
+        // Counts are real and everyone has answered - nothing to chase.
+        if (total > 0 && !f.noReply) return "";
+
+        // Only claim a number when one has actually been calculated.
+        const label = total > 0 ? "Nudge " + Number(f.noReply) : "Chase replies";
+
+        return `<button type="button" class="btn ghost small" data-act="nudgeReplies" data-id="${esc(f.id)}">
+                  ${esc(label)}
+                </button>`;
     }
 
     whoHtml(f) {
