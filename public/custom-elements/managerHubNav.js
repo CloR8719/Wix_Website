@@ -36,7 +36,7 @@
 //  bottom bar has no room and the topbar already carries it.
 //  Media Manager -> right-click -> Copy URL (the https://static.wixstatic.com
 //  one). A `wix:image://` URI will NOT work as an <img> src. Blank hides it.
-const CREST_URL = "";
+const CREST_URL = "https://static.wixstatic.com/media/1c0088_cee7211f27184a17a5b42fc2c20d8571~mv2.png";
 
 // ⚠️ OFF by default - try Wix's "Pin to Screen" first. Flip to true only if
 // Wix won't let you pin on mobile alone. See the note in the styles below for

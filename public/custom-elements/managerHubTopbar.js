@@ -26,7 +26,7 @@
 //  Media Manager -> right-click -> Copy URL (the https://static.wixstatic.com
 //  one). A `wix:image://` URI will NOT work as an <img> src. Leave blank and
 //  the club initials show instead, so nothing renders broken.
-const CREST_URL = "";
+const CREST_URL = "https://static.wixstatic.com/media/1c0088_cee7211f27184a17a5b42fc2c20d8571~mv2.png";
 const CLUB_INITIALS = "SA";
 
 // Relative on purpose - keeps the link correct on the live site, the test
