@@ -563,14 +563,21 @@ class ParentHubFixtures extends HTMLElement {
         }).join("");
 
         const label = kid.isSub
-            ? who + " is on the bench for this one"
+            ? who + " is a sub for this one"
             : who + " is playing in this position";
 
-        // The bench sits UNDER the pitch, the way a real one does. Only this
-        // child is named on it, exactly as on the pitch itself - the other subs
-        // are as anonymous as the starters.
+        // Sits UNDER the pitch, the way a real bench does. Only this child is
+        // named on it, exactly as on the pitch itself - the other subs are as
+        // anonymous as the starters.
+        //
+        // ⚠️ LABELLED "SUB", NOT "BENCH", and that is deliberate. Being
+        // "benched" means being dropped; being a sub is just this week's
+        // rotation, which is what it actually is at junior level. Same reason
+        // the message wording is identical to a starter's. The manager's own
+        // screen still says bench - that is a different audience having a
+        // different conversation.
         const bench = kid.isSub
-            ? '<div class="mbench"><span class="mbench-label">Bench</span>' +
+            ? '<div class="mbench"><span class="mbench-label">Sub</span>' +
               '<span class="mshirt mine">' + who + "</span></div>"
             : "";
 
