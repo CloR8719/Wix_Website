@@ -603,11 +603,17 @@ error blames the URL.
 
 ### Who can post straight out
 
-**Admin posts immediately** (`ctx.perms.allTeams`); everyone else still holds
-at `status: "pending"`. Twenty volunteer managers with one-tap access to the
-club's public voice and no undo is a different risk from one secretary having
-it. Opening it up is one condition in `publishRecruitmentPost` — but the
-default should be the cautious one.
+**Every manager, no approval step** (decided 2026-08-22). The earlier caution
+was about giving volunteers a channel for free text — it does not apply here.
+`extraLine`, `clubName`, `ageGroup`, `teamName` and the training details are
+all typed by the manager and all **drawn onto the poster**, which already goes
+public on the club website. Facebook is a second destination for content they
+could already publish, not a new way to say something new.
+
+The `pending` status stays in the schema for **POTM**, which is a different
+case: those posts carry a child's photograph. Note that **nothing approves a
+pending row today** — re-enabling the hold without building that screen would
+strand posts.
 
 **The send happens after the row is saved**, so a Facebook outage never loses
 a poster somebody just spent ten minutes on.

@@ -25,15 +25,12 @@
 //
 //  FACEBOOK IS WIRED (2026-08-22) via backend/facebook.jsw.
 //
-//  ⚠️ WHO CAN POST STRAIGHT TO FACEBOOK IS A PERMISSION, NOT A SETTING.
-//  An Admin posts immediately - that is what Rob asked for and he is the
-//  one who owns the Page. Everyone else still holds at `pending`.
-//
-//  The reason for the split rather than opening it to all: twenty
-//  volunteer managers with one-tap access to the club's public voice and
-//  no undo is a different risk from one secretary having it. Nothing
-//  stops it being opened up later - it is one condition below - but the
-//  default should be the cautious one.
+//  EVERY MANAGER POSTS STRAIGHT OUT, decided 2026-08-22. Every field a
+//  manager types is already drawn onto the poster and the poster already
+//  goes public on the club website - so Facebook is a second destination
+//  for content they could already publish, not a new channel for free
+//  text. The `pending` status remains in the schema for POTM, which is a
+//  different case: those posts carry a child's photograph.
 // =====================================================================
 
 import wixData from 'wix-data';
@@ -218,10 +215,20 @@ export async function publishRecruitmentPost(teamId, payload = {}) {
             // club's public voice and twenty managers would otherwise have
             // one-tap access with no undo. Website-only can go straight out -
             // the news form already works that way.
-            // An Admin's Facebook post goes out now, so it is published the
-            // moment it is written rather than waiting on an approval step
-            // that would only ever be them approving themselves.
-            status: (toFacebook && !ctx.perms.allTeams) ? "pending" : "published",
+            // EVERY manager posts straight out - no approval step.
+            //
+            // The earlier caution was about handing volunteers a channel for
+            // free text. It does not apply: extraLine, clubName, ageGroup,
+            // teamName and the training details are all typed by the manager
+            // and all DRAWN ONTO THE POSTER, which already goes public on the
+            // club website. Facebook is a second destination for content they
+            // could already publish, not a new way to say something new.
+            //
+            // To reintroduce approval, make this
+            //   (toFacebook && !ctx.perms.allTeams) ? "pending" : "published"
+            // and build the screen that clears the queue - nothing approves a
+            // pending row today, so it would strand posts if added blind.
+            status: "published",
             createdByStaff: ctx.staffId,
             publishedDate: new Date()
         };
