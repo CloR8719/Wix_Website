@@ -30,12 +30,21 @@
 //  that, pixel values silently drift. Measured by Rob in the layout editor.
 // =====================================================================
 
-// ⚠️ FILL THESE IN. Media Manager -> right-click -> Copy URL, the
+// Set 2026-08-22. Media Manager -> right-click -> Copy URL, the
 // https://static.wixstatic.com one. A wix:image:// URI will NOT load here.
-// Leave blank and the poster still works - it draws on a plain dark ground so
-// the layout is checkable - but it won't look like the real thing.
-const TEMPLATE_URL = "";
-const CREST_URL = "";
+//
+// ⚠️ DON'T LET THESE GO BLANK. The poster still renders without them - on a
+// plain dark ground, so the layout stays checkable - which means an empty
+// value degrades quietly instead of erroring. That is exactly how they sat
+// empty in the repo while the live copy had them, and any paste of this file
+// would have silently wiped the real poster. Values live here now so the
+// repo and the live element agree.
+//
+// Both are loaded with crossOrigin="anonymous" because they are drawn onto a
+// canvas - a tainted canvas makes toDataURL() throw, so publishing would fail
+// rather than just look wrong.
+const TEMPLATE_URL = "https://static.wixstatic.com/media/1c0088_2bfd4b74e3c24a4ba5f92d647e6428b6~mv2.jpg";
+const CREST_URL = "https://static.wixstatic.com/media/1c0088_cee7211f27184a17a5b42fc2c20d8571~mv2.png";
 
 // ⚠️ TEMPORARY LAYOUT TOOL. Flip to true, republish, and the poster becomes
 // draggable with a coordinate panel underneath it. Position everything, copy
