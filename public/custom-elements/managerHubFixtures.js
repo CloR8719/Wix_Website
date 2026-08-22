@@ -88,10 +88,10 @@ const STYLES = `
   /* A one-line result for an action that changes nothing visible - sending
      reminders leaves every count exactly as it was, so without this a manager
      presses the button and cannot tell whether anything happened. */
-  .flash {
-    margin-bottom: 14px; padding: 10px 12px; border-radius: 9px;
+  .nudged {
+    margin-top: 10px; padding: 9px 11px; border-radius: 8px;
     background: var(--accent-soft); color: var(--text);
-    font-size: 12.5px; font-weight: 600; line-height: 1.5;
+    font-size: 12px; font-weight: 600; line-height: 1.45;
   }
 
   .nothing {
@@ -309,7 +309,6 @@ class ManagerHubFixtures extends HTMLElement {
         };
 
         body.innerHTML = `
-          ${d.flash ? `<div class="flash">${esc(d.flash)}</div>` : ""}
           ${upcoming.length
               ? group(upcoming)
               : `<div class="nothing">
@@ -374,6 +373,7 @@ class ManagerHubFixtures extends HTMLElement {
                   : ""}
               ${this.nudgeBtn(f)}
             </div>
+            ${this.nudgeMsg(f)}
           </div>`;
     }
 
@@ -384,6 +384,11 @@ class ManagerHubFixtures extends HTMLElement {
     //
     // The TOTAL is what separates the two cases: zero across all three means
     // the counts were never worked out, not that everybody answered.
+    // ⚠️ FEEDBACK BELONGS ON THE CARD THAT WAS PRESSED. This used to set a
+    // flash at the top of the whole list, so a manager who had scrolled down
+    // to a fixture pressed Nudge and saw nothing happen - the confirmation was
+    // off-screen above them. Sending reminders changes no count either, so
+    // there is nothing else on the card that moves.
     nudgeBtn(f) {
         if (f.past || f.rolledUp) return "";
 
@@ -395,9 +400,18 @@ class ManagerHubFixtures extends HTMLElement {
         // Only claim a number when one has actually been calculated.
         const label = total > 0 ? "Nudge " + Number(f.noReply) : "Chase replies";
 
-        return `<button type="button" class="btn ghost small" data-act="nudgeReplies" data-id="${esc(f.id)}">
-                  ${esc(label)}
+        const busy = !!(this._data.nudging && this._data.nudging[f.id]);
+
+        return `<button type="button" class="btn ghost small" data-act="nudgeReplies"
+                    data-id="${esc(f.id)}" ${busy ? "disabled" : ""}>
+                  ${busy ? "Sending…" : esc(label)}
                 </button>`;
+    }
+
+    // Sits under the buttons of the card it belongs to.
+    nudgeMsg(f) {
+        const msg = (this._data.nudged && this._data.nudged[f.id]) || "";
+        return msg ? `<div class="nudged">${esc(msg)}</div>` : "";
     }
 
     whoHtml(f) {

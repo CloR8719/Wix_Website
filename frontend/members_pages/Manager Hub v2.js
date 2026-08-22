@@ -941,21 +941,36 @@ function wireEverything() {
 
         $w("#customMgrFixtures").on("nudgeReplies", async (e) => {
             const fid = (e && e.detail && e.detail.fixtureId) || "";
-            if (!fid) return;
+            // Every outcome below writes a visible line onto the card, so if
+            // NOTHING appears the event never arrived - this says which.
+            console.log("[ManagerHub] nudge pressed for fixture", fid, "model:", !!fixturesModel);
+            if (!fid || !fixturesModel) return;
+
+            // Marked busy BEFORE the round trip. Sending reminders changes no
+            // count on the card, so without this the whole action is invisible
+            // until it finishes.
+            fixturesModel.nudging = Object.assign({}, fixturesModel.nudging, { [fid]: true });
+            fixturesModel.nudged = Object.assign({}, fixturesModel.nudged, { [fid]: "" });
+            pushFixtures();
+
+            let msg;
             try {
                 const res = await nudgeNoReplies(teamId(), fid);
-                // Reloading rather than patching: the reminder doesn't change
-                // any count, but a manager who just pressed it should see the
-                // list settle rather than wonder whether it worked.
-                if (fixturesModel) {
-                    fixturesModel.flash = (res && res.success)
-                        ? (res.asked === 0 ? "Everyone's already replied." :
-                           "Reminder sent about " + res.asked + (res.asked === 1 ? " player." : " players."))
-                        : ((res && res.error) || "Couldn't send those reminders.");
-                    pushFixtures();
-                }
+                msg = (res && res.success)
+                    ? (res.asked === 0
+                        ? "Everyone's already replied."
+                        : "Reminder sent to the parents of " + res.asked +
+                          (res.asked === 1 ? " player." : " players."))
+                    : ((res && res.error) || "Couldn't send those reminders.");
             } catch (err) {
                 console.error("[ManagerHub] nudgeReplies:", err);
+                msg = "Couldn't send those reminders just now.";
+            }
+
+            if (fixturesModel) {
+                fixturesModel.nudging = Object.assign({}, fixturesModel.nudging, { [fid]: false });
+                fixturesModel.nudged = Object.assign({}, fixturesModel.nudged, { [fid]: msg });
+                pushFixtures();
             }
         });
 
