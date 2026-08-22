@@ -471,3 +471,68 @@ that job and RSVP numbers on a played game still need to be readable.
 The Home teaser was checked against this and does **not** show past fixtures —
 verified against all three storage shapes `date_only` could take (string,
 Date at UTC midnight, Date at BST local midnight).
+
+---
+
+## Squad selection (2026-08-22)
+
+Who's actually playing, on top of who said they're available.
+
+### CMS — before this works
+
+`fixtures`: `squadFormat` (Number), `squadShape` (Text), `squadSelected` (Text),
+`squadSubs` (Text), `squadPublished` (Boolean), `meetTime` (Text),
+`meetPlace` (Text).
+`Teams`: `T_matchFormat` (Number) — the team's usual format, copied onto the
+fixture the first time a squad is picked so changing it next season doesn't
+rewrite last year's line-ups.
+
+Editor: state `stateSquadPick` with `manager-hub-squad-pick` → `#customSquadPick`.
+
+### The formation rule
+
+**A formation is just a list of row sizes.** `4-4-2` is rows of 4, 4 and 2,
+valid at 11-a-side because they sum to 10 and the keeper is the 11th.
+`sum === format - 1` means a keeper; `sum === format` means none, and that
+second reading is **capped at 4-a-side** (`NO_KEEPER_MAX`) — without the cap,
+`4-4-2-1` was accepted at 11v11 as "eleven outfield players", which is
+arithmetically consistent and nonsense on a pitch.
+
+One rule covers every format and shape, so **there is no table of formations
+anywhere**. The presets in the element are convenience buttons; a manager can
+type anything that adds up. `NO_KEEPER_MAX` is declared in both
+`fixtures.jsw` and `managerHubSquadPick.js` and **must stay equal** — two
+answers to "does this shape need a keeper" is how the pitch and the save
+disagree.
+
+### Rules enforced on the server, not just the screen
+
+- **A parent who said no cannot be picked.** Refused by `saveSquad`, not merely
+  greyed out — a disabled look that still works on tap is worse than no block.
+  "No reply" is silence, not a no, so those *are* selectable and carry an amber
+  marker onto the pitch.
+- No player twice; unknown ids refused; slots that no longer exist dropped.
+- Only `Match` and `Tournament`, and only in the future.
+
+### What the parent gets
+
+`squadInfoFor()` sends **only whether this parent's own child is in it** —
+never the line-up. Withholding it server-side is the enforcement; hiding it in
+CSS would be theatre, since anything delivered to a browser is readable there.
+
+A parent whose child wasn't picked gets **nothing at all** — no message, no
+"not selected", no list to count themselves out of. Starters and subs get the
+identical message except for the position.
+
+The mini pitch shows **only their own child named**, every other shirt blank.
+`SHOW_PARENT_PITCH` at the top of `parentHubFixtures.js` turns it off. Its one
+consequence: a starter and a sub become distinguishable. That's a judgement
+call, not a bug.
+
+### The nudge
+
+`nudgeNoReplies` writes one ParentMessages row per parent of anyone who hasn't
+answered. Separate from selection deliberately — it's useful on any fixture,
+picked or not. Because sending reminders changes no count on screen, the
+fixtures element gained a `flash` slot; without it a manager presses the button
+and can't tell whether anything happened.

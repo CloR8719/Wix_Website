@@ -113,6 +113,44 @@ const STYLES = `
     background: var(--critical-bg); border-color: var(--critical); color: var(--critical);
   }
 
+  /* ---------- squad selection ---------- */
+  .squad {
+    margin-top: 11px; padding: 11px 12px; border-radius: 10px;
+    background: var(--success-bg); border: 1px solid var(--success);
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .squad-tag {
+    font-size: 10px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase;
+    color: var(--success);
+  }
+  .squad .meet { font-size: 12.5px; color: var(--text); line-height: 1.5; }
+
+  /* A small pitch, drawn not loaded. Only THIS child is named; every other
+     shirt is deliberately blank, so there is no team sheet here. */
+  .mpitch {
+    position: relative; width: 100%; max-width: 190px; aspect-ratio: 68 / 100;
+    border-radius: 8px; overflow: hidden; align-self: center;
+    background: repeating-linear-gradient(to top, #4A8A5C 0 8%, #3F7D4E 8% 16%);
+    border: 1.5px solid rgba(255,255,255,.34);
+    display: grid; padding: 6px 4px;
+  }
+  .mpitch::before {
+    content: ""; position: absolute; left: 0; right: 0; top: 50%;
+    border-top: 1.5px solid rgba(255,255,255,.34);
+  }
+  .mrow { display: flex; align-items: center; justify-content: space-evenly; gap: 2px; position: relative; z-index: 2; }
+  .mshirt {
+    width: 15px; height: 15px; border-radius: 50%;
+    background: rgba(255,255,255,.34); flex-shrink: 0;
+  }
+  .mshirt.mine {
+    width: auto; min-width: 15px; height: auto; border-radius: 999px;
+    background: #FFFFFF; color: #16212F;
+    font-size: 8.5px; font-weight: 800; padding: 3px 7px; line-height: 1.1;
+    box-shadow: 0 0 0 2px rgba(255,255,255,.45);
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
   .kid-msg { flex-basis: 100%; font-size: 11.5px; color: var(--critical); font-weight: 600; }
 
   /* The fold. Everything past the reply window lives behind this, because
@@ -226,6 +264,30 @@ function isFinished(fixture) {
     const endsAt = (stop !== null ? stop : start + ASSUMED_DURATION_MINUTES) + GRACE_MINUTES;
 
     return ((now.getHours() * 60) + now.getMinutes()) > endsAt;
+}
+
+// Set to false for the text-only parent view (no pitch, no position).
+const SHOW_PARENT_PITCH = true;
+
+function parseShape(str) {
+    const parts = String(str || "").trim().split(/[^0-9]+/).filter(Boolean).map(Number);
+    if (!parts.length) return null;
+    if (parts.some(function (x) { return x < 1 || x > 9; })) return null;
+    return parts;
+}
+
+// "09:15" -> "9.15am". Parents read a meet-up time, not a 24-hour clock.
+function timeWords(value) {
+    const v = String(value || "").trim();
+    if (!v) return "";
+    const m = v.match(/^([0-9]{1,2}):([0-9]{2})/);
+    if (!m) return v;
+    let h = Number(m[1]);
+    const mins = m[2];
+    const suffix = h >= 12 ? "pm" : "am";
+    h = h % 12;
+    if (h === 0) h = 12;
+    return mins === "00" ? (h + suffix) : (h + "." + mins + suffix);
 }
 
 function esc(value) {
@@ -414,7 +476,74 @@ class ParentHubFixtures extends HTMLElement {
               </button>
             </div>
             ${error ? `<span class="kid-msg">${esc(error)}</span>` : ""}
+            ${this.squadHtml(kid)}
           </div>`;
+    }
+
+    // ⚠️ ONLY EVER ABOUT THIS CHILD. The backend never sends the rest of the
+    // line-up, so there is nothing here to leak - a parent whose child wasn't
+    // picked simply gets nothing, with no "not selected" message and no list
+    // to count themselves out of.
+    //
+    // A sub gets the IDENTICAL wording minus the position. The bench is not a
+    // tier to hand a parent in writing.
+    squadHtml(kid) {
+        if (!kid || !kid.squadPublished || !kid.inSquad) return "";
+
+        const meet = kid.meetTime
+            ? `<div class="meet"><b>Meet ${esc(timeWords(kid.meetTime))}</b>${
+                 kid.meetPlace ? " at " + esc(kid.meetPlace) : ""}</div>`
+            : "";
+
+        return `
+          <div class="squad">
+            <div class="squad-top">
+              <span class="squad-tag">In the squad</span>
+            </div>
+            ${SHOW_PARENT_PITCH ? this.miniPitch(kid) : ""}
+            ${meet}
+          </div>`;
+    }
+
+    // The child's own position on a pitch, every other shirt blank. Gives a
+    // kid the "I'm playing right back" moment without publishing a team sheet.
+    //
+    // Set SHOW_PARENT_PITCH to false at the top of this file to drop back to
+    // the text-only version - the one consequence of showing it is that a
+    // starter and a sub become distinguishable, which is a judgement call
+    // rather than a bug.
+    miniPitch(kid) {
+        const rows = parseShape(kid.shape);
+        const format = Number(kid.format) || 0;
+        if (!rows || !format) return "";
+
+        const sum = rows.reduce(function (a, b) { return a + b; }, 0);
+        const keeper = sum === format - 1;
+        if (!keeper && sum !== format) return "";
+
+        const lines = [];
+        if (keeper) lines.push(1);
+        rows.forEach(function (r) { lines.push(r); });
+
+        const firstId = [];
+        let running = 0;
+        lines.forEach(function (l) { firstId.push(running); running += l; });
+
+        const mine = Number(kid.slot);
+        const html = lines.slice().reverse().map(function (count, ri) {
+            const base = firstId[lines.length - 1 - ri];
+            let cells = "";
+            for (let i = 0; i < count; i++) {
+                const isMine = (base + i) === mine;
+                cells += '<span class="mshirt' + (isMine ? " mine" : "") + '">' +
+                         (isMine ? esc(kid.firstName || "You") : "") + "</span>";
+            }
+            return '<div class="mrow">' + cells + "</div>";
+        }).join("");
+
+        return '<div class="mpitch" style="grid-template-rows:repeat(' + lines.length + ',1fr)" ' +
+               'role="img" aria-label="' + esc(kid.firstName || "Your child") +
+               ' is playing in this position">' + html + "</div>";
     }
 }
 

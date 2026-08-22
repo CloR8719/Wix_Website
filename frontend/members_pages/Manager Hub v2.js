@@ -40,7 +40,8 @@ import {
 
 import {
     getTeamFixtures, createFixture, updateFixture,
-    deleteFixture, getTeamFixtureResponses, getManagerWeekFixtures
+    deleteFixture, getTeamFixtureResponses, getManagerWeekFixtures,
+    getSquadPicker, saveSquad, publishSquad, nudgeNoReplies
 } from 'backend/fixtures.jsw';
 
 import { getComposeContext, sendManagerMessage, getSentMessages } from 'backend/messages.jsw';
@@ -79,7 +80,8 @@ const TAB_TITLES = {
     stateStatsAdd:       { title: "Add stats",       sub: "" },
     stateStatsEdit:      { title: "Edit records",    sub: "" },
     stateShare:          { title: "Join link",       sub: "QR code and link" },
-    stateEnquiryAdd:     { title: "Add an enquiry",  sub: "Taken by hand" }
+    stateEnquiryAdd:     { title: "Add an enquiry",  sub: "Taken by hand" },
+    stateSquadPick:      { title: "Pick the squad",  sub: "" }
 };
 
 // The five with a nav item. Everything else is a drill-down and keeps the
@@ -104,7 +106,7 @@ let messagesModel = null, composeModel = null;
 let moreModel = null, recruitModel = null;
 let teamProfileModel = null, staffModel = null, sponsorsModel = null, newsModel = null;
 let statsModel = null, statsAddModel = null, statsEditModel = null;
-let shareModel = null, enquiryAddModel = null;
+let shareModel = null, enquiryAddModel = null, squadPickModel = null;
 // Cached for the session - the dictionary and age-group bounds don't change
 // between one enquiry and the next, and a manager taking two families' details
 // in a row shouldn't wait twice.
@@ -156,6 +158,7 @@ const pushStatsAdd    = () => push("#customStatsAdd", statsAddModel);
 const pushStatsEdit   = () => push("#customStatsEdit", statsEditModel);
 const pushShare       = () => push("#customShare", shareModel);
 const pushEnquiryAdd  = () => push("#customEnquiryAdd", enquiryAddModel);
+const pushSquadPick   = () => push("#customSquadPick", squadPickModel);
 
 function paintNav() {
     // The nav highlights the last MAIN tab, so drilling into a player keeps
@@ -519,6 +522,62 @@ async function loadRecruit() {
 }
 
 // ==========================================
+// SQUAD SELECTION
+// ==========================================
+
+async function loadSquadPick(fixtureId) {
+    const tid = teamId();
+    if (!tid || !fixtureId) return;
+
+    squadPickModel = { loading: true };
+    pushSquadPick();
+    goTo("stateSquadPick");
+
+    try {
+        const res = await getSquadPicker(tid, fixtureId);
+        squadPickModel = (res && res.success)
+            ? res
+            : { error: (res && res.error) || "Couldn't load that squad." };
+    } catch (err) {
+        console.error("[ManagerHub] loadSquadPick:", err);
+        squadPickModel = { error: "Couldn't load that squad just now." };
+    }
+    pushSquadPick();
+}
+
+// Save, publish and nudge differ only in which backend call runs and what the
+// success line says, so they share everything else - including the rule that a
+// failure must leave the manager's typed selection exactly where it was.
+async function runSquadAction(e, run, describe) {
+    const d = (e && e.detail) || {};
+    if (!d.fixtureId || !squadPickModel) return;
+
+    squadPickModel = Object.assign({}, squadPickModel, { busy: true, error: "", done: "" });
+    pushSquadPick();
+
+    try {
+        const res = await run(d.fixtureId, d.form);
+
+        // ⚠️ PATCHED, NOT RELOADED. getSquadPicker would come back with the
+        // saved selection and the element seeds from the model - so a reload
+        // here would be fine after a save, and would silently DISCARD the
+        // manager's work after a failure. Patching keeps both cases honest.
+        squadPickModel = Object.assign({}, squadPickModel, {
+            busy: false,
+            done: (res && res.success) ? describe(res) : "",
+            error: (res && res.success) ? "" : ((res && res.error) || "That didn't work."),
+            published: (res && res.success && res.reach !== undefined) ? true : squadPickModel.published
+        });
+    } catch (err) {
+        console.error("[ManagerHub] runSquadAction:", err);
+        squadPickModel = Object.assign({}, squadPickModel, {
+            busy: false, error: "That didn't work just now."
+        });
+    }
+    pushSquadPick();
+}
+
+// ==========================================
 // JOIN LINK / MANUAL ENQUIRY
 // ==========================================
 
@@ -873,6 +932,28 @@ function wireEverything() {
     safeWire("#customMgrFixtures", () => {
         $w("#customMgrFixtures").on("addFixture", () => openFixtureForm(null));
 
+        $w("#customMgrFixtures").on("pickSquad", (e) => loadSquadPick((e && e.detail && e.detail.fixtureId) || ""));
+
+        $w("#customMgrFixtures").on("nudgeReplies", async (e) => {
+            const fid = (e && e.detail && e.detail.fixtureId) || "";
+            if (!fid) return;
+            try {
+                const res = await nudgeNoReplies(teamId(), fid);
+                // Reloading rather than patching: the reminder doesn't change
+                // any count, but a manager who just pressed it should see the
+                // list settle rather than wonder whether it worked.
+                if (fixturesModel) {
+                    fixturesModel.flash = (res && res.success)
+                        ? (res.asked === 0 ? "Everyone's already replied." :
+                           "Reminder sent about " + res.asked + (res.asked === 1 ? " player." : " players."))
+                        : ((res && res.error) || "Couldn't send those reminders.");
+                    pushFixtures();
+                }
+            } catch (err) {
+                console.error("[ManagerHub] nudgeReplies:", err);
+            }
+        });
+
         $w("#customMgrFixtures").on("editFixture", (e) => {
             const id = e && e.detail && e.detail.fixtureId;
             const fixture = fixturesModel && (fixturesModel.fixtures || []).find(f => f.id === id);
@@ -1069,6 +1150,26 @@ function wireEverything() {
             }
             pushEnquiryAdd();
         });
+    });
+
+    // ---- squad picker ----
+    safeWire("#customSquadPick", () => {
+        const el = $w("#customSquadPick");
+
+        el.on("cancelSquadPick", () => { goTo("stateFixtures"); loadFixtures(); });
+
+        el.on("saveSquad", (e) => runSquadAction(e, saveSquad, (res) =>
+            "Saved — " + res.placed + " on the pitch, " + res.subs + " on the bench."));
+
+        el.on("publishSquad", (e) => runSquadAction(e, publishSquad, (res) =>
+            "Sent to " + res.reach + (res.reach === 1 ? " parent" : " parents") +
+            " for " + res.picked + (res.picked === 1 ? " player." : " players.")));
+
+        el.on("nudgeReplies", (e) => runSquadAction(e, (fid, form) => nudgeNoReplies(teamId(), fid), (res) =>
+            res.asked === 0
+                ? "Everyone's already replied."
+                : "Reminder sent to " + res.reach + (res.reach === 1 ? " parent" : " parents") +
+                  " about " + res.asked + (res.asked === 1 ? " player." : " players.")));
     });
 
     // ---- recruitment ----

@@ -23,6 +23,10 @@
 //  them and the number starts rewarding whoever taps yes most reliably.
 // =====================================================================
 
+// Must match PLAYING_EVENT_TYPES in squadRules.js. Squads exist only for the
+// events a training-only child is already excluded from — one rule, not two.
+const PLAYING_TYPES = ["Match", "Tournament"];
+
 const TYPE_TONE = {
     Match: "t-info", Tournament: "t-violet",
     Training: "t-accent", Event: "t-neutral"
@@ -81,6 +85,15 @@ const STYLES = `
     font-size: 10.5px; font-weight: 700; letter-spacing: .07em;
     text-transform: uppercase; color: var(--text-faint); margin-bottom: 14px;
   }
+  /* A one-line result for an action that changes nothing visible - sending
+     reminders leaves every count exactly as it was, so without this a manager
+     presses the button and cannot tell whether anything happened. */
+  .flash {
+    margin-bottom: 14px; padding: 10px 12px; border-radius: 9px;
+    background: var(--accent-soft); color: var(--text);
+    font-size: 12.5px; font-weight: 600; line-height: 1.5;
+  }
+
   .nothing {
     padding: 22px 16px; text-align: center;
     border: 1px dashed var(--line); border-radius: 12px;
@@ -296,6 +309,7 @@ class ManagerHubFixtures extends HTMLElement {
         };
 
         body.innerHTML = `
+          ${d.flash ? `<div class="flash">${esc(d.flash)}</div>` : ""}
           ${upcoming.length
               ? group(upcoming)
               : `<div class="nothing">
@@ -352,6 +366,16 @@ class ManagerHubFixtures extends HTMLElement {
               </button>
               ${!f.rolledUp
                   ? `<button type="button" class="btn ghost small" data-act="editFixture" data-id="${esc(f.id)}">Edit</button>`
+                  : ""}
+              ${!f.past && PLAYING_TYPES.indexOf(f.eventType) !== -1
+                  ? `<button type="button" class="btn ghost small" data-act="pickSquad" data-id="${esc(f.id)}">
+                       ${f.squadPublished ? "Squad sent ✓" : "Pick squad"}
+                     </button>`
+                  : ""}
+              ${!f.past && f.noReply
+                  ? `<button type="button" class="btn ghost small" data-act="nudgeReplies" data-id="${esc(f.id)}">
+                       Nudge ${f.noReply}
+                     </button>`
                   : ""}
             </div>
           </div>`;

@@ -86,6 +86,43 @@ function dayLabel(eventDate, today) {
     return eventDate.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
 }
 
+// What ONE child's parent is allowed to know about the selection: whether
+// their own child is in it, and where to be. Never who else was picked.
+//
+// Starters and subs are told the same thing except for the position, which is
+// absent for a sub rather than replaced with the word "bench" - the bench is
+// not a tier a parent should be handed in writing.
+function squadInfoFor(fixture, playerId) {
+    if (fixture.squadPublished !== true) return { squadPublished: false };
+
+    let selected = {}, subs = [];
+    try { selected = JSON.parse(fixture.squadSelected || "{}") || {}; } catch (e) { selected = {}; }
+    try { subs = JSON.parse(fixture.squadSubs || "[]") || []; } catch (e) { subs = []; }
+
+    let slot = -1;
+    for (const k in selected) {
+        if (String(selected[k]) === String(playerId)) { slot = Number(k); break; }
+    }
+    const isSub = subs.map(String).indexOf(String(playerId)) !== -1;
+    if (slot === -1 && !isSub) return { squadPublished: true, inSquad: false };
+
+    const info = {
+        squadPublished: true,
+        inSquad: true,
+        meetTime: fixture.meetTime || "",
+        meetPlace: fixture.meetPlace || ""
+    };
+
+    // The shape is sent so the parent's pitch can be drawn with the right
+    // number of anonymous shirts - it reveals a formation, not a team.
+    if (slot !== -1) {
+        info.slot = slot;
+        info.shape = fixture.squadShape || "";
+        info.format = Number(fixture.squadFormat) || 0;
+    }
+    return info;
+}
+
 // Returns every upcoming fixture for this parent's children, each with the
 // children it applies to and their current response.
 export async function getParentFixtures(parentProfileId) {
@@ -182,7 +219,15 @@ export async function getParentFixtures(parentProfileId) {
                     id: k._id,
                     name: `${k.SP_firstName || ""} ${k.SP_lastName || ""}`.trim(),
                     firstName: k.SP_firstName || "",
-                    response: responseFor(f._id, k._id)
+                    response: responseFor(f._id, k._id),
+                    // ⚠️ ONLY EVER ABOUT THIS PARENT'S OWN CHILD. The full
+                    // line-up is deliberately NOT sent to the browser - a
+                    // parent whose child wasn't picked has nothing new to see,
+                    // and there is no team sheet to count yourself out of.
+                    // Withholding it here is the enforcement; hiding it in CSS
+                    // would be theatre, since anything delivered to a browser
+                    // is readable in that browser.
+                    ...squadInfoFor(f, k._id)
                 }));
 
             if (forKids.length === 0) return null;
@@ -492,7 +537,11 @@ export async function getTeamFixtures(teamId) {
                 accepted: Number(f.rsvpAcceptedCount) || 0,
                 declined: Number(f.rsvpDeclinedCount) || 0,
                 noReply: Number(f.rsvpNoReplyCount) || 0,
-                rolledUp: f.rsvpRolledUp === true
+                rolledUp: f.rsvpRolledUp === true,
+                // ⚠️ === true, never a truthiness check. This column was added
+                // to a collection that already had rows, so every existing
+                // fixture has it UNSET rather than false.
+                squadPublished: f.squadPublished === true
             }));
 
         return { success: true, teamId, fixtures: rows };
