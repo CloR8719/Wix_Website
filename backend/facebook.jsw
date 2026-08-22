@@ -1,0 +1,190 @@
+// =====================================================================
+//  facebook.jsw — posting to the club's Facebook Page
+// =====================================================================
+//  Replaces Wix's £17/month social tool with the free Graph API. One
+//  call, one credential, no subscription.
+//
+//  SETUP (done 2026-08-22, recorded so it can be redone):
+//    1. A free app at developers.facebook.com, use case "Manage
+//       everything on your Page". LEFT IN DEVELOPMENT MODE - publishing
+//       triggers App Review, which only exists for acting on Pages you
+//       do NOT control. Posting to your own club Page never needs it.
+//    2. Graph API Explorer -> USER token with pages_show_list,
+//       pages_manage_posts, pages_read_engagement.
+//    3. Access Token Debugger -> "Extend Access Token" -> long-lived
+//       USER token.
+//    4. Call /me/accounts WITH THAT long-lived token. The Page token it
+//       returns then never expires. Fetch it with a short-lived token
+//       instead and you get one that dies in an hour - that single step
+//       is the difference between a permanent setup and a weekly chore.
+//    5. Page token -> Wix Secrets as `_FB_PAGE_TOKEN`.
+//
+//  ⚠️ DATA ACCESS EXPIRY IS SEPARATE FROM TOKEN EXPIRY. The token says
+//  "never expires" and means it, but Meta also expires DATA ACCESS 90
+//  days after the app last interacted with the granting user. In
+//  practice a Page token used only for posting often keeps working past
+//  that; Meta guarantees nothing either way. So a token rejection is
+//  caught explicitly below and reported in words that say what to do,
+//  rather than surfacing as a generic failure three months from now
+//  when nobody remembers this file exists.
+//
+//  ⚠️ THE TOKEN IS NEVER LOGGED. Not on success, not in an error, not
+//  in a debug line. It is the whole credential - anyone holding it can
+//  post to the club's Page as the club.
+// =====================================================================
+
+import { getSecret } from 'wix-secrets-backend';
+
+// Public - it is the club's Page URL. Deliberately a visible constant
+// rather than a secret: hiding a public number in Secrets Manager just
+// makes it harder to find when someone needs to change it.
+const PAGE_ID = "1719682841640246";
+
+const GRAPH = "https://graph.facebook.com/v21.0";
+
+// Facebook FETCHES the image itself rather than us uploading bytes, which
+// is why recruitment.jsw marks posters isPrivate:false. A private file
+// gives Facebook a 403 and the post fails with a misleading error about
+// the URL being invalid.
+//
+// Accepts either form and normalises: mediaManager.upload() returns a
+// `wix:image://` URI, which Facebook cannot fetch. Callers were getting
+// this wrong because the upload result LOOKS like a URL.
+function httpsImageUrl(value) {
+    const v = String(value || "").trim();
+    if (!v) return "";
+    if (/^https?:\/\//i.test(v)) return v;
+    const m = v.match(/^wix:image:\/\/v1\/([^/]+)/i);
+    return m ? "https://static.wixstatic.com/media/" + m[1] : "";
+}
+
+// Graph errors are nested and inconsistent. This pulls out the parts worth
+// acting on and, crucially, turns the token ones into an instruction.
+function readGraphError(payload, status) {
+    const err = (payload && payload.error) || {};
+    const code = Number(err.code) || 0;
+    const sub = Number(err.error_subcode) || 0;
+    const msg = err.message || ("Facebook returned " + status);
+
+    // 190 covers expired, invalidated and revoked tokens. Subcode 463 is
+    // specifically expiry. Either way the fix is identical and the person
+    // reading this will not know that unless it says so.
+    if (code === 190 || sub === 463 || sub === 467) {
+        return {
+            token: true,
+            error: "Facebook has stopped accepting the saved token. It needs " +
+                   "regenerating: Graph API Explorer -> user token -> extend it " +
+                   "in the Access Token Debugger -> call /me/accounts with the " +
+                   "extended token -> put the new Page token in Wix Secrets as " +
+                   "_FB_PAGE_TOKEN."
+        };
+    }
+    if (code === 200 || code === 10) {
+        return {
+            token: true,
+            error: "The token no longer has permission to post to the Page. " +
+                   "Check pages_manage_posts is still granted, then regenerate it."
+        };
+    }
+    return { token: false, error: msg };
+}
+
+// ---------------------------------------------------------------------
+//  Post a photo with a caption
+// ---------------------------------------------------------------------
+//  imageUrl: an https URL or a wix:image:// URI - either is fine.
+//  caption:  the post text. Facebook calls it a caption on /photos, but
+//            it renders as the post body.
+export async function postPhotoToPage(imageUrl, caption) {
+    try {
+        const url = httpsImageUrl(imageUrl);
+        if (!url) {
+            return {
+                success: false,
+                error: "No usable image URL. mediaManager returns a wix:image:// " +
+                       "URI, which Facebook cannot fetch - it has to be the " +
+                       "https://static.wixstatic.com form."
+            };
+        }
+
+        let token;
+        try {
+            token = await getSecret("_FB_PAGE_TOKEN");
+        } catch (secretErr) {
+            console.error("[facebook] _FB_PAGE_TOKEN missing from Secrets Manager");
+            return {
+                success: false,
+                error: "No Facebook token is saved. Add the Page token to Wix " +
+                       "Secrets Manager as _FB_PAGE_TOKEN."
+            };
+        }
+        if (!token) {
+            return { success: false, error: "The saved Facebook token is empty." };
+        }
+
+        const body = new URLSearchParams();
+        body.set("url", url);
+        body.set("caption", String(caption || ""));
+        body.set("access_token", token);
+
+        const res = await fetch(GRAPH + "/" + PAGE_ID + "/photos", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: body.toString()
+        });
+
+        let payload = {};
+        try { payload = await res.json(); } catch (e) { payload = {}; }
+
+        if (!res.ok || payload.error) {
+            const info = readGraphError(payload, res.status);
+            // The URL is safe to log and is usually the thing at fault. The
+            // token never is - see the header note.
+            console.error("[facebook] post failed:", info.error, "| image:", url);
+            return { success: false, error: info.error, tokenProblem: info.token };
+        }
+
+        // /photos returns the photo id and the id of the post it created.
+        const postId = payload.post_id || payload.id || "";
+        console.log("[facebook] posted to page, post id " + postId);
+
+        return {
+            success: true,
+            postId,
+            // Only meaningful once the Page is published; harmless otherwise.
+            permalink: postId ? "https://www.facebook.com/" + postId : ""
+        };
+    } catch (error) {
+        console.error("[facebook] postPhotoToPage threw:", error.message);
+        return { success: false, error: "Couldn't reach Facebook just now." };
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Is the saved token still good?
+// ---------------------------------------------------------------------
+//  Cheap read-only call, for a settings screen or a health check - so the
+//  answer to "will the Monday POTM post work" can be had on Friday rather
+//  than discovered on Monday.
+export async function checkFacebookToken() {
+    try {
+        let token;
+        try { token = await getSecret("_FB_PAGE_TOKEN"); }
+        catch (e) { return { success: false, ok: false, error: "No token saved." }; }
+        if (!token) return { success: false, ok: false, error: "The saved token is empty." };
+
+        const res = await fetch(GRAPH + "/" + PAGE_ID + "?fields=name&access_token=" +
+                                encodeURIComponent(token));
+        let payload = {};
+        try { payload = await res.json(); } catch (e) { payload = {}; }
+
+        if (!res.ok || payload.error) {
+            const info = readGraphError(payload, res.status);
+            return { success: true, ok: false, error: info.error, tokenProblem: info.token };
+        }
+        return { success: true, ok: true, pageName: payload.name || "" };
+    } catch (error) {
+        console.error("[facebook] checkFacebookToken threw:", error.message);
+        return { success: false, ok: false, error: "Couldn't reach Facebook just now." };
+    }
+}

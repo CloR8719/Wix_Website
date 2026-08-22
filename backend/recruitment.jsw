@@ -23,15 +23,23 @@
 //  precedent for the children's ID documents in mediaUpload.jsw, which is a
 //  separate and still-open decision.
 //
-//  ⚠️ FACEBOOK IS NOT WIRED. `toFacebook` is recorded and the post is held
-//  at `pending`, but nothing sends. Deliberate: the visual and the approval
-//  step get built with everything else, and posting is wired last once the
-//  route is proven. See docs/MANAGER_HUB_V2_ELEMENTS.md.
+//  FACEBOOK IS WIRED (2026-08-22) via backend/facebook.jsw.
+//
+//  ⚠️ WHO CAN POST STRAIGHT TO FACEBOOK IS A PERMISSION, NOT A SETTING.
+//  An Admin posts immediately - that is what Rob asked for and he is the
+//  one who owns the Page. Everyone else still holds at `pending`.
+//
+//  The reason for the split rather than opening it to all: twenty
+//  volunteer managers with one-tap access to the club's public voice and
+//  no undo is a different risk from one secretary having it. Nothing
+//  stops it being opened up later - it is one condition below - but the
+//  default should be the cautious one.
 // =====================================================================
 
 import wixData from 'wix-data';
 import { mediaManager } from 'wix-media-backend';
 import { assertTeamAccess } from 'backend/managerData.jsw';
+import { postPhotoToPage } from 'backend/facebook.jsw';
 
 const OPTIONS = { suppressAuth: true };
 
@@ -115,6 +123,40 @@ export async function getRecruitContext(teamId) {
 }
 
 // base64 is the whole PNG, without the `data:image/png;base64,` prefix.
+// What actually appears under the poster on Facebook. Kept plain and
+// factual - the image carries the design, and a caption stuffed with
+// hashtags reads like spam on a club page.
+function facebookCaption(row) {
+    const bits = [];
+    if (row.ageGroup) bits.push(row.ageGroup);
+    if (row.position) bits.push("looking for " + row.position.toLowerCase());
+
+    const lead = bits.length ? bits.join(" — ") : "New players wanted";
+    const extra = String(row.extraLine || "").trim();
+
+    return lead + "." +
+        (extra ? "\n\n" + extra : "") +
+        "\n\nGet in touch through the website to register your interest.";
+}
+
+function buildMessage(toWebsite, toFacebook, status, fb) {
+    if (!toFacebook) return "Poster saved and ready for the website.";
+
+    if (status === "pending") {
+        return toWebsite
+            ? "Saved. It needs approving before it goes on Facebook."
+            : "Sent for approval before it goes on Facebook.";
+    }
+    if (fb && fb.success) {
+        return toWebsite
+            ? "Posted to Facebook and saved for the website."
+            : "Posted to Facebook.";
+    }
+    // Saved but not sent - say so plainly rather than reporting a success
+    // that only half happened.
+    return "Saved, but Facebook rejected it: " + ((fb && fb.error) || "unknown reason");
+}
+
 export async function publishRecruitmentPost(teamId, payload = {}) {
     try {
         const access = await assertTeamAccess(teamId);
@@ -176,12 +218,37 @@ export async function publishRecruitmentPost(teamId, payload = {}) {
             // club's public voice and twenty managers would otherwise have
             // one-tap access with no undo. Website-only can go straight out -
             // the news form already works that way.
-            status: toFacebook ? "pending" : "published",
+            // An Admin's Facebook post goes out now, so it is published the
+            // moment it is written rather than waiting on an approval step
+            // that would only ever be them approving themselves.
+            status: (toFacebook && !ctx.perms.allTeams) ? "pending" : "published",
             createdByStaff: ctx.staffId,
             publishedDate: new Date()
         };
 
         const saved = await wixData.insert("RecruitmentPosts", row, OPTIONS);
+
+        // ⚠️ SENT AFTER THE ROW IS SAVED, ON PURPOSE. A Facebook outage must
+        // not lose a poster the manager just spent ten minutes on - the record
+        // and the image survive regardless, and the post can be retried.
+        let fbResult = null;
+        if (toFacebook && row.status === "published") {
+            // posterUri, not posterUrl: mediaManager returns a wix:image://
+            // URI and posterUrl is only populated when it happens to be an
+            // https one, which it is not. postPhotoToPage normalises either.
+            fbResult = await postPhotoToPage(posterUri, facebookCaption(row));
+
+            if (fbResult.success) {
+                await wixData.update("RecruitmentPosts",
+                    Object.assign({}, saved, {
+                        fbPostId: fbResult.postId || "",
+                        fbPostedDate: new Date()
+                    }), OPTIONS);
+            } else {
+                console.error("[recruitment] Facebook post failed for", saved._id,
+                    "-", fbResult.error);
+            }
+        }
 
         return {
             success: true,
@@ -189,11 +256,11 @@ export async function publishRecruitmentPost(teamId, payload = {}) {
             posterUri,
             posterUrl,
             status: row.status,
-            message: toFacebook
-                ? (toWebsite
-                    ? "Saved and sent for approval before it goes on Facebook."
-                    : "Sent for approval before it goes on Facebook.")
-                : "Poster saved and ready for the website."
+            facebook: fbResult
+                ? { posted: fbResult.success, error: fbResult.error || "",
+                    tokenProblem: !!fbResult.tokenProblem }
+                : null,
+            message: buildMessage(toWebsite, toFacebook, row.status, fbResult)
         };
     } catch (error) {
         console.error("publishRecruitmentPost error:", error);

@@ -552,3 +552,62 @@ would bounce anyone testing on a preview or staging domain onto the live
 site. Page code can override it by setting the `websiteurl` attribute, which
 is handled before the `data` guard in `attributeChangedCallback` — that
 guard returns early on any other attribute name.
+
+---
+
+## Facebook posting (2026-08-22)
+
+`backend/facebook.jsw`. Replaces Wix's £17/month social tool with the free
+Graph API.
+
+### CMS — two fields on `RecruitmentPosts`
+
+`fbPostId` (Text), `fbPostedDate` (Date). Without them the post still goes
+out; you just can't tell later which ones did.
+
+### Setup, recorded so it can be redone
+
+Free Meta app, use case "Manage everything on your Page", **left in
+Development mode** — publishing triggers App Review, which only exists for
+acting on Pages you don't control. Posting to your own club Page never
+needs it.
+
+Graph API Explorer → **user** token with `pages_show_list`,
+`pages_manage_posts`, `pages_read_engagement` → Access Token Debugger →
+**Extend Access Token** → call `/me/accounts` **with that extended token**.
+
+⚠️ **That last step is the whole trick.** A Page token inherits its lifetime
+from the user token that fetched it. Fetch it with the short-lived one and it
+dies in an hour; fetch it with the extended one and it never expires. Verify
+in the Debugger — it should read **Expires: Never**.
+
+Page token → Wix Secrets as `_FB_PAGE_TOKEN`. Page id is a visible constant
+in the file, not a secret — it's public, and hiding it just makes it harder
+to find.
+
+### Two things that will bite later
+
+**Data access expiry is separate from token expiry.** The token says never
+and means it, but Meta expires *data access* 90 days after the app last
+interacted with the granting user. A Page token used only for posting often
+survives it; Meta guarantees nothing. So token rejections (Graph codes 190 /
+200) are caught explicitly and returned as an instruction naming the fix,
+rather than surfacing as a generic failure months later.
+
+**`mediaManager.upload()` returns a `wix:image://` URI**, which Facebook
+cannot fetch — and `recruitment.jsw`'s `posterUrl` only populates when the
+result happens to be https, which it isn't. `postPhotoToPage` normalises
+either form itself, so a caller can't get it wrong. Posters are also
+`isPrivate: false` on purpose: a private file gives Facebook a 403 and the
+error blames the URL.
+
+### Who can post straight out
+
+**Admin posts immediately** (`ctx.perms.allTeams`); everyone else still holds
+at `status: "pending"`. Twenty volunteer managers with one-tap access to the
+club's public voice and no undo is a different risk from one secretary having
+it. Opening it up is one condition in `publishRecruitmentPost` — but the
+default should be the cautious one.
+
+**The send happens after the row is saved**, so a Facebook outage never loses
+a poster somebody just spent ten minutes on.
