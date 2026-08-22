@@ -901,20 +901,64 @@ async function loadFixtureFor(teamId, fixtureId, opts = {}) {
     return { ok: true, fixture, ctx: access.ctx };
 }
 
+
+function teamFormatOf(team) {
+    if (!team) return 0;
+    if (team.T_matchFormat) return team.T_matchFormat;
+
+    const want = "tmatchformat";
+    for (const k in team) {
+        const norm = String(k).toLowerCase().replace(/[^a-z]/g, "");
+        if (norm === want || norm === "matchformat") {
+            const v = Number(team[k]);
+            if (v) {
+                console.log("[fixtures] match format read from '" + k + "' rather than T_matchFormat");
+                return v;
+            }
+        }
+    }
+    return 0;
+}
+
 export async function getSquadPicker(teamId, fixtureId) {
     try {
         const r = await loadFixtureFor(teamId, fixtureId, { playingOnly: true });
         if (!r.ok) return { success: false, error: r.error };
         const f = r.fixture;
 
-        // The team's usual format, copied onto the fixture the first time a
-        // squad is picked - so changing a team's format next season doesn't
-        // silently rewrite last year's line-ups.
-        let format = Number(f.squadFormat) || 0;
+        // The team's usual format, copied onto the fixture ONCE SOMEBODY HAS
+        // ACTUALLY BEEN PICKED - so changing a team's format next season
+        // doesn't silently rewrite last year's line-ups.
+        //
+        // ⚠️ THE "hasPicked" TEST MATTERS. It used to read f.squadFormat
+        // whenever it was set, but merely OPENING the picker and pressing Save
+        // wrote a format - so a fixture saved once at the 7v7 fallback was
+        // stuck on 7v7 for good, and correcting T_matchFormat afterwards
+        // appeared to do nothing. Until a player is genuinely placed, the
+        // team's own default is still the better answer.
+        const savedSel = readJson(f.squadSelected, {});
+        const savedSubs = readJson(f.squadSubs, []);
+        const hasPicked = Object.keys(savedSel).length > 0 || savedSubs.length > 0;
+
+        let format = hasPicked ? (Number(f.squadFormat) || 0) : 0;
+        let formatFrom = format ? "fixture" : "";
+
         if (!format) {
             const team = await wixData.get("Teams", teamId, OPTIONS);
-            format = Number(team && team.T_matchFormat) || 7;
+            const raw = teamFormatOf(team);
+            format = Number(raw) || 7;
+            formatFrom = raw ? "team" : "fallback";
+
+            if (!raw) {
+                // Loud on purpose: this is the setup step people get wrong, and
+                // silently defaulting to 7v7 looks like the field being ignored.
+                console.warn("[fixtures] No usable match format on team " + teamId +
+                    " - defaulting to 7v7. Expected a number in T_matchFormat. " +
+                    "Keys present: " + (team ? Object.keys(team).join(",") : "team not found"));
+            }
         }
+        console.log("[fixtures] squad picker format=" + format + " (from " + formatFrom + ")");
+
         const shape = f.squadShape || defaultShapeFor(format);
 
         const [squadRes, responses] = await Promise.all([
