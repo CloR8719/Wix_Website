@@ -85,7 +85,20 @@ const STYLES = `
     outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
   }
   .field.bad input, .field.bad textarea { border-color: var(--critical); }
+  /* ⚠️ min-width:0 IS THE WHOLE FIX. A grid item defaults to min-width:auto,
+     meaning it refuses to shrink below its content's intrinsic size - and a
+     native <input type="date"> or type="time" has a wide intrinsic minimum
+     because of the picker UI. So the columns pushed past the container and the
+     second one landed outside the element entirely. */
   .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .two > * { min-width: 0; }
+  .field input { max-width: 100%; }
+
+  /* Under this a date and a time still will not sit together, whatever the
+     min-width says - the native pickers have a floor. */
+  @media (max-width: 430px) {
+    .two { grid-template-columns: 1fr; }
+  }
 
   .label {
     font-size: 10.5px; font-weight: 700; letter-spacing: .07em;

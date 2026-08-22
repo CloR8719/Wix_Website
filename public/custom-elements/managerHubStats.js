@@ -74,7 +74,10 @@ const STYLES = `
   /* Scorecard: numbers first, labels under. It's read at a glance, so the
      figure has to be the biggest thing in the cell. */
   .score { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
-  .score .cell { text-align: center; }
+  /* ⚠️ BOTH GRIDS. The rule used to be ".score .cell" only, so the goals row
+     underneath - identical markup, same 3-column grid - was left-aligned while
+     the row above it was centred. They line up now. */
+  .score .cell, .goals .cell { text-align: center; }
   .score .n { font-size: 26px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
   .score .t { font-size: 10.5px; font-weight: 600; color: var(--text-faint); text-transform: uppercase; letter-spacing: .05em; margin-top: 3px; }
   .score .won .n { color: var(--success); }

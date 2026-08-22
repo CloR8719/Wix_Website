@@ -96,7 +96,31 @@ const STYLES = `
   .head .side { flex: 1; min-width: 0; }
   .head h3 { margin: 0 0 3px; font-size: 17px; font-weight: 700; }
   .head p { margin: 0 0 9px; font-size: 12px; color: var(--text-muted); }
-  input[type="file"] { font-size: 12px; color: var(--text-muted); width: 100%; }
+  /* An email address is ONE unbroken token, so min-width:0 on the flex parent
+     is not enough on its own - there is no space for the browser to wrap at.
+     It has to be told it may break mid-word. */
+  .head .side p {
+    overflow-wrap: anywhere; word-break: break-word;
+    font-size: 12.5px; color: var(--text-muted); margin: 2px 0 0;
+  }
+
+  /* ⚠️ THE NATIVE FILE INPUT IS HIDDEN, NOT RESTYLED. Browsers render it as
+     "Choose File" followed by "No file chosen", and that trailing text cannot
+     be removed with CSS in every engine. The input stays in the DOM with its
+     id so the existing change handler is untouched; the label drives it. */
+  input[type="file"] {
+    position: absolute; width: 1px; height: 1px;
+    opacity: 0; overflow: hidden; white-space: nowrap;
+  }
+  .filebtn {
+    display: inline-block; margin-top: 9px;
+    padding: 8px 13px; border-radius: 9px; cursor: pointer;
+    font-size: 12.5px; font-weight: 700;
+    border: 1.5px solid var(--line); color: var(--accent); background: transparent;
+  }
+  .filebtn:hover { border-color: var(--accent); }
+  /* The hidden input still takes focus, so the visible control must show it. */
+  input[type="file"]:focus-visible + .filebtn { outline: 2px solid var(--accent); outline-offset: 2px; }
 
   .chips { display: flex; flex-wrap: wrap; gap: 7px; }
   .chip {
@@ -361,6 +385,7 @@ class ManagerHubStaff extends HTMLElement {
                 <h3>${esc(d.name || "Your record")}</h3>
                 <p>${esc(d.email || "")}</p>
                 <input type="file" id="photoFile" accept="image/*" />
+                <label class="filebtn" for="photoFile">Change photo</label>
               </div>
             </div>
           </div>

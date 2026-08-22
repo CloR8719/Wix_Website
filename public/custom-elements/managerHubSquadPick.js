@@ -236,7 +236,17 @@ const STYLES = `
   .counter b { font-size: 20px; font-variant-numeric: tabular-nums; }
   .counter .of { font-size: 12.5px; color: var(--text-muted); }
 
+  /* Holds the meet-TIME input, so it needs the same guard as the fixture
+     form: a grid item defaults to min-width:auto and a native time picker
+     will not shrink below its intrinsic width, pushing the second column
+     out of the element. */
   .two { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
+  .two > * { min-width: 0; }
+  .field input { max-width: 100%; }
+
+  @media (max-width: 430px) {
+    .two { grid-template-columns: 1fr; }
+  }
   .field { display: flex; flex-direction: column; gap: 6px; }
   .field label { font-size: 12px; font-weight: 600; color: var(--text-muted); }
   .field input {

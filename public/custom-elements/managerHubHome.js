@@ -88,6 +88,19 @@ const STYLES = `
     padding: 10px 14px; border-radius: 10px; cursor: pointer;
     border: 1.5px solid transparent; flex: 1; min-width: 0;
     white-space: nowrap;
+    /* Centred explicitly. A button's default centring is only default - it
+       inherits text-align from an ancestor in some engines, and "Manage squad"
+       is the longest label here so it shows first. */
+    text-align: center;
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+
+  /* Below this the two labels genuinely cannot sit side by side without
+     clipping, and a half-word button is worse than a stacked pair. */
+  @media (max-width: 400px) {
+    .btns { flex-direction: column; }
+    .btn { flex: none; width: 100%; }
   }
   .btn.primary { background: var(--accent); color: #fff; }
   .btn.ghost { background: transparent; color: var(--text-muted); border-color: var(--line); }

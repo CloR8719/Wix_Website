@@ -82,7 +82,15 @@ const STYLES = `
   .field input:focus, .field textarea:focus, .field select:focus {
     outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
   }
+  /* Same grid trap as the fixture form: a native time input will not shrink
+     below its intrinsic width unless the track is told it may. */
   .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .two > * { min-width: 0; }
+  .field input, .field select, .field textarea { max-width: 100%; }
+
+  @media (max-width: 430px) {
+    .two { grid-template-columns: 1fr; }
+  }
 
   .card {
     background: var(--surface); border: 1px solid var(--line-soft);
@@ -101,7 +109,20 @@ const STYLES = `
   }
   .photo .side { flex: 1; min-width: 0; }
   .photo p { margin: 0 0 8px; font-size: 11.5px; color: var(--text-faint); line-height: 1.5; }
-  input[type="file"] { font-size: 12px; color: var(--text-muted); width: 100%; }
+  /* Hidden rather than restyled - see managerHubStaff.js for why. */
+  input[type="file"] {
+    position: absolute; width: 1px; height: 1px;
+    opacity: 0; overflow: hidden; white-space: nowrap;
+  }
+  .filebtn {
+    display: inline-block; margin-top: 9px;
+    padding: 8px 13px; border-radius: 9px; cursor: pointer;
+    font-size: 12.5px; font-weight: 700;
+    border: 1.5px solid var(--line); color: var(--accent); background: transparent;
+  }
+  .filebtn:hover { border-color: var(--accent); }
+  input[type="file"]:focus-visible + .filebtn { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .photo .side p { overflow-wrap: anywhere; word-break: break-word; }
 
   .chips { display: flex; flex-wrap: wrap; gap: 7px; }
   .chip {
@@ -378,6 +399,7 @@ class ManagerHubTeamProfile extends HTMLElement {
                 <div class="side">
                   <p>Landscape works best. Large photos are shrunk automatically.</p>
                   <input type="file" id="photoFile" accept="image/*" />
+                  <label class="filebtn" for="photoFile">Change photo</label>
                 </div>
               </div>
             </div>
