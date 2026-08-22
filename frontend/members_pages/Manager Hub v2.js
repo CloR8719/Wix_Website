@@ -550,13 +550,18 @@ async function loadSquadPick(fixtureId) {
 // failure must leave the manager's typed selection exactly where it was.
 async function runSquadAction(e, run, describe) {
     const d = (e && e.detail) || {};
-    if (!d.fixtureId || !squadPickModel) return;
+    const tid = teamId();
+    // ⚠️ EVERY squad backend function takes (teamId, fixtureId, ...) - passing
+    // the fixture id first made assertTeamAccess check a FIXTURE id against
+    // the manager's teams, which failed with "That isn't one of your teams."
+    // Anything that takes fewer arguments simply ignores the extra one.
+    if (!tid || !d.fixtureId || !squadPickModel) return;
 
     squadPickModel = Object.assign({}, squadPickModel, { busy: true, error: "", done: "" });
     pushSquadPick();
 
     try {
-        const res = await run(d.fixtureId, d.form);
+        const res = await run(tid, d.fixtureId, d.form);
 
         // ⚠️ PATCHED, NOT RELOADED. getSquadPicker would come back with the
         // saved selection and the element seeds from the model - so a reload
@@ -1165,7 +1170,7 @@ function wireEverything() {
             "Sent to " + res.reach + (res.reach === 1 ? " parent" : " parents") +
             " for " + res.picked + (res.picked === 1 ? " player." : " players.")));
 
-        el.on("nudgeReplies", (e) => runSquadAction(e, (fid, form) => nudgeNoReplies(teamId(), fid), (res) =>
+        el.on("nudgeReplies", (e) => runSquadAction(e, nudgeNoReplies, (res) =>
             res.asked === 0
                 ? "Everyone's already replied."
                 : "Reminder sent to " + res.reach + (res.reach === 1 ? " parent" : " parents") +
