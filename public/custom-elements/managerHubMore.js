@@ -32,8 +32,14 @@ const ICONS = {
     person: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
     news: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-2 2Zm0 0a2 2 0 0 1-2-2v-9h4"/><path d="M18 14h-8M15 18h-5M10 6h8v4h-8V6Z"/></svg>',
     handshake: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 17 9.5 15.5a2.1 2.1 0 0 1 3-3l1 1 3.5-3.5a2.1 2.1 0 0 1 3 3L16 18"/><path d="m8 13-4-4 4-4 3 3"/></svg>',
-    power: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>'
+    power: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>',
+    globe: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>'
 };
+
+// Where "Back to the website" goes. A RELATIVE path on purpose: an absolute
+// URL would bounce anyone testing on a preview or staging domain onto the
+// live site. Page code can override it with the websiteurl attribute.
+const SITE_URL = "/";
 
 // `perm` gates the row: undefined = always shown, otherwise the named
 // permission must be true in the payload.
@@ -100,6 +106,10 @@ const STYLES = `
   }
 
   .menu { border: 1px solid var(--line-soft); border-radius: 12px; overflow: hidden; }
+  /* .row is used by both <button> and <a> now, so the anchor needs the
+     text-decoration and colour resets a button gets for free. */
+  a.row { text-decoration: none; color: inherit; }
+
   .row {
     display: flex; align-items: center; gap: 12px; width: 100%;
     padding: 14px 15px; background: var(--surface);
@@ -154,7 +164,7 @@ class ManagerHubMore extends HTMLElement {
         this._lastHeight = 0;
     }
 
-    static get observedAttributes() { return ["data"]; }
+    static get observedAttributes() { return ["data", "websiteurl"]; }
     connectedCallback() { this.build(); this.watchHeight(); }
     disconnectedCallback() {
         if (this._resizeObserver) { this._resizeObserver.disconnect(); this._resizeObserver = null; }
@@ -173,6 +183,15 @@ class ManagerHubMore extends HTMLElement {
 
     attributeChangedCallback(name, oldValue, newValue) {
         if (!this._built) this.build();
+
+        // Handled BEFORE the data guard below, which returns early on any
+        // other attribute name.
+        if (name === "websiteurl") {
+            this._siteUrl = newValue || SITE_URL;
+            this.paint();
+            return;
+        }
+
         if (name !== "data" || !newValue) return;
         try {
             const parsed = JSON.parse(newValue);
@@ -218,6 +237,15 @@ class ManagerHubMore extends HTMLElement {
           </p>
           ${sections}
           <div class="menu">
+            <!-- A REAL ANCHOR, on purpose. No listener, no page-code round
+                 trip - if every other line of JS in this file throws, this row
+                 still gets a manager off the page. Same reasoning as the
+                 Parent Hub's "Visit Our Website" row. -->
+            <a class="row" href="${esc(this._siteUrl || SITE_URL)}">
+              <span class="ico">${ICONS.globe}</span>
+              <span class="tx"><b>Back to the website</b><span>Fixtures, news and club information</span></span>
+              <span class="chev">›</span>
+            </a>
             <button type="button" class="row" data-act="logout">
               <span class="ico danger">${ICONS.power}</span>
               <span class="tx"><b>Log out</b></span>

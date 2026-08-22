@@ -536,3 +536,19 @@ answered. Separate from selection deliberately — it's useful on any fixture,
 picked or not. Because sending reminders changes no count on screen, the
 fixtures element gained a `flash` slot; without it a manager presses the button
 and can't tell whether anything happened.
+
+### Exit to the website (2026-08-22)
+
+`managerHubMore.js` gained a **"Back to the website"** row above Log out,
+matching the Parent Hub's "Visit Our Website".
+
+It is a **real `<a href>`, not a wired button** — no listener, no page-code
+round trip. If every other line of JS in the element throws, that row still
+gets a manager off a page that has no site header. Same reasoning as the
+Parent Hub's.
+
+The target is `SITE_URL = "/"`, **relative on purpose**: an absolute URL
+would bounce anyone testing on a preview or staging domain onto the live
+site. Page code can override it by setting the `websiteurl` attribute, which
+is handled before the `data` guard in `attributeChangedCallback` — that
+guard returns early on any other attribute name.
