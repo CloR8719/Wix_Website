@@ -120,20 +120,46 @@ export async function getRecruitContext(teamId) {
 }
 
 // base64 is the whole PNG, without the `data:image/png;base64,` prefix.
-// What actually appears under the poster on Facebook. Kept plain and
-// factual - the image carries the design, and a caption stuffed with
-// hashtags reads like spam on a club page.
-function facebookCaption(row) {
-    const bits = [];
-    if (row.ageGroup) bits.push(row.ageGroup);
-    if (row.position) bits.push("looking for " + row.position.toLowerCase());
+// Where the caption sends people. A named constant so it can be changed
+// without going hunting through string concatenation.
+const CLUB_URL = "www.signolathleticjfc.co.uk";
 
-    const lead = bits.length ? bits.join(" — ") : "New players wanted";
-    const extra = String(row.extraLine || "").trim();
+// What appears under the poster on Facebook.
+//
+// ⚠️ BUILT FROM THE PAYLOAD, NOT THE SAVED ROW. The first version read
+// row.ageGroup, which the row has never had - so it silently produced a
+// caption with the age group missing and no error anywhere. Anything the
+// caption needs has to be saved on the row above or read from the payload
+// here; reading a field that does not exist just yields undefined and a
+// quietly worse post.
+//
+// Kept plain and factual: the poster carries the design, and a caption
+// stuffed with hashtags reads like spam on a club page.
+function facebookCaption(payload, contactName) {
+    const who = String(contactName || "").trim();
+    const age = String(payload.ageGroup || "").trim();
+    const team = String(payload.teamName || "").trim();
+    const pos = String(payload.position || "").trim();
+    const extra = String(payload.extraLine || "").trim();
 
-    return lead + "." +
-        (extra ? "\n\n" + extra : "") +
-        "\n\nGet in touch through the website to register your interest.";
+    // "U15s Wolverines" reads better than either alone, but neither is
+    // guaranteed to be filled in.
+    const squad = [age, team].filter(Boolean).join(" ");
+
+    const lines = ["We are recruiting!"];
+
+    const detail = [];
+    if (squad) detail.push(squad);
+    if (pos) detail.push("looking for " + pos.toLowerCase());
+    if (detail.length) lines.push(detail.join(" — ") + ".");
+
+    if (extra) lines.push(extra);
+
+    lines.push(
+        (who ? "Contact " + who + " or visit " : "Visit ") + CLUB_URL
+    );
+
+    return lines.join("\n\n");
 }
 
 function buildMessage(toWebsite, toFacebook, status, fb) {
@@ -208,13 +234,11 @@ export async function publishRecruitmentPost(teamId, payload = {}) {
             // a human reading the list of past posters, not for querying.
             position: String(payload.position || "").trim(),
             extraLine: String(payload.extraLine || "").trim(),
+            ageGroup: String(payload.ageGroup || "").trim(),
+            contactName: String(payload.contactName || "").trim(),
             posterUrl: posterUri,
             toWebsite,
             toFacebook,
-            // Anything bound for Facebook waits for approval. That's the
-            // club's public voice and twenty managers would otherwise have
-            // one-tap access with no undo. Website-only can go straight out -
-            // the news form already works that way.
             // EVERY manager posts straight out - no approval step.
             //
             // The earlier caution was about handing volunteers a channel for
@@ -243,7 +267,7 @@ export async function publishRecruitmentPost(teamId, payload = {}) {
             // posterUri, not posterUrl: mediaManager returns a wix:image://
             // URI and posterUrl is only populated when it happens to be an
             // https one, which it is not. postPhotoToPage normalises either.
-            fbResult = await postPhotoToPage(posterUri, facebookCaption(row));
+            fbResult = await postPhotoToPage(posterUri, facebookCaption(payload, row.contactName));
 
             if (fbResult.success) {
                 await wixData.update("RecruitmentPosts",

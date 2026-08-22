@@ -516,6 +516,11 @@ class ManagerHubRecruit extends HTMLElement {
                 season: this._form.season,
                 extraLine: this._form.extraLine,
                 teamName: this._form.teamName,
+                // Sent for the Facebook caption. Both are already drawn on the
+                // poster, so this adds nothing new to what goes public - it
+                // just lets the caption say the same thing in words.
+                ageGroup: this._form.ageGroup,
+                contactName: this._form.contactName,
                 toWebsite: !!this._form.toWebsite,
                 toFacebook: !!this._form.toFacebook,
                 imageBase64: base64
