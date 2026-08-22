@@ -138,6 +138,23 @@ const STYLES = `
     content: ""; position: absolute; left: 0; right: 0; top: 50%;
     border-top: 1.5px solid rgba(255,255,255,.34);
   }
+  .mpitchwrap { display: flex; flex-direction: column; gap: 6px; align-items: center; }
+  .mbench {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    justify-content: center; max-width: 190px;
+    padding: 6px 9px; border-radius: 8px;
+    background: var(--accent-soft); border: 1px solid var(--line-soft);
+  }
+  .mbench-label {
+    font-size: 8.5px; font-weight: 800; letter-spacing: .07em;
+    text-transform: uppercase; color: var(--text-faint);
+  }
+  /* The bench pill needs its own colours - .mshirt.mine is white-on-green for
+     the pitch, which disappears on the bench's pale background. */
+  .mbench .mshirt.mine {
+    background: var(--text); color: var(--surface); box-shadow: none;
+  }
+
   .mrow { display: flex; align-items: center; justify-content: space-evenly; gap: 2px; position: relative; z-index: 2; }
   .mshirt {
     width: 15px; height: 15px; border-radius: 50%;
@@ -529,21 +546,38 @@ class ParentHubFixtures extends HTMLElement {
         let running = 0;
         lines.forEach(function (l) { firstId.push(running); running += l; });
 
-        const mine = Number(kid.slot);
+        // -1 when this child is a sub, which matches no slot - so every shirt
+        // on the pitch stays blank and they appear on the bench instead.
+        const mine = kid.isSub ? -1 : Number(kid.slot);
+        const who = esc(kid.firstName || "You");
+
         const html = lines.slice().reverse().map(function (count, ri) {
             const base = firstId[lines.length - 1 - ri];
             let cells = "";
             for (let i = 0; i < count; i++) {
                 const isMine = (base + i) === mine;
                 cells += '<span class="mshirt' + (isMine ? " mine" : "") + '">' +
-                         (isMine ? esc(kid.firstName || "You") : "") + "</span>";
+                         (isMine ? who : "") + "</span>";
             }
             return '<div class="mrow">' + cells + "</div>";
         }).join("");
 
-        return '<div class="mpitch" style="grid-template-rows:repeat(' + lines.length + ',1fr)" ' +
-               'role="img" aria-label="' + esc(kid.firstName || "Your child") +
-               ' is playing in this position">' + html + "</div>";
+        const label = kid.isSub
+            ? who + " is on the bench for this one"
+            : who + " is playing in this position";
+
+        // The bench sits UNDER the pitch, the way a real one does. Only this
+        // child is named on it, exactly as on the pitch itself - the other subs
+        // are as anonymous as the starters.
+        const bench = kid.isSub
+            ? '<div class="mbench"><span class="mbench-label">Bench</span>' +
+              '<span class="mshirt mine">' + who + "</span></div>"
+            : "";
+
+        return '<div class="mpitchwrap">' +
+               '<div class="mpitch" style="grid-template-rows:repeat(' + lines.length + ',1fr)" ' +
+               'role="img" aria-label="' + esc(label) + '">' + html + "</div>" +
+               bench + "</div>";
     }
 }
 

@@ -1167,17 +1167,21 @@ function wireEverything() {
             "Saved — " + res.placed + " on the pitch, " + res.subs + " on the bench."));
 
         el.on("publishSquad", (e) => runSquadAction(e, publishSquad, (res) => {
+            // ⚠️ COUNTED IN PLAYERS, NOT PARENTS. The parent figure is bigger
+            // than the player figure whenever a child has two accounts linked,
+            // which is correct and reads as a fault - a manager thinks in
+            // squad members, so that is the number reported.
             const players = res.picked + (res.picked === 1 ? " player" : " players");
-            const parents = res.reach + (res.reach === 1 ? " parent" : " parents");
-            // More parents than players is NORMAL - a child with two linked
-            // accounts gets both told - but the bare numbers read like a fault,
-            // so the reason is spelled out rather than left to be worked out.
-            const why = res.reach > res.picked ? " (some have two)" : "";
+
+            // The exception, because this one is NOT just presentation: these
+            // children generated no message at all, and without saying so the
+            // manager would believe the whole squad had been told.
             const gap = res.unreachable
                 ? " " + res.unreachable + (res.unreachable === 1 ? " player has" : " players have") +
                   " no linked parent account, so nobody was told about them."
                 : "";
-            return "Squad published — " + players + ", " + parents + " messaged" + why + "." + gap;
+
+            return "Squad sent to the parents of " + players + "." + gap;
         }));
 
         el.on("nudgeReplies", (e) => runSquadAction(e, nudgeNoReplies, (res) =>

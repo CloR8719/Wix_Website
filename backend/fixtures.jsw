@@ -115,11 +115,14 @@ function squadInfoFor(fixture, playerId) {
 
     // The shape is sent so the parent's pitch can be drawn with the right
     // number of anonymous shirts - it reveals a formation, not a team.
-    if (slot !== -1) {
-        info.slot = slot;
-        info.shape = fixture.squadShape || "";
-        info.format = Number(fixture.squadFormat) || 0;
-    }
+    // The shape goes to SUBS as well as starters, so a sub's parent gets the
+    // same pitch with their child on the bench beneath it. It reveals a
+    // formation and a squad size, never a name - the line-up itself is still
+    // not sent to any parent's browser.
+    info.slot = slot;                 // -1 for a sub
+    info.isSub = slot === -1;
+    info.shape = fixture.squadShape || "";
+    info.format = Number(fixture.squadFormat) || 0;
     return info;
 }
 
@@ -1170,6 +1173,13 @@ export async function publishSquad(teamId, fixtureId, payload) {
                         title: "In the squad — " + title,
                         body,
                         senderName: r.ctx.name || "Your manager",
+                        // WARNING: SCOPE IS WHAT getParentMessages QUERIES ON.
+                        // It ORs together scope=Club, scope=Parent and
+                        // scope=Team; a row without one matches no branch and
+                        // is invisible in the parent's hub, with no error
+                        // anywhere. "kind" is for display grouping and is NOT
+                        // a substitute for it.
+                        scope: "Parent",
                         kind: "alert",
                         team: teamId,
                         player: player._id,
@@ -1247,6 +1257,13 @@ export async function nudgeNoReplies(teamId, fixtureId) {
                               (f.startTime ? ", " + timeWords(f.startTime) : "") +
                               `. Open Fixtures in your hub to let us know.`,
                         senderName: r.ctx.name || "Your manager",
+                        // WARNING: SCOPE IS WHAT getParentMessages QUERIES ON.
+                        // It ORs together scope=Club, scope=Parent and
+                        // scope=Team; a row without one matches no branch and
+                        // is invisible in the parent's hub, with no error
+                        // anywhere. "kind" is for display grouping and is NOT
+                        // a substitute for it.
+                        scope: "Parent",
                         kind: "alert",
                         team: teamId,
                         player: p._id,
