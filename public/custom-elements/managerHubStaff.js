@@ -187,6 +187,14 @@ const STYLES = `
   @media (max-width: 749px) {
     .wrap { padding-bottom: calc(84px + env(safe-area-inset-bottom, 0px)); }
   }
+
+  /* iOS Safari zooms the page in when an input under 16px takes focus, and
+     never zooms back out - leaving the manager stuck on a magnified page
+     mid-form. On a phone correctness beats matching the mockup. Same rule
+     as parentHubHome.js. */
+  @media (max-width: 749px) {
+    input, select, textarea { font-size: 16px; }
+  }
 `;
 
 function esc(value) {

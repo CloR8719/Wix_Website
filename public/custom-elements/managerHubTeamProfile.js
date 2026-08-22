@@ -174,6 +174,35 @@ const STYLES = `
   @media (max-width: 749px) {
     .wrap { padding-bottom: calc(84px + env(safe-area-inset-bottom, 0px)); }
   }
+
+  /* ⚠️ NATIVE DATE/TIME INPUTS OVERFLOW THEIR CONTAINER without this.
+     min-width BEATS width:100%, and browsers give these a wide intrinsic
+     minimum from the picker chrome - so the field runs outside the state
+     box on a phone while looking fine on desktop. appearance:none drops
+     the native chrome that was adding the width in the first place.
+     Same fix as parentHubHome.js, proven live since 2026-08-16. */
+  input[type="date"], input[type="time"] {
+    -webkit-appearance: none; appearance: none;
+    min-width: 0; max-width: 100%; width: 100%;
+    /* Inline-block by default, which leaves a baseline gap underneath. */
+    display: block;
+  }
+  input[type="date"]::-webkit-date-and-time-value,
+  input[type="time"]::-webkit-date-and-time-value {
+    text-align: left; margin: 0;
+  }
+  input[type="date"]::-webkit-calendar-picker-indicator,
+  input[type="time"]::-webkit-calendar-picker-indicator {
+    margin-left: 0; margin-right: 0;
+  }
+
+  /* iOS Safari zooms the page in when an input under 16px takes focus, and
+     never zooms back out - leaving the manager stuck on a magnified page
+     mid-form. On a phone correctness beats matching the mockup. Same rule
+     as parentHubHome.js. */
+  @media (max-width: 749px) {
+    input, select, textarea { font-size: 16px; }
+  }
 `;
 
 // Wix TIME columns come back as "19:00:00.000", not "19:00".
