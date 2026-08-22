@@ -1102,8 +1102,23 @@ export async function saveSquad(teamId, fixtureId, payload = {}) {
 // Publishing writes one ParentMessages row per parent of each PICKED child.
 // Nobody else is written to at all - a child who wasn't picked generates no
 // message, so there is no notification and nothing to count yourself out of.
-export async function publishSquad(teamId, fixtureId) {
+export async function publishSquad(teamId, fixtureId, payload) {
     try {
+        // ⚠️ PUBLISH SENDS WHAT IS ON SCREEN, so it SAVES FIRST.
+        //
+        // This read the stored row and nothing else, but the selection only
+        // reaches the server through saveSquad - so a manager who picked a
+        // team and pressed Publish without pressing Save first was told
+        // "Nobody's picked yet" about a pitch full of players.
+        //
+        // Saving here also means the validation runs once, in one place: a
+        // player whose parent declined between picking and publishing is
+        // refused now rather than being messaged.
+        if (payload && payload.shape) {
+            const saved = await saveSquad(teamId, fixtureId, payload);
+            if (!saved.success) return saved;
+        }
+
         const r = await loadFixtureFor(teamId, fixtureId, { playingOnly: true });
         if (!r.ok) return { success: false, error: r.error };
         const f = r.fixture;
@@ -1113,7 +1128,7 @@ export async function publishSquad(teamId, fixtureId) {
         const picked = [...new Set(Object.keys(selected).map(k => selected[k]).concat(subs))].filter(Boolean);
 
         if (picked.length === 0) {
-            return { success: false, error: "Nobody's picked yet." };
+            return { success: false, error: "Nobody's picked yet — put someone on the pitch or the bench first." };
         }
 
         f.squadPublished = true;
