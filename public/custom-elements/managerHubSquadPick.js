@@ -244,7 +244,12 @@ const STYLES = `
   .two > * { min-width: 0; }
   .field input { max-width: 100%; }
 
-  @media (max-width: 430px) {
+  /* ⚠️ 749px, NOT a narrower guess. A native picker next to another field
+     fits in theory and overflows in practice - the intrinsic minimum differs
+     per browser, so any threshold picked to "just fit" is wrong on something.
+     One field per row on every phone. 749px is the project's mobile
+     breakpoint everywhere else. */
+  @media (max-width: 749px) {
     .two { grid-template-columns: 1fr; }
   }
   .field { display: flex; flex-direction: column; gap: 6px; }

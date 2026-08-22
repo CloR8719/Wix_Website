@@ -112,10 +112,18 @@ const STYLES = `
     position: absolute; width: 1px; height: 1px;
     opacity: 0; overflow: hidden; white-space: nowrap;
   }
+  /* ⚠️ inline-block ALONE ISN'T ENOUGH. If an ancestor is ever a flex or grid
+     container, the label becomes an item and gets stretched by the default
+     align-items:stretch - at which point the text sits at the left of a
+     full-width box instead of centred in a snug one. align-self and an
+     explicit text-align make it independent of what its parent turns out to
+     be. Same reason the Home buttons got explicit centring. */
   .filebtn {
-    display: inline-block; margin-top: 9px;
+    display: inline-flex; align-items: center; justify-content: center;
+    align-self: flex-start; width: auto;
+    margin-top: 9px;
     padding: 8px 13px; border-radius: 9px; cursor: pointer;
-    font-size: 12.5px; font-weight: 700;
+    font-size: 12.5px; font-weight: 700; text-align: center;
     border: 1.5px solid var(--line); color: var(--accent); background: transparent;
   }
   .filebtn:hover { border-color: var(--accent); }

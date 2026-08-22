@@ -96,7 +96,12 @@ const STYLES = `
 
   /* Under this a date and a time still will not sit together, whatever the
      min-width says - the native pickers have a floor. */
-  @media (max-width: 430px) {
+  /* ⚠️ 749px, NOT a narrower guess. A native picker next to another field
+     fits in theory and overflows in practice - the intrinsic minimum differs
+     per browser, so any threshold picked to "just fit" is wrong on something.
+     One field per row on every phone. 749px is the project's mobile
+     breakpoint everywhere else. */
+  @media (max-width: 749px) {
     .two { grid-template-columns: 1fr; }
   }
 

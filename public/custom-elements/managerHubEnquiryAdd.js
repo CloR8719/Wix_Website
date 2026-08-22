@@ -84,7 +84,7 @@ const STYLES = `
   .field.bad input, .field.bad select { border-color: var(--critical); background: var(--critical-bg); }
 
   .two { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
-  @media (max-width: 420px) { .two { grid-template-columns: 1fr; } }
+  @media (max-width: 749px) { .two { grid-template-columns: 1fr; } }
 
   .hint { font-size: 11.5px; color: var(--text-faint); line-height: 1.5; }
 
