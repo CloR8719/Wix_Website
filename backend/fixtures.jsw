@@ -1143,12 +1143,18 @@ export async function publishSquad(teamId, fixtureId, payload) {
         const title = [f.homeTeam, f.awayTeam].filter(Boolean).join(" v ") || "Squad for the match";
 
         let reach = 0;
+        let unreachable = 0;
         for (const pid of picked) {
             try {
                 const player = await wixData.get("SignolPlayers", pid, OPTIONS);
                 if (!player) continue;
 
-                const parents = [refId(player.primaryParentId), refId(player.secondaryParentId)].filter(Boolean);
+                // Deduped: a record where both parent fields point at the same
+                // account would otherwise send that person the same message
+                // twice, which reads as a system fault rather than a data one.
+                const parents = [...new Set(
+                    [refId(player.primaryParentId), refId(player.secondaryParentId)].filter(Boolean)
+                )];
                 const first = player.SP_firstName || "Your child";
 
                 // Starters and subs get the IDENTICAL message. The bench is
@@ -1156,6 +1162,8 @@ export async function publishSquad(teamId, fixtureId, payload) {
                 const body = `${first} is in the squad for ${title}.` +
                     (when ? ` ${when.charAt(0).toUpperCase()}${when.slice(1)}.` : "") +
                     (meet ? ` ${meet}` : "");
+
+                if (parents.length === 0) unreachable++;
 
                 for (const parentId of parents) {
                     await wixData.insert("ParentMessages", {
@@ -1177,7 +1185,10 @@ export async function publishSquad(teamId, fixtureId, payload) {
             }
         }
 
-        return { success: true, picked: picked.length, reach };
+        // A picked child with no linked parent account gets no message at all,
+        // and nothing on screen would otherwise say so - the manager would
+        // believe the whole squad had been told.
+        return { success: true, picked: picked.length, reach, unreachable };
     } catch (error) {
         console.error("publishSquad error:", error);
         return { success: false, error: "Couldn't publish that squad." };
@@ -1224,7 +1235,9 @@ export async function nudgeNoReplies(teamId, fixtureId) {
         let reach = 0;
         for (const p of waiting) {
             try {
-                const parents = [refId(p.primaryParentId), refId(p.secondaryParentId)].filter(Boolean);
+                const parents = [...new Set(
+                    [refId(p.primaryParentId), refId(p.secondaryParentId)].filter(Boolean)
+                )];
                 const first = p.SP_firstName || "your child";
                 for (const parentId of parents) {
                     await wixData.insert("ParentMessages", {

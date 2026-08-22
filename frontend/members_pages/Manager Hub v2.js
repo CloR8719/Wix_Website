@@ -1166,9 +1166,19 @@ function wireEverything() {
         el.on("saveSquad", (e) => runSquadAction(e, saveSquad, (res) =>
             "Saved — " + res.placed + " on the pitch, " + res.subs + " on the bench."));
 
-        el.on("publishSquad", (e) => runSquadAction(e, publishSquad, (res) =>
-            "Sent to " + res.reach + (res.reach === 1 ? " parent" : " parents") +
-            " for " + res.picked + (res.picked === 1 ? " player." : " players.")));
+        el.on("publishSquad", (e) => runSquadAction(e, publishSquad, (res) => {
+            const players = res.picked + (res.picked === 1 ? " player" : " players");
+            const parents = res.reach + (res.reach === 1 ? " parent" : " parents");
+            // More parents than players is NORMAL - a child with two linked
+            // accounts gets both told - but the bare numbers read like a fault,
+            // so the reason is spelled out rather than left to be worked out.
+            const why = res.reach > res.picked ? " (some have two)" : "";
+            const gap = res.unreachable
+                ? " " + res.unreachable + (res.unreachable === 1 ? " player has" : " players have") +
+                  " no linked parent account, so nobody was told about them."
+                : "";
+            return "Squad published — " + players + ", " + parents + " messaged" + why + "." + gap;
+        }));
 
         el.on("nudgeReplies", (e) => runSquadAction(e, nudgeNoReplies, (res) =>
             res.asked === 0
