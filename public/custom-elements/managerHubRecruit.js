@@ -628,17 +628,18 @@ class ManagerHubRecruit extends HTMLElement {
             <button type="button" class="check" data-act="toggle" data-key="toWebsite"
                     aria-pressed="${!!f.toWebsite}">
               <span class="box">✓</span>
-              <span><b>Club website</b><span>Publishes as a news post</span></span>
+              <span><b>Club website</b><span>Publishes as a news post with the poster</span></span>
             </button>
             <button type="button" class="check" data-act="toggle" data-key="toFacebook"
                     aria-pressed="${!!f.toFacebook}">
               <span class="box">✓</span>
-              <span><b>Facebook page</b><span>Held for approval before it goes live</span></span>
+              <span><b>Facebook page</b><span>Posts straight to the club page</span></span>
             </button>
           </div>
 
           ${f.toFacebook ? `<div class="warn">
-              Facebook posts are checked before they go out — it's the club's public page.
+              This goes out immediately and can't be unsent from here — you'd have to
+              delete it on Facebook.
             </div>` : ""}
 
           <div class="actions">
