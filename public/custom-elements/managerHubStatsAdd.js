@@ -546,19 +546,6 @@ class ManagerHubStatsAdd extends HTMLElement {
         if (this.consentOk()) return true;
         return this._potm.override && String(this._potm.overrideNote || "").trim().length > 0;
     }
-
-    // What's missing, named, so a manager can go and ask rather than guess.
-    consentGaps() {
-        return this.pickedWinners()
-            .filter(p => p.photoOk !== true || p.socialOk !== true)
-            .map(p => {
-                const missing = [];
-                if (p.photoOk !== true) missing.push("website");
-                if (p.socialOk !== true) missing.push("social media");
-                return p.label + " (" + missing.join(" and ") + ")";
-            });
-    }
-
     paint() {
         const d = this._data;
         const body = this.shadowRoot.getElementById("body");
