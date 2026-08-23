@@ -1552,9 +1552,13 @@ function wireEverything() {
                     } else if (res.notScheduled === "full") {
                         msg += ". Every slot is taken — post this one yourself.";
                     } else if (res.notScheduled === "nophoto") {
-                        // Said plainly. A manager who meant to attach one gets
-                        // told before Monday rather than noticing the absence.
-                        msg += ". No photo, so nothing will post to Facebook.";
+                        // ⚠️ TWO DIFFERENT REASONS, NOT ONE. "No photo" is only
+                        // true when none was attached. If one WAS attached and
+                        // consent stopped it, saying "no photo" contradicts the
+                        // consent line right before it and reads as a bug.
+                        msg += res.photoBlocked
+                            ? " Nothing will post to Facebook without it."
+                            : ". No photo, so nothing will post to Facebook.";
                     } else if (res.photoSaved || res.photoOverridden) {
                         msg += ". Not scheduled to post.";
                     }
