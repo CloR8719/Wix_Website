@@ -29,6 +29,7 @@ import { mediaManager } from 'wix-media-backend';
 import { assertTeamAccess, getManagerContext } from 'backend/managerData.jsw';
 // PO_reason is a RICH_TEXT column - see backend/wixFormat.js.
 import { richToText, textToRich } from 'backend/wixFormat.js';
+import { targetDayFor, slotInstant, slotsPerDay, describeSlot } from 'backend/potmSchedule.js';
 // The same "who is actually in this squad" rule fixtures and messages use.
 import { isAttendingSquadMember } from 'backend/squadRules.js';
 
@@ -316,6 +317,39 @@ async function consentForPhoto(teamId, playerIds, wholeTeam) {
 // counts rows by player name, so a pair stored as a single "Alfie and Sofia"
 // row would count as one award for a player who doesn't exist and none for
 // either child. A whole-squad award is genuinely one thing, so it stays one row.
+// Finds the next free slot for a submission made now, and returns both the
+// instant and the words for the manager.
+//
+// ⚠️ COUNTS WHAT IS ALREADY BOOKED rather than trusting a counter. Two
+// managers submitting within the same second would otherwise be handed the
+// same slot - a query is the only thing that reflects what is genuinely
+// taken. Wix has no transaction to lean on here, so a rare collision is
+// possible; the poster handles it by posting one per run regardless, which
+// makes a duplicate slot a cosmetic problem rather than a double post.
+async function nextFreeSlot(now) {
+    const day = targetDayFor(now);
+    if (!day) return { instant: null, label: "", reason: "late" };
+
+    // The whole day's window, so "how many are booked" is one query.
+    const from = slotInstant(day, 0);
+    const to = slotInstant(day, slotsPerDay() - 1);
+
+    const booked = await wixData.query("Playerofthematch")
+        .ge("PO_scheduledFor", from)
+        .le("PO_scheduledFor", to)
+        .limit(100)
+        .find(OPTIONS);
+
+    const index = booked.items.length;
+    const instant = slotInstant(day, index);
+
+    // Every slot gone. Not scheduled rather than bumped to the next day: the
+    // whole point is that a POTM lands within a couple of days of the match.
+    if (!instant) return { instant: null, label: "", reason: "full" };
+
+    return { instant, label: describeSlot(instant), reason: "" };
+}
+
 export async function addPlayerOfTheMatch(teamId, form = {}) {
     try {
         const access = await assertTeamAccess(teamId);
@@ -406,15 +440,29 @@ export async function addPlayerOfTheMatch(teamId, form = {}) {
         }
 
         if (wholeTeam) {
-            await wixData.insert("Playerofthematch",
-                Object.assign({}, base, { PO_playerName: "The whole squad" }), OPTIONS);
-            return { success: true, saved: 1, photoSaved: !!photoUrl };
+            const squadSlot = await nextFreeSlot(new Date());
+            const squadRow = Object.assign({}, base, { PO_playerName: "The whole squad" });
+            if (squadSlot.instant && photoUrl) squadRow.PO_scheduledFor = squadSlot.instant;
+            await wixData.insert("Playerofthematch", squadRow, OPTIONS);
+            return {
+                success: true, saved: 1, photoSaved: !!photoUrl,
+                scheduledFor: squadSlot.label,
+                notScheduled: squadSlot.reason
+            };
         }
+
+        // ⚠️ ONLY THE FIRST NAME IS SCHEDULED TO POST. A manager picking three
+        // players creates three rows - all of them count for the leaderboard,
+        // but posting three near-identical photos an hour apart would read as
+        // spam on the club's page. Rob's call: first name posts, the rest are
+        // recorded only.
+        const slot = await nextFreeSlot(new Date());
 
         for (let i = 0; i < names.length; i++) {
             const row = Object.assign({}, base, { PO_playerName: names[i] });
             // Only meaningful when the element knew the id for this name.
             if (ids[i]) row.playerReference = ids[i];
+            if (i === 0 && slot.instant && photoUrl) row.PO_scheduledFor = slot.instant;
             await wixData.insert("Playerofthematch", row, OPTIONS);
         }
 
@@ -423,7 +471,11 @@ export async function addPlayerOfTheMatch(teamId, form = {}) {
             saved: names.length,
             photoSaved: !!photoUrl,
             photoOverridden: photoOverridden,
-            photoBlocked: !!form.photoBase64 && !photoUrl
+            photoBlocked: !!form.photoBase64 && !photoUrl,
+            // "Monday at 11am", or empty with a reason - so a manager is never
+            // left assuming it will post when it won't.
+            scheduledFor: slot.label,
+            notScheduled: slot.instant ? "" : slot.reason
         };
     } catch (error) {
         console.error("addPlayerOfTheMatch error:", error);

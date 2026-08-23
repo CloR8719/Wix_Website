@@ -1,0 +1,123 @@
+// =====================================================================
+//  potmPoster.jsw — posts one Player of the Match award, hourly
+// =====================================================================
+//  Called by jobs.config every hour. Finds the oldest award whose slot has
+//  come round and hasn't gone out, posts it, marks it, stops.
+//
+//  ⚠️ ONE PER RUN, DELIBERATELY. The hourly cron IS the spacing - there is
+//  no timer inside a job and no way to pause between posts, so posting
+//  everything due would put five awards on the page in the same minute,
+//  which is the exact thing the schedule exists to prevent.
+//
+//  It also makes the job SELF-HEALING in the same way fixturesRollup is: a
+//  missed run doesn't lose anything, it just means the queue drains an hour
+//  later. Nothing needs replaying by hand.
+//
+//  ⚠️ RUNS EVERY HOUR, NOT JUST MONDAY. Cheap - one indexed query that
+//  returns nothing on a Wednesday - and it means a Tuesday overflow drains
+//  without a second cron entry. The schedule decides when something is due;
+//  this only ever asks "is anything due now".
+//
+//  CONSENT: an award only reaches this file with a photo if consent was on
+//  file OR a manager recorded an override with a written reason. Rob's
+//  decision (2026-08-23) is that the override extends to Facebook - the
+//  managers are adults, they'll be briefed, and the audit trail on the row
+//  names who decided and why. This file does not re-litigate it; it posts
+//  what was approved and records that it did.
+// =====================================================================
+
+import wixData from 'wix-data';
+import { postPhotoToPage } from 'backend/facebook.jsw';
+import { richToText } from 'backend/wixFormat.js';
+
+const OPTIONS = { suppressAuth: true };
+
+// The caption, exactly as Rob specified: three labelled lines.
+//
+// The reason comes out of a RICH_TEXT column, so it arrives wrapped in
+// paragraph markup - richToText strips it. Posting the raw value would put
+// literal <p> tags on the club's Facebook page.
+function caption(row, teamName) {
+    const lines = [];
+    lines.push("Player: " + String(row.PO_playerName || "").trim());
+    if (teamName) lines.push("Team: " + teamName);
+
+    const reason = richToText(row.PO_reason).replace(/\n+/g, " ").trim();
+    if (reason) lines.push("Reason: " + reason);
+
+    return lines.join("\n");
+}
+
+async function teamNameFor(ref) {
+    const id = (typeof ref === "string") ? ref : ((ref && ref._id) || "");
+    if (!id) return "";
+    try {
+        const team = await wixData.get("Teams", id, OPTIONS);
+        return (team && team.T_teamName) || "";
+    } catch (err) {
+        // A missing team costs one line of the caption, not the post.
+        console.error("[potmPoster] couldn't read team", id, err.message);
+        return "";
+    }
+}
+
+export async function postDuePlayerOfTheMatch() {
+    try {
+        const now = new Date();
+
+        // ⚠️ .ne("postedToFb", true) WOULD MISS EVERYTHING. This column was
+        // added to a collection that already had rows, so those rows have it
+        // UNSET rather than false - and Wix Data's .ne() does not reliably
+        // match an unset field. Exactly what silently stopped the fixtures
+        // rollup once. isEmpty() is what catches "never been set".
+        const base = () => wixData.query("Playerofthematch")
+            .le("PO_scheduledFor", now)
+            .isNotEmpty("PO_scheduledFor");
+
+        const due = await base().eq("postedToFb", false)
+            .or(base().isEmpty("postedToFb"))
+            .ascending("PO_scheduledFor")
+            .limit(1)
+            .find(OPTIONS);
+
+        if (due.items.length === 0) return { success: true, posted: 0 };
+
+        const row = due.items[0];
+
+        // No photo means nothing to post. Marked done rather than left to be
+        // retried forever - the award still counts on the leaderboard.
+        if (!row.PO_playerPhoto) {
+            row.postedToFb = true;
+            row.PO_fbSkipped = "No photo on the award";
+            await wixData.update("Playerofthematch", row, OPTIONS);
+            console.log("[potmPoster] skipped " + row._id + " - no photo");
+            return { success: true, posted: 0, skipped: 1 };
+        }
+
+        const teamName = await teamNameFor(row.PO_teamName);
+        const res = await postPhotoToPage(row.PO_playerPhoto, caption(row, teamName));
+
+        if (!res.success) {
+            // ⚠️ NOT marked as posted. A token problem or an outage should be
+            // retried on the next run, not silently swallowed - which is what
+            // marking it here would do. The log is the only place this
+            // surfaces, so it says what and why.
+            console.error("[potmPoster] post FAILED for " + row._id +
+                " (" + (row.PO_playerName || "?") + "):", res.error);
+            return { success: false, posted: 0, error: res.error, tokenProblem: !!res.tokenProblem };
+        }
+
+        row.postedToFb = true;
+        row.PO_fbPostId = res.postId || "";
+        row.PO_fbPostedDate = new Date();
+        await wixData.update("Playerofthematch", row, OPTIONS);
+
+        console.log("[potmPoster] posted " + (row.PO_playerName || "?") +
+            " for " + (teamName || "?") + ", post id " + res.postId);
+
+        return { success: true, posted: 1, player: row.PO_playerName || "" };
+    } catch (error) {
+        console.error("[potmPoster] job threw:", error.message, error);
+        return { success: false, posted: 0, error: "The job failed." };
+    }
+}
