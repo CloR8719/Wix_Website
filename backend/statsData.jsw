@@ -234,7 +234,17 @@ export async function getStatsOptions(teamId) {
             // Ordered by ClubDictionary's own "order" column, highest first, so
             // the current season is whatever the club puts at the top. The
             // recruitment poster reads the same list the same way.
-            seasons: seasons.items.map(s => ({ value: s.label || s.value || "", label: s.label || s.value || "" }))
+            // ⚠️ THE id IS THE POINT. Both stats collections have a season
+            // REFERENCE as well as seasonLabel, and the reference has been
+            // empty on every row this system has ever written - so any page
+            // filtering on it sees nothing. The label alone can't populate a
+            // reference; the ClubDictionary row id can.
+            seasons: seasons.items
+                .map(s => ({
+                    value: s.label || s.value || "",
+                    label: s.label || s.value || "",
+                    id: s._id
+                }))
                 .filter(s => s.value)
         };
     } catch (error) {
@@ -350,6 +360,35 @@ async function nextFreeSlot(now) {
     return { instant, label: describeSlot(instant), reason: "" };
 }
 
+// The ClubDictionary row id for a season label.
+//
+// ⚠️ LOOKED UP, NOT TAKEN FROM THE FORM. The browser could send any id, and a
+// reference pointing at the wrong dictionary row is worse than an empty one -
+// it would silently file an award under the wrong season and nothing would
+// ever flag it. The label is what the manager actually chose; the id is
+// derived from it here.
+//
+// Returns "" when there is no match, which leaves the reference empty rather
+// than writing something wrong. An unset reference is recoverable; a wrong
+// one looks correct forever.
+async function seasonRefFor(label) {
+    const wanted = String(label || "").trim();
+    if (!wanted) return "";
+    try {
+        const res = await wixData.query("ClubDictionary")
+            .eq("category", "season")
+            .limit(50)
+            .find(OPTIONS);
+        const hit = res.items.find(function (s) {
+            return String(s.label || s.value || "").trim() === wanted;
+        });
+        return hit ? hit._id : "";
+    } catch (err) {
+        console.error("[statsData] couldn't resolve the season reference for", wanted, err.message);
+        return "";
+    }
+}
+
 export async function addPlayerOfTheMatch(teamId, form = {}) {
     try {
         const access = await assertTeamAccess(teamId);
@@ -418,11 +457,16 @@ export async function addPlayerOfTheMatch(teamId, form = {}) {
             }
         }
 
+        const seasonRef = await seasonRefFor(form.season);
+
         const base = {
             PO_teamName: teamId,
             seasonLabel: String(form.season),
             PO_reason: textToRich(form.reason)
         };
+        // Only set when it resolved - writing "" to a REFERENCE column is not
+        // the same as leaving it alone, and Wix treats the two differently.
+        if (seasonRef) base.season = seasonRef;
         if (photoUrl) base.PO_playerPhoto = photoUrl;
 
         // The audit trail. Written on every row of the award, so it travels
@@ -495,6 +539,10 @@ export async function addPlayerStats(teamId, season, rows = []) {
         const usable = (rows || []).filter(r => String(r.playerName || "").trim());
         if (usable.length === 0) return { success: false, error: "Add at least one player." };
 
+        // Resolved ONCE for the whole sheet rather than per row - fifteen
+        // players would otherwise mean fifteen identical dictionary queries.
+        const statsSeasonRef = await seasonRefFor(season);
+
         let saved = 0;
         const failed = [];
         for (const r of usable) {
@@ -503,6 +551,10 @@ export async function addPlayerStats(teamId, season, rows = []) {
                     PS_teamName: teamId,
                     PS_playerName: String(r.playerName).trim(),
                     seasonLabel: String(season),
+                    // PlayerStats carries the same unused season reference as
+                    // Playerofthematch. Filling one and not the other would
+                    // make the two disagree the first time anyone filtered.
+                    ...(statsSeasonRef ? { season: statsSeasonRef } : {}),
                     goals: num(r.goals),
                     assists: num(r.assists),
                     tackles: num(r.tackles),
