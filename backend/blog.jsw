@@ -16,7 +16,17 @@ import { auth } from '@wix/essentials';
 // PUBLIC: create a live blog post
 // Returns { blogPostId, url } — does NOT touch the CMS (caller owns the row).
 // ------------------------------------------
-export async function createBlogPost({ title, bodyHtml, featuredImage, memberId }) {
+// Puts the picture at the TOP of the body when the caller asks for it.
+// Opt-in rather than automatic: the news form's images are landscape and
+// already read fine as a cover, so repeating them would just be clutter.
+function withBodyImage(richContent, featuredImage, bodyImage) {
+    if (!bodyImage) return richContent;
+    const node = makeImage(featuredImage);
+    if (!node) return richContent;
+    return { nodes: [node].concat(richContent.nodes || []) };
+}
+
+export async function createBlogPost({ title, bodyHtml, featuredImage, memberId, bodyImage }) {
     if (!memberId) {
         throw new Error("createBlogPost: memberId is required (the author).");
     }
@@ -33,7 +43,7 @@ export async function createBlogPost({ title, bodyHtml, featuredImage, memberId 
         title: (title && title.trim()) || "Club News",
         memberId,
         commentingEnabled: true,
-        richContent: htmlToRicos(bodyHtml || ""),
+        richContent: withBodyImage(htmlToRicos(bodyHtml || ""), featuredImage, bodyImage),
         ...(cover ? {
             heroImage: cover,
             media: { wixMedia: { image: cover }, displayed: true, custom: true }
@@ -113,6 +123,39 @@ function makeText(text, decorations) {
         id: "",
         nodes: [],
         textData: { text: text || "", decorations: decorations || [] }
+    };
+}
+
+// A full-width image INSIDE the post body.
+//
+// ⚠️ THE COVER IMAGE IS NOT ENOUGH FOR A PORTRAIT PICTURE. Wix crops the
+// cover to its own aspect ratio, so a 1080x1578 recruitment poster loses
+// its top and bottom and the reader never sees the whole thing. Putting it
+// in the body as well means the cover can crop however it likes and the
+// poster is still readable in full further down.
+//
+// htmlToRicos only understands block text tags, so an <img> in the HTML is
+// silently dropped - this has to be a real Ricos node.
+function makeImage(featuredImage) {
+    const ref = coverImageRef(featuredImage);
+    if (!ref) return null;
+
+    // Ricos wants the bare media id, not the wix:image:// URI.
+    const m = ref.match(/^wix:image:\/\/v1\/([^/]+)/i);
+    const id = m ? m[1] : "";
+    if (!id) return null;
+
+    return {
+        type: "IMAGE",
+        id: nid(),
+        nodes: [],
+        imageData: {
+            containerData: {
+                width: { size: "CONTENT" },
+                alignment: "CENTER"
+            },
+            image: { src: { id } }
+        }
     };
 }
 

@@ -136,16 +136,32 @@ const CLUB_URL = "www.signolathleticjfc.co.uk";
 //
 // Kept plain and factual: the poster carries the design, and a caption
 // stuffed with hashtags reads like spam on a club page.
-function facebookCaption(payload, contactName) {
-    const who = String(contactName || "").trim();
+// ⚠️ THE TEAM NAME USUALLY ALREADY CONTAINS THE AGE GROUP. Joining them
+// blindly produced "UNDER 12s U12 Eagles", because ageGroup is "UNDER 12s"
+// and teamName is "U12 Eagles" - both true, together nonsense.
+//
+// So: if the team name already carries the age group's number, it is the
+// more specific of the two and stands alone. Only when it doesn't - a team
+// called just "Eagles" - are they joined, because then each says something
+// the other doesn't.
+function squadLabel(payload) {
     const age = String(payload.ageGroup || "").trim();
     const team = String(payload.teamName || "").trim();
+    if (!team) return age;
+    if (!age) return team;
+
+    const num = (age.match(/[0-9]+/) || [])[0];
+    if (num && team.indexOf(num) !== -1) return team;
+
+    return age + " " + team;
+}
+
+function facebookCaption(payload, contactName) {
+    const who = String(contactName || "").trim();
     const pos = String(payload.position || "").trim();
     const extra = String(payload.extraLine || "").trim();
 
-    // "U15s Wolverines" reads better than either alone, but neither is
-    // guaranteed to be filled in.
-    const squad = [age, team].filter(Boolean).join(" ");
+    const squad = squadLabel(payload);
 
     const lines = ["We are recruiting!"];
 
@@ -166,8 +182,7 @@ function facebookCaption(payload, contactName) {
 // The blog post's headline. Short and factual - it appears in the news feed
 // alongside match reports, so it has to read as a club item, not a shout.
 function blogTitle(payload) {
-    const squad = [String(payload.ageGroup || "").trim(),
-                   String(payload.teamName || "").trim()].filter(Boolean).join(" ");
+    const squad = squadLabel(payload);
     return squad ? (squad + " are looking for players") : "We are looking for players";
 }
 
@@ -316,6 +331,10 @@ export async function publishRecruitmentPost(teamId, payload = {}) {
                     // the URI form for the cover image. An https one gives
                     // "Media image not found".
                     featuredImage: posterUri,
+                    // The poster is PORTRAIT, so the cover thumbnail crops it.
+                    // Repeating it in the body is the only way a reader sees
+                    // the whole thing.
+                    bodyImage: true,
                     memberId: ctx.memberId
                 });
                 blogPostId = (blog && blog.blogPostId) || "";
