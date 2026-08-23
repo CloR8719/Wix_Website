@@ -606,9 +606,6 @@ class ManagerHubRecruit extends HTMLElement {
         const seasons = Array.isArray(d.seasons) ? d.seasons : [];
 
         body.innerHTML = `
-          ${d.sent ? `<div class="ok">${esc(d.sent)}</div>` : ""}
-          ${d.error ? `<div class="err">${esc(d.error)}</div>` : ""}
-
           <div class="preview">
             <canvas id="poster" width="${CANVAS_W}" height="${CANVAS_H}" tabindex="0"></canvas>
           </div>
@@ -707,6 +704,14 @@ class ManagerHubRecruit extends HTMLElement {
               This goes out immediately and can't be unsent from here — you'd have to
               delete it on Facebook.
             </div>` : ""}
+
+          <!-- ⚠️ THE RESULT SITS NEXT TO THE BUTTON, not at the top of the
+               element. It used to render above the poster canvas - which is up
+               to 620px tall, with the whole form below it - so pressing Publish
+               put the answer several hundred pixels off-screen and the whole
+               thing read as a dead button. Same fault as the fixtures nudge. -->
+          ${d.sent ? `<div class="ok">${esc(d.sent)}</div>` : ""}
+          ${d.error ? `<div class="err">${esc(d.error)}</div>` : ""}
 
           <div class="actions">
             <button type="button" class="btn primary" data-act="publish"
