@@ -1539,6 +1539,21 @@ function wireEverything() {
                     // is the same as no override at all.
                     else if (res.photoOverridden) msg += " — photo published on your say-so, and recorded";
                     else if (res.photoSaved) msg += " with photo";
+
+                    // ⚠️ WHEN IT POSTS, OR WHY IT WON'T. Without this a manager
+                    // submits on a Wednesday, sees "Award saved", and reasonably
+                    // assumes it is going out - when nothing is scheduled at all.
+                    // The backend already worked this out; it was just never
+                    // reaching the screen.
+                    if (res.scheduledFor) {
+                        msg += ". Posting to Facebook " + res.scheduledFor + ".";
+                    } else if (res.notScheduled === "late") {
+                        msg += ". Too late to be scheduled — post this one yourself.";
+                    } else if (res.notScheduled === "full") {
+                        msg += ". Every slot is taken — post this one yourself.";
+                    } else if (res.photoSaved || res.photoOverridden) {
+                        msg += ". Not scheduled to post.";
+                    }
                 }
 
                 statsAddModel = Object.assign({}, statsAddModel, {
