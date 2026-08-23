@@ -29,8 +29,30 @@
 import wixData from 'wix-data';
 import { postPhotoToPage } from 'backend/facebook.jsw';
 import { richToText } from 'backend/wixFormat.js';
+import { SLOT_MINUTES, WINDOW_END_HOUR, ukParts } from 'backend/potmSchedule.js';
 
 const OPTIONS = { suppressAuth: true };
+
+// How many goes an award gets before it is left alone. Two: one bad hour is
+// worth retrying, a second failure means something is wrong that retrying
+// will not fix - a dead token, a deleted photo - and Rob would rather post
+// it by hand than have it rattle around the queue.
+const MAX_ATTEMPTS = 2;
+
+// A whole-squad award is stored under this exact phrase, so it must not be
+// shortened to its first word.
+const WHOLE_SQUAD = "The whole squad";
+
+// ⚠️ FIRST NAME ONLY. PO_playerName holds the full name because the
+// leaderboard needs to tell two Jacks apart, but a public post naming a
+// child in full is a different thing entirely - and Rob asked for first
+// names regardless.
+function firstNameOf(full) {
+    const name = String(full || "").trim();
+    if (!name) return "";
+    if (name === WHOLE_SQUAD) return name;
+    return name.split(/\s+/)[0];
+}
 
 // The caption, exactly as Rob specified: three labelled lines.
 //
@@ -39,7 +61,7 @@ const OPTIONS = { suppressAuth: true };
 // literal <p> tags on the club's Facebook page.
 function caption(row, teamName) {
     const lines = [];
-    lines.push("Player: " + String(row.PO_playerName || "").trim());
+    lines.push("Player: " + firstNameOf(row.PO_playerName));
     if (teamName) lines.push("Team: " + teamName);
 
     const reason = richToText(row.PO_reason).replace(/\n+/g, " ").trim();
@@ -58,6 +80,32 @@ async function teamNameFor(ref) {
         // A missing team costs one line of the caption, not the post.
         console.error("[potmPoster] couldn't read team", id, err.message);
         return "";
+    }
+}
+
+// One slot after whatever is currently scheduled last. Null once that would
+// fall outside the posting window - there is no point moving something to
+// 9pm, and rolling it to tomorrow would post a POTM further from the match
+// than the schedule is willing to go.
+async function slotAtBackOfQueue() {
+    try {
+        const base = () => wixData.query("Playerofthematch").isNotEmpty("PO_scheduledFor");
+        const last = await base().eq("postedToFb", false)
+            .or(base().isEmpty("postedToFb"))
+            .descending("PO_scheduledFor")
+            .limit(1)
+            .find(OPTIONS);
+
+        if (last.items.length === 0) return null;
+
+        const latest = new Date(last.items[0].PO_scheduledFor);
+        const next = new Date(latest.getTime() + SLOT_MINUTES * 60000);
+
+        // Judged in UK time, like every other boundary in this feature.
+        return ukParts(next).hour > WINDOW_END_HOUR ? null : next;
+    } catch (err) {
+        console.error("[potmPoster] couldn't work out a retry slot:", err.message);
+        return null;
     }
 }
 
@@ -98,13 +146,41 @@ export async function postDuePlayerOfTheMatch() {
         const res = await postPhotoToPage(row.PO_playerPhoto, caption(row, teamName));
 
         if (!res.success) {
-            // ⚠️ NOT marked as posted. A token problem or an outage should be
-            // retried on the next run, not silently swallowed - which is what
-            // marking it here would do. The log is the only place this
-            // surfaces, so it says what and why.
-            console.error("[potmPoster] post FAILED for " + row._id +
-                " (" + (row.PO_playerName || "?") + "):", res.error);
-            return { success: false, posted: 0, error: res.error, tokenProblem: !!res.tokenProblem };
+            // ⚠️ A FAILURE MUST NOT BLOCK THE QUEUE. The job posts the OLDEST
+            // due award, so simply leaving a failed one in place would mean it
+            // is picked again next hour, and again - one dead photo would stop
+            // every award behind it, indefinitely.
+            //
+            // So it goes to the BACK: rescheduled after everything currently
+            // waiting, which both frees the queue and avoids two posts landing
+            // in the same hour. After MAX_ATTEMPTS it is left alone entirely -
+            // Rob posts those by hand rather than have them circle forever.
+            const attempts = (Number(row.PO_fbAttempts) || 0) + 1;
+            row.PO_fbAttempts = attempts;
+
+            const retryAt = (attempts < MAX_ATTEMPTS) ? await slotAtBackOfQueue() : null;
+
+            if (retryAt) {
+                row.PO_scheduledFor = retryAt;
+                console.error("[potmPoster] post failed for " + row._id + " (" +
+                    (row.PO_playerName || "?") + "), moved to " + retryAt.toISOString() +
+                    " - attempt " + attempts + " of " + MAX_ATTEMPTS + ":", res.error);
+            } else {
+                // Marked done so it stops being picked. Not a lie: it will
+                // never be posted by this job, and PO_fbSkipped says why.
+                row.postedToFb = true;
+                row.PO_fbSkipped = "Gave up after " + attempts +
+                    (attempts === 1 ? " attempt: " : " attempts: ") + (res.error || "unknown");
+                console.error("[potmPoster] GIVING UP on " + row._id + " (" +
+                    (row.PO_playerName || "?") + ") - post this one by hand:", res.error);
+            }
+
+            await wixData.update("Playerofthematch", row, OPTIONS);
+            return {
+                success: false, posted: 0, error: res.error,
+                tokenProblem: !!res.tokenProblem,
+                rescheduled: !!retryAt, gaveUp: !retryAt
+            };
         }
 
         row.postedToFb = true;
