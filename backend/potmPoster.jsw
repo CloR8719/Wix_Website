@@ -43,6 +43,13 @@ const MAX_ATTEMPTS = 2;
 // shortened to its first word.
 const WHOLE_SQUAD = "The whole squad";
 
+// The words of the post, gathered here so they can be reworded without
+// reading the function that assembles them.
+const POST_HEADER = "Player of the match!";
+const LABEL_PLAYER = "Player";
+const LABEL_TEAM = "Team";
+const LABEL_REASON = "Our coach said";
+
 // ⚠️ FIRST NAME ONLY. PO_playerName holds the full name because the
 // leaderboard needs to tell two Jacks apart, but a public post naming a
 // child in full is a different thing entirely - and Rob asked for first
@@ -60,14 +67,18 @@ function firstNameOf(full) {
 // paragraph markup - richToText strips it. Posting the raw value would put
 // literal <p> tags on the club's Facebook page.
 function caption(row, teamName) {
-    const lines = [];
-    lines.push("Player: " + firstNameOf(row.PO_playerName));
-    if (teamName) lines.push("Team: " + teamName);
+    const details = [];
+    details.push(LABEL_PLAYER + ": " + firstNameOf(row.PO_playerName));
+    if (teamName) details.push(LABEL_TEAM + ": " + teamName);
 
+    // Collapsed to one line: a reason typed as two paragraphs would otherwise
+    // break up the labelled block and read as though something was missing.
     const reason = richToText(row.PO_reason).replace(/\n+/g, " ").trim();
-    if (reason) lines.push("Reason: " + reason);
+    if (reason) details.push(LABEL_REASON + ": " + reason);
 
-    return lines.join("\n");
+    // The header stands alone, then the details together - the blank line is
+    // what makes it read as a heading rather than a fourth field.
+    return POST_HEADER + "\n\n" + details.join("\n");
 }
 
 async function teamNameFor(ref) {
