@@ -762,7 +762,14 @@ class ManagerHubRecruit extends HTMLElement {
 
         canvas.addEventListener("pointerup", (e) => {
             this._drag = null;
-            try { canvas.releasePointerCapture(e.pointerId); } catch (err) {}
+            try {
+                canvas.releasePointerCapture(e.pointerId);
+            } catch (err) {
+                // Deliberately ignored. releasePointerCapture throws if this
+                // pointer was never captured - a stray pointerup, or one that
+                // started outside the canvas. There is nothing to release and
+                // nothing to tell anyone, and the drag is already cleared above.
+            }
         });
 
         this.shadowRoot.addEventListener("keydown", (e) => {
