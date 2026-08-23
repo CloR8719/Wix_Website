@@ -45,7 +45,7 @@ const WHOLE_SQUAD = "The whole squad";
 
 // The words of the post, gathered here so they can be reworded without
 // reading the function that assembles them.
-const POST_HEADER = "Player of the match!";
+const POST_HEADER = "⚽ Player of the match ⚽";
 const LABEL_PLAYER = "Player";
 const LABEL_TEAM = "Team";
 const LABEL_REASON = "Our coach said";
