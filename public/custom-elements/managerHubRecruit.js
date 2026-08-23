@@ -73,8 +73,20 @@ const CANVAS_H = 1578;
 // matches the 940x705 Wix recommends for the side-by-side and editorial
 // blog layouts. The portrait original still goes in the post body, so the
 // reader sees it full size either way.
+// Blog cover. 4:3 at 940x705 - Rob's blog is set to the EDITORIAL layout
+// with crop at 4:3, so this is the exact shape it wants. A different layout
+// wants a different number: one column is 21:9, magazine is 1:1.
 const COVER_W = 940;
 const COVER_H = 705;
+
+// ⚠️ FACEBOOK CROPS THE FEED PREVIEW TOO, at a different ratio again. A
+// single image shows at up to 4:5 (0.8); this poster is 0.684, taller than
+// that, so the feed would cut the club name off the top and the phone
+// number off the bottom - and the preview is all most people ever see.
+//
+// 1080x1350 is 4:5 at Facebook's recommended width.
+const FB_W = 1080;
+const FB_H = 1350;
 
 const YELLOW = "#FFC629";
 const WHITE  = "#F2F4F6";
@@ -504,34 +516,38 @@ class ManagerHubRecruit extends HTMLElement {
         if (LAYOUT_MODE) this.wireLayout();
     }
 
-    // Draws the finished poster, letterboxed, onto an offscreen 4:3 canvas.
-    // Offscreen because it exists only to be exported - putting it in the DOM
+    // Draws the finished poster, letterboxed, onto an offscreen canvas of a
+    // given shape. ONE function for both destinations - the blog and Facebook
+    // crop at different ratios, and two copies of this would drift the moment
+    // either changed.
+    //
+    // Offscreen because it exists only to be exported; putting it in the DOM
     // would mean styling and hiding something nobody ever looks at.
     //
-    // Returns "" rather than throwing: a missing cover costs a nicely cropped
-    // thumbnail, and losing the whole post over that would be a poor trade.
-    coverBase64(poster) {
+    // Returns "" rather than throwing: a missing variant costs a well-shaped
+    // preview, and losing the whole post over that would be a poor trade.
+    letterbox(poster, width, height, label) {
         try {
             const c = document.createElement("canvas");
-            c.width = COVER_W;
-            c.height = COVER_H;
+            c.width = width;
+            c.height = height;
             const ctx = c.getContext("2d");
 
             // INK, not white - a white surround on a dark poster reads as a
             // rendering fault rather than a deliberate border.
             ctx.fillStyle = INK;
-            ctx.fillRect(0, 0, COVER_W, COVER_H);
+            ctx.fillRect(0, 0, width, height);
 
             // Contain, never cover: cover would crop, which is the whole
             // problem being solved here.
-            const scale = Math.min(COVER_W / poster.width, COVER_H / poster.height);
+            const scale = Math.min(width / poster.width, height / poster.height);
             const w = poster.width * scale;
             const h = poster.height * scale;
-            ctx.drawImage(poster, (COVER_W - w) / 2, (COVER_H - h) / 2, w, h);
+            ctx.drawImage(poster, (width - w) / 2, (height - h) / 2, w, h);
 
             return (c.toDataURL("image/jpeg", 0.9).split(",")[1]) || "";
         } catch (err) {
-            console.error("manager-hub-recruit: couldn't build the cover image", err);
+            console.error("manager-hub-recruit: couldn't build the " + label + " image", err);
             return "";
         }
     }
@@ -554,11 +570,13 @@ class ManagerHubRecruit extends HTMLElement {
             return;
         }
 
-        const coverBase64 = this.coverBase64(canvas);
+        const coverBase64 = this.letterbox(canvas, COVER_W, COVER_H, "blog cover");
+        const fbBase64 = this.letterbox(canvas, FB_W, FB_H, "Facebook");
 
         this.dispatchEvent(new CustomEvent("publishPoster", {
             detail: {
                 coverBase64,
+                fbBase64,
                 positions: this._form.positions.slice(),
                 position: this._form.positions.join(", "),
                 season: this._form.season,
