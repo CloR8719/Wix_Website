@@ -1551,6 +1551,10 @@ function wireEverything() {
                         msg += ". Too late to be scheduled — post this one yourself.";
                     } else if (res.notScheduled === "full") {
                         msg += ". Every slot is taken — post this one yourself.";
+                    } else if (res.notScheduled === "nophoto") {
+                        // Said plainly. A manager who meant to attach one gets
+                        // told before Monday rather than noticing the absence.
+                        msg += ". No photo, so nothing will post to Facebook.";
                     } else if (res.photoSaved || res.photoOverridden) {
                         msg += ". Not scheduled to post.";
                     }
