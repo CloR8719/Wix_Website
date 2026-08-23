@@ -232,6 +232,42 @@ function buildMessage(toWebsite, toFacebook, status, fb, blogPostId) {
     return parts.length ? parts.join(" ") : "Poster saved.";
 }
 
+// Uploads one letterboxed variant of the poster.
+//
+// ⚠️ AT MODULE SCOPE, NOT INSIDE publishRecruitmentPost. It started life
+// declared inside that function's try block, which trips ESLint's
+// no-inner-declarations - function declarations in a block hoist differently
+// between strict and sloppy mode, so the rule refuses them anywhere but a
+// function body root. Taking safeTeam and stamp as part of the filename
+// rather than closing over them is what makes moving it out possible.
+//
+// NON-FATAL by design: a failed variant costs a well-shaped preview and the
+// caller falls back to the portrait poster, which crops but beats losing a
+// finished post over a thumbnail.
+//
+// jpeg, not png, because that is what the element exports for these -
+// declaring png would upload a file whose contents disagree with its stated
+// type, which some consumers reject.
+async function uploadVariant(b64, fileName, label) {
+    if (!b64) return "";
+    try {
+        const up = await mediaManager.upload(
+            FOLDER,
+            Buffer.from(b64, "base64"),
+            fileName,
+            {
+                mediaOptions: { mimeType: "image/jpeg", mediaType: "image" },
+                metadataOptions: { isPrivate: false, isVisitorUpload: false }
+            }
+        );
+        return up.fileUrl || "";
+    } catch (err) {
+        console.error("[recruitment] " + label + " image upload failed, " +
+            "falling back to the portrait poster:", err && err.message);
+        return "";
+    }
+}
+
 export async function publishRecruitmentPost(teamId, payload = {}) {
     try {
         const access = await assertTeamAccess(teamId);
@@ -289,28 +325,12 @@ export async function publishRecruitmentPost(teamId, payload = {}) {
         // jpeg, not png, because that is what the element exports for these -
         // declaring png would upload a file whose contents disagree with its
         // stated type, which some consumers reject.
-        async function uploadVariant(b64, suffix, label) {
-            if (!b64) return "";
-            try {
-                const up = await mediaManager.upload(
-                    FOLDER,
-                    Buffer.from(b64, "base64"),
-                    `recruit-${safeTeam}-${stamp}-${suffix}.jpg`,
-                    {
-                        mediaOptions: { mimeType: "image/jpeg", mediaType: "image" },
-                        metadataOptions: { isPrivate: false, isVisitorUpload: false }
-                    }
-                );
-                return up.fileUrl || "";
-            } catch (err) {
-                console.error("[recruitment] " + label + " image upload failed, " +
-                    "falling back to the portrait poster:", err && err.message);
-                return "";
-            }
-        }
-
-        const coverUri = await uploadVariant(String(payload.coverBase64 || ""), "cover", "blog cover");
-        const fbUri = await uploadVariant(String(payload.fbBase64 || ""), "fb", "Facebook");
+        const coverUri = await uploadVariant(
+            String(payload.coverBase64 || ""),
+            `recruit-${safeTeam}-${stamp}-cover.jpg`, "blog cover");
+        const fbUri = await uploadVariant(
+            String(payload.fbBase64 || ""),
+            `recruit-${safeTeam}-${stamp}-fb.jpg`, "Facebook");
 
         const posterUri = uploaded.fileUrl || uploaded.fileName || "";
         const posterUrl = (uploaded.fileUrl && uploaded.fileUrl.startsWith("http"))
