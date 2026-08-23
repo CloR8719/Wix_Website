@@ -19,14 +19,19 @@ import { auth } from '@wix/essentials';
 // Puts the picture at the TOP of the body when the caller asks for it.
 // Opt-in rather than automatic: the news form's images are landscape and
 // already read fine as a cover, so repeating them would just be clutter.
-function withBodyImage(richContent, featuredImage, bodyImage) {
+// bodyImageOverride exists because the cover and the body image are not
+// always the same picture. A recruitment post has a letterboxed 4:3 cover so
+// the thumbnail isn't cropped, but the body should carry the PORTRAIT
+// original - the letterboxed one there would just be the same poster with
+// wasted space either side.
+function withBodyImage(richContent, featuredImage, bodyImage, bodyImageOverride) {
     if (!bodyImage) return richContent;
-    const node = makeImage(featuredImage);
+    const node = makeImage(bodyImageOverride || featuredImage);
     if (!node) return richContent;
     return { nodes: [node].concat(richContent.nodes || []) };
 }
 
-export async function createBlogPost({ title, bodyHtml, featuredImage, memberId, bodyImage }) {
+export async function createBlogPost({ title, bodyHtml, featuredImage, memberId, bodyImage, bodyImageOverride }) {
     if (!memberId) {
         throw new Error("createBlogPost: memberId is required (the author).");
     }
@@ -43,7 +48,7 @@ export async function createBlogPost({ title, bodyHtml, featuredImage, memberId,
         title: (title && title.trim()) || "Club News",
         memberId,
         commentingEnabled: true,
-        richContent: withBodyImage(htmlToRicos(bodyHtml || ""), featuredImage, bodyImage),
+        richContent: withBodyImage(htmlToRicos(bodyHtml || ""), featuredImage, bodyImage, bodyImageOverride),
         ...(cover ? {
             heroImage: cover,
             media: { wixMedia: { image: cover }, displayed: true, custom: true }

@@ -274,6 +274,32 @@ export async function publishRecruitmentPost(teamId, payload = {}) {
         // an external service can actually load. Both are kept - Wix APIs
         // (like the Blog cover image) want the URI form, everything else
         // wants the URL.
+        // The 4:3 letterboxed version for the blog cover. Uploaded separately
+        // and NON-FATALLY: a failure here costs a nicely-shaped thumbnail, and
+        // losing the whole post over that would be a poor trade. The mimeType
+        // is jpeg because that is what the element exports for this one -
+        // declaring png would upload a file whose contents disagree with its
+        // type, which some consumers reject.
+        let coverUri = "";
+        const coverBase64 = String(payload.coverBase64 || "");
+        if (coverBase64) {
+            try {
+                const coverUp = await mediaManager.upload(
+                    FOLDER,
+                    Buffer.from(coverBase64, "base64"),
+                    `recruit-${safeTeam}-${stamp}-cover.jpg`,
+                    {
+                        mediaOptions: { mimeType: "image/jpeg", mediaType: "image" },
+                        metadataOptions: { isPrivate: false, isVisitorUpload: false }
+                    }
+                );
+                coverUri = coverUp.fileUrl || "";
+            } catch (coverErr) {
+                console.error("[recruitment] cover image upload failed, " +
+                    "falling back to the portrait poster:", coverErr && coverErr.message);
+            }
+        }
+
         const posterUri = uploaded.fileUrl || uploaded.fileName || "";
         const posterUrl = (uploaded.fileUrl && uploaded.fileUrl.startsWith("http"))
             ? uploaded.fileUrl
@@ -330,11 +356,14 @@ export async function publishRecruitmentPost(teamId, payload = {}) {
                     // The wix:image:// URI, NOT the https URL - blog.jsw wants
                     // the URI form for the cover image. An https one gives
                     // "Media image not found".
-                    featuredImage: posterUri,
-                    // The poster is PORTRAIT, so the cover thumbnail crops it.
-                    // Repeating it in the body is the only way a reader sees
-                    // the whole thing.
+                    // The 4:3 letterboxed version when the element managed to
+                    // build one; the portrait poster otherwise, which crops but
+                    // is better than no cover at all.
+                    featuredImage: coverUri || posterUri,
+                    // The body image is always the PORTRAIT original, whatever the
+                    // cover ended up being - that is the one worth reading.
                     bodyImage: true,
+                    bodyImageOverride: posterUri,
                     memberId: ctx.memberId
                 });
                 blogPostId = (blog && blog.blogPostId) || "";
