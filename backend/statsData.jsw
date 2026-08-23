@@ -29,7 +29,7 @@ import { mediaManager } from 'wix-media-backend';
 import { assertTeamAccess, getManagerContext } from 'backend/managerData.jsw';
 // PO_reason is a RICH_TEXT column - see backend/wixFormat.js.
 import { richToText, textToRich } from 'backend/wixFormat.js';
-import { targetDayFor, slotInstant, slotsPerDay, describeSlot } from 'backend/potmSchedule.js';
+import { allSlots, sameSlot, describeSlot } from 'backend/potmSchedule.js';
 // The same "who is actually in this squad" rule fixtures and messages use.
 import { isAttendingSquadMember } from 'backend/squadRules.js';
 
@@ -327,37 +327,54 @@ async function consentForPhoto(teamId, playerIds, wholeTeam) {
 // counts rows by player name, so a pair stored as a single "Alfie and Sofia"
 // row would count as one award for a player who doesn't exist and none for
 // either child. A whole-squad award is genuinely one thing, so it stays one row.
-// Finds the next free slot for a submission made now, and returns both the
-// instant and the words for the manager.
+// Finds the next genuinely free slot for a submission made now, and returns
+// both the instant and the words for the manager.
 //
-// ⚠️ COUNTS WHAT IS ALREADY BOOKED rather than trusting a counter. Two
-// managers submitting within the same second would otherwise be handed the
-// same slot - a query is the only thing that reflects what is genuinely
-// taken. Wix has no transaction to lean on here, so a rare collision is
-// possible; the poster handles it by posting one per run regardless, which
-// makes a duplicate slot a cosmetic problem rather than a double post.
+// ⚠️ FINDS A GAP, IT DOES NOT COUNT. The first version used
+// booked.items.length as the slot index, which is only correct while nothing
+// is ever deleted or moved. Delete one award and every later submission is
+// handed a slot that is already taken; a failed post rescheduled to the back
+// breaks it the same way. So this reads what is actually occupied and takes
+// the first hour nobody has.
+//
+// It also skips slots that have already PASSED, which is what lets the
+// Monday-noon rule be the only day rule: a submission at 10am simply cannot
+// be given the 8am slot, so it lands on 11am by itself.
+//
+// Walks Monday then Tuesday - candidateDays returns them in order - so
+// overflow onto Tuesday needs no special case here either.
 async function nextFreeSlot(now) {
-    const day = targetDayFor(now);
-    if (!day) return { instant: null, label: "", reason: "late" };
+    const slots = allSlots(now);
+    if (slots.length === 0) return { instant: null, label: "", reason: "late" };
 
-    // The whole day's window, so "how many are booked" is one query.
-    const from = slotInstant(day, 0);
-    const to = slotInstant(day, slotsPerDay() - 1);
+    // One query for both days. Unposted only: a slot whose award has already
+    // gone out is free again as far as scheduling is concerned, though in
+    // practice that hour is in the past anyway.
+    const from = slots[0];
+    const to = slots[slots.length - 1];
 
-    const booked = await wixData.query("Playerofthematch")
+    const base = () => wixData.query("Playerofthematch")
         .ge("PO_scheduledFor", from)
-        .le("PO_scheduledFor", to)
-        .limit(100)
+        .le("PO_scheduledFor", to);
+
+    const booked = await base().eq("postedToFb", false)
+        .or(base().isEmpty("postedToFb"))
+        .limit(200)
         .find(OPTIONS);
 
-    const index = booked.items.length;
-    const instant = slotInstant(day, index);
+    const taken = booked.items
+        .map(r => r.PO_scheduledFor)
+        .filter(Boolean);
 
-    // Every slot gone. Not scheduled rather than bumped to the next day: the
+    for (const slot of slots) {
+        if (slot.getTime() <= now.getTime()) continue;          // already gone
+        if (taken.some(t => sameSlot(t, slot))) continue;       // somebody has it
+        return { instant: slot, label: describeSlot(slot), reason: "" };
+    }
+
+    // Both days full. Not scheduled rather than pushed to Wednesday: the
     // whole point is that a POTM lands within a couple of days of the match.
-    if (!instant) return { instant: null, label: "", reason: "full" };
-
-    return { instant, label: describeSlot(instant), reason: "" };
+    return { instant: null, label: "", reason: "full" };
 }
 
 // The ClubDictionary row id for a season label.

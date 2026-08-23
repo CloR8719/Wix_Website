@@ -2,49 +2,45 @@
 //  potmSchedule.js — when a Player of the Match post goes out
 // =====================================================================
 //  Managers submit POTM over the weekend. The posts go out spread across
-//  Monday rather than all at once, so the club's Facebook page isn't a
-//  wall of twelve identical posts at 10am.
+//  Monday, overflowing into Tuesday, rather than all at once - so the
+//  club's Facebook page isn't a wall of twenty identical posts at 8am.
 //
 //  THE RULES (Rob, 2026-08-23):
-//    Saturday or Sunday          -> posts Monday
-//    Monday before 09:00         -> posts Monday
-//    Monday 09:00 - 12:00        -> posts Tuesday
-//    anything later              -> NOT SCHEDULED. Tough.
+//    Saturday or Sunday   -> the next free slot, Monday then Tuesday
+//    Monday before 12:00  -> the next free slot that hasn't already passed
+//    anything later       -> NOT SCHEDULED. Tough.
 //
-//  So the window opens Saturday and shuts at Monday noon. A submission on
-//  Wednesday gets nothing rather than rolling to the following Monday - a
-//  POTM for last weekend's match appearing eight days later reads as a
-//  mistake, and a manager told "scheduled" would reasonably stop chasing it.
+//  22 teams, realistically 15-16 submitting. 12 slots a day across two
+//  days is 24, which carries that with room to spare.
 //
-//  Window is 10:00 to 19:00 UK time.
+//  ⚠️ THE 12:00 STOP IS THE ONLY DAY RULE LEFT. An earlier version also
+//  switched days at 09:00, which is now unnecessary: a submission at 10am
+//  simply cannot be given the 8am or 9am slots because they are in the
+//  past, so it lands on 11am by itself. One rule instead of two, and the
+//  awkward case - submitting during the posting window - falls out
+//  correctly rather than needing its own branch.
 //
-//  ⚠️ SLOT_MINUTES IS 60, NOT THE 45 ROB ASKED FOR, and that is a platform
-//  limit rather than a preference. Wix scheduled jobs run at most once an
-//  hour, so a slot at 10:45 cannot fire until 11:00 - the spacing would
-//  silently drift and the stored time would be a lie. 60 gives ten honest
-//  slots (10:00-19:00), which is what the cron can actually honour.
-//  If Wix ever allows a sub-hourly job, change this to 45 and the cron to
-//  match; nothing else needs touching.
+//  ⚠️ SLOT_MINUTES IS 60, NOT THE 45 ROB FIRST ASKED FOR, and that is a
+//  platform limit rather than a preference. Wix scheduled jobs run at most
+//  once an hour, so a slot at 10:45 cannot fire until 11:00 - the spacing
+//  would drift and the stored time would be a lie.
 //
 //  ⚠️ EVERYTHING HERE IS UK LOCAL TIME, CONVERTED PROPERLY.
 //  Wix's backend runs in UTC and the club is on BST for half the year, so
-//  "Monday 10am" computed naively is 11am in summer. Every boundary below
-//  goes through ukLocalToUtc(), which asks Intl what Europe/London's offset
+//  "Monday 8am" computed naively is 9am in summer. Every boundary goes
+//  through ukLocalToUtc(), which asks Intl what Europe/London's offset
 //  actually is on that date rather than assuming one.
 //
 //  A plain .js file, not .jsw: pure date arithmetic with no business being
 //  callable from a browser.
 // =====================================================================
 
-export const WINDOW_START_HOUR = 10;   // first slot, UK local
+export const WINDOW_START_HOUR = 8;    // first slot, UK local
 export const WINDOW_END_HOUR = 19;     // last slot, UK local (inclusive)
-export const CUTOFF_HOUR = 9;          // submissions after this move to the next day
 export const SLOT_MINUTES = 60;        // see the note above before changing
+export const LAST_CHANCE_HOUR = 12;    // Monday hard stop
 
 const MONDAY = 1;
-
-// Submissions between the cutoff and this move to Tuesday; after it, nothing.
-export const LAST_CHANCE_HOUR = 12;
 
 // What Europe/London's offset from UTC is at a given instant, in ms.
 // Asked rather than assumed - the answer changes twice a year, and on the
@@ -57,7 +53,6 @@ function ukOffsetMs(instant) {
     });
     const p = {};
     dtf.formatToParts(instant).forEach(function (x) { p[x.type] = x.value; });
-    // Hour 24 appears at midnight in some ICU versions.
     const hour = p.hour === "24" ? 0 : Number(p.hour);
     const asIfUtc = Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day),
                              hour, Number(p.minute), Number(p.second));
@@ -92,38 +87,36 @@ export function ukParts(instant) {
     };
 }
 
-// How many slots a day holds. 10:00-19:00 at 60 minutes is ten.
+// 08:00 to 19:00 at 60 minutes is twelve.
 export function slotsPerDay() {
     const span = (WINDOW_END_HOUR - WINDOW_START_HOUR) * 60;
     return Math.floor(span / SLOT_MINUTES) + 1;
 }
 
-// Which day a submission made NOW belongs to, as a UK calendar date - or
-// null when it has missed the boat entirely.
+// Which days a submission made NOW may be placed on, soonest first.
 //
-// Returns the date parts rather than an instant, because the slot time is
-// applied afterwards and doing both at once made the DST handling harder to
-// follow than it needed to be.
-export function targetDayFor(now) {
+// Returns an array so the caller can walk Monday and then Tuesday looking
+// for room, rather than the schedule having to guess in advance which day
+// will have space.
+export function candidateDays(now) {
     const t = ukParts(now);
 
     // The weekend, when matches are played and POTM is decided.
     if (t.weekday === 6 || t.weekday === 0) {
-        return addDaysUk(t, daysUntil(t.weekday, MONDAY));
+        const mon = addDaysUk(t, daysUntil(t.weekday, MONDAY));
+        return [mon, addDaysUk(mon, 1)];
     }
 
-    if (t.weekday === MONDAY) {
-        // Before the cutoff - goes out today.
-        if (t.hour < CUTOFF_HOUR) return { year: t.year, month: t.month, day: t.day };
-        // Late, but not too late - tomorrow.
-        if (t.hour < LAST_CHANCE_HOUR) return addDaysUk(t, 1);
-        return null;
+    if (t.weekday === MONDAY && t.hour < LAST_CHANCE_HOUR) {
+        const mon = { year: t.year, month: t.month, day: t.day };
+        return [mon, addDaysUk(mon, 1)];
     }
 
-    // ⚠️ Tuesday to Friday get NOTHING, deliberately. The window is a weekly
-    // cycle that opens Saturday and shuts Monday noon; rolling a late entry to
-    // the following Monday would post a POTM eight days after the match.
-    return null;
+    // ⚠️ Past Monday noon, and Tuesday to Friday, get NOTHING - deliberately.
+    // The window is a weekly cycle that opens Saturday and shuts Monday noon;
+    // rolling a late entry onward would post a POTM further and further from
+    // the match it was for.
+    return [];
 }
 
 function daysUntil(fromWeekday, toWeekday) {
@@ -143,14 +136,40 @@ function addDaysUk(parts, days) {
     };
 }
 
-// The nth slot on a given UK date, as a UTC instant. Returns null once the
-// day is full - the caller decides what that means.
+// The nth slot on a given UK date, as a UTC instant. Null once the day is
+// full - the caller moves to the next day.
 export function slotInstant(dayParts, index) {
     if (index < 0 || index >= slotsPerDay()) return null;
     const minutesIn = index * SLOT_MINUTES;
     const hour = WINDOW_START_HOUR + Math.floor(minutesIn / 60);
     const minute = minutesIn % 60;
     return ukLocalToUtc(dayParts.year, dayParts.month, dayParts.day, hour, minute);
+}
+
+// Every slot across the candidate days, soonest first. The caller filters
+// out the ones already taken.
+export function allSlots(now) {
+    const out = [];
+    candidateDays(now).forEach(function (day) {
+        for (let i = 0; i < slotsPerDay(); i++) {
+            const inst = slotInstant(day, i);
+            if (inst) out.push(inst);
+        }
+    });
+    return out;
+}
+
+// ⚠️ MATCHED BY THE HOUR, NOT THE EXACT MILLISECOND. A row whose time was
+// edited by hand in the CMS - which is how the whole thing gets tested -
+// will not land precisely on a computed slot, and an exact comparison would
+// happily book a second award into the same hour as it. The job posts one
+// per run regardless, so a double booking only ever shows up as a post
+// arriving an hour late, which is exactly the sort of thing nobody
+// investigates.
+export function sameSlot(a, b) {
+    if (!a || !b) return false;
+    return Math.floor(new Date(a).getTime() / 3600000) ===
+           Math.floor(new Date(b).getTime() / 3600000);
 }
 
 // "Monday at 11am" - what a manager is told when they submit.
