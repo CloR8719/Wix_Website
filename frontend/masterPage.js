@@ -8,20 +8,23 @@ import { linkMemberToStaff } from 'backend/staffData';
 // controls VISIBILITY: shown only when the logged-in member's email is in this
 // list, so nobody else ever sees it. Add/remove emails here as needed (e.g. your
 // own, for testing) - no other code changes needed.
-// ⚠️ PLACEHOLDERS - THE LIVE SITE HAS THE REAL ONES.
-// Pasting this file as-is HIDES the secretary button from everyone, including
-// whoever pasted it. Copy the real addresses out of the live copy first, or
-// the shortcut simply disappears and looks like a permissions fault.
+// Who sees the secretary shortcut in the header. Lowercase, because the check
+// lowercases the member's login email before comparing - a capital letter here
+// silently never matches.
 //
-// Lowercase, because the check lowercases the member's email before comparing.
+// ⚠️ A TYPO HERE FAILS SILENTLY. The button simply doesn't appear, which looks
+// exactly like a permissions problem and sends people looking in the wrong
+// place. "jdhsignol@sky.comm" was supplied with a doubled M and has been
+// corrected to .com - if that address really is unusual, change it back.
 //
-// This is CONVENIENCE, NOT SECURITY: hiding the button does not protect the
+// This is CONVENIENCE, NOT SECURITY. Hiding the button does not protect the
 // dashboard, and anyone with the URL can still open it. The real gate is
 // getManagerContext/assertTeamAccess on the backend, which reads the staff
-// record rather than a list of addresses.
+// record rather than a list of addresses. Adding someone here does NOT grant
+// them anything; it only saves them typing a URL.
 const SECRETARY_EMAILS = [
-    "rob@example.com",
-    "secretary@example.com"
+    "robclowes1987@icloud.com",
+    "jdhsignol@sky.com"
 ];
 
 async function updateSecretaryButton() {
