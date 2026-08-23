@@ -327,6 +327,11 @@ async function consentForPhoto(teamId, playerIds, wholeTeam) {
 // counts rows by player name, so a pair stored as a single "Alfie and Sofia"
 // row would count as one award for a player who doesn't exist and none for
 // either child. A whole-squad award is genuinely one thing, so it stays one row.
+// The exact phrase a whole-squad award is stored under. Shared with
+// potmPoster.jsw, which must not shorten it to its first word - two
+// spellings of this would mean the post said "The".
+const WHOLE_SQUAD = "The whole squad";
+
 // Finds the next genuinely free slot for a submission made now, and returns
 // both the instant and the words for the manager.
 //
@@ -500,30 +505,53 @@ export async function addPlayerOfTheMatch(teamId, form = {}) {
                 (access.ctx.name || "?") + " team=" + teamId + " reason=" + overrideNote);
         }
 
+        // ⚠️ NO PHOTO MEANS NO SLOT IS EVEN ASKED FOR.
+        //
+        // This used to allocate a slot regardless and then only WRITE it when
+        // there was a photo - so an award without one reported "Posting Monday
+        // at 8am", stored nothing, and left the slot free. The next submission
+        // was then handed the very same time, because as far as the CMS was
+        // concerned nobody had taken it.
+        //
+        // Nothing can be posted without a photo, so there is nothing to
+        // schedule and nothing to claim.
+        const slot = photoUrl
+            ? await nextFreeSlot(new Date())
+            : { instant: null, label: "", reason: "nophoto" };
+
         if (wholeTeam) {
-            const squadSlot = await nextFreeSlot(new Date());
-            const squadRow = Object.assign({}, base, { PO_playerName: "The whole squad" });
-            if (squadSlot.instant && photoUrl) squadRow.PO_scheduledFor = squadSlot.instant;
+            const squadRow = Object.assign({}, base, { PO_playerName: WHOLE_SQUAD });
+            if (slot.instant) squadRow.PO_scheduledFor = slot.instant;
             await wixData.insert("Playerofthematch", squadRow, OPTIONS);
             return {
                 success: true, saved: 1, photoSaved: !!photoUrl,
-                scheduledFor: squadSlot.label,
-                notScheduled: squadSlot.reason
+                photoOverridden: photoOverridden,
+                photoBlocked: !!form.photoBase64 && !photoUrl,
+                scheduledFor: slot.label,
+                notScheduled: slot.instant ? "" : slot.reason
             };
         }
 
-        // ⚠️ ONLY THE FIRST NAME IS SCHEDULED TO POST. A manager picking three
-        // players creates three rows - all of them count for the leaderboard,
-        // but posting three near-identical photos an hour apart would read as
-        // spam on the club's page. Rob's call: first name posts, the rest are
-        // recorded only.
-        const slot = await nextFreeSlot(new Date());
-
+        // ⚠️ ONE ROW PER PLAYER, ONE POST FOR ALL OF THEM.
+        //
+        // Every row counts on the leaderboard - a shared award is a POTM for
+        // each of them, and collapsing that into a single row with a
+        // multi-reference would mean rewriting how the leaderboard counts.
+        //
+        // But only the FIRST row carries the schedule, and it also carries the
+        // full list of names so the post can say "Jonah and Kai" rather than
+        // naming one of them and quietly ignoring the other. Three
+        // near-identical photos an hour apart would read as spam; one post
+        // that credits everybody does not.
         for (let i = 0; i < names.length; i++) {
             const row = Object.assign({}, base, { PO_playerName: names[i] });
             // Only meaningful when the element knew the id for this name.
             if (ids[i]) row.playerReference = ids[i];
-            if (i === 0 && slot.instant && photoUrl) row.PO_scheduledFor = slot.instant;
+
+            if (i === 0 && slot.instant) {
+                row.PO_scheduledFor = slot.instant;
+                if (names.length > 1) row.PO_postNames = names.join(", ");
+            }
             await wixData.insert("Playerofthematch", row, OPTIONS);
         }
 

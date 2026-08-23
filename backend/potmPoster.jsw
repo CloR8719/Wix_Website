@@ -47,6 +47,7 @@ const WHOLE_SQUAD = "The whole squad";
 // reading the function that assembles them.
 const POST_HEADER = "⚽ Player of the match ⚽";
 const LABEL_PLAYER = "Player";
+const LABEL_PLAYERS = "Players";
 const LABEL_TEAM = "Team";
 const LABEL_REASON = "Our coach said";
 
@@ -66,9 +67,30 @@ function firstNameOf(full) {
 // The reason comes out of a RICH_TEXT column, so it arrives wrapped in
 // paragraph markup - richToText strips it. Posting the raw value would put
 // literal <p> tags on the club's Facebook page.
+// Everyone the award is for, as first names.
+//
+// PO_postNames is set on the scheduled row when several players shared it -
+// the other rows exist for the leaderboard and never post. Falling back to
+// PO_playerName covers the ordinary single-winner case and anything created
+// before that field existed.
+function playersLine(row) {
+    const raw = String(row.PO_postNames || row.PO_playerName || "");
+    const names = raw.split(",").map(function (n) { return firstNameOf(n.trim()); })
+                     .filter(Boolean);
+
+    if (names.length === 0) return "";
+    if (names.length === 1) return names[0];
+    if (names.length === 2) return names[0] + " and " + names[1];
+    return names.slice(0, -1).join(", ") + " and " + names[names.length - 1];
+}
+
 function caption(row, teamName) {
+    const who = playersLine(row);
+    const shared = who.indexOf(" and ") !== -1;
+
     const details = [];
-    details.push(LABEL_PLAYER + ": " + firstNameOf(row.PO_playerName));
+    // Plural when it was shared - "Player: Jonah and Kai" reads like a mistake.
+    details.push((shared ? LABEL_PLAYERS : LABEL_PLAYER) + ": " + who);
     if (teamName) details.push(LABEL_TEAM + ": " + teamName);
 
     // Collapsed to one line: a reason typed as two paragraphs would otherwise
