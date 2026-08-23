@@ -1,14 +1,5 @@
 import { authentication, currentMember } from 'wix-members-frontend';
 import { linkMemberToStaff } from 'backend/staffData';
-// Safe to import here even though public-file state is NOT shared between
-// masterPage and page code (see the progress-bar note further down). That
-// gotcha is about *mutable* values - this module only exports a constant list
-// and a pure function, so both contexts read identical values.
-import { isBetaTester } from 'public/betaAccess.js';
-
-// Tracks what's already been applied to the header so the poll below only touches
-// $w elements when something actually changed, and so a stale/older save result
-// (from a previous click) can't be mistaken for the current one.
 
 // Secretary dashboard shortcut (2026-08) - #btnSecretaryDashboard is a header
 // button that lives on every page (built once here in masterPage, not per-page).
@@ -17,7 +8,17 @@ import { isBetaTester } from 'public/betaAccess.js';
 // controls VISIBILITY: shown only when the logged-in member's email is in this
 // list, so nobody else ever sees it. Add/remove emails here as needed (e.g. your
 // own, for testing) - no other code changes needed.
-// ⚠️ SETUP: replace with real emails, all lowercase.
+// ⚠️ PLACEHOLDERS - THE LIVE SITE HAS THE REAL ONES.
+// Pasting this file as-is HIDES the secretary button from everyone, including
+// whoever pasted it. Copy the real addresses out of the live copy first, or
+// the shortcut simply disappears and looks like a permissions fault.
+//
+// Lowercase, because the check lowercases the member's email before comparing.
+//
+// This is CONVENIENCE, NOT SECURITY: hiding the button does not protect the
+// dashboard, and anyone with the URL can still open it. The real gate is
+// getManagerContext/assertTeamAccess on the backend, which reads the staff
+// record rather than a list of addresses.
 const SECRETARY_EMAILS = [
     "rob@example.com",
     "secretary@example.com"
@@ -40,40 +41,10 @@ async function updateSecretaryButton() {
     }
 }
 
-// Beta shortcut (2026-08-16) - #btnParentHubV2 is a header button, same build
-// as #btnSecretaryDashboard above: LINK set in the Editor, code here controls
-// only VISIBILITY. It exists because Parent Hub v2 is hidden from the site
-// menu while it's being built, so there's otherwise no way to reach it on a
-// real phone - and a custom element can't be tested any other way (they don't
-// render in the Editor or in Preview).
-//
-// Gated on public/betaAccess.js, the SAME list that hides the stateMore2 tab
-// inside the hub. One list, so there's no way to end up able to reach the page
-// but not see the thing you came to test.
-//
-// Delete this function, its two call sites, and the button once v2 goes live
-// and joins the normal menu.
-async function updateBetaHubButton() {
-    if (!$w("#btnParentHubV2").id) return;
-    try {
-        if (!authentication.loggedIn()) { $w("#btnParentHubV2").collapse(); return; }
-        const member = await currentMember.getMember();
-        if (isBetaTester(member)) {
-            $w("#btnParentHubV2").expand();
-        } else {
-            $w("#btnParentHubV2").collapse();
-        }
-    } catch (err) {
-        console.error("Beta hub button visibility check failed:", err);
-        $w("#btnParentHubV2").collapse();
-    }
-}
-
 $w.onReady(async function () {
     // Both collapse first and expand only on a passing check - so a logged-out
     // visitor, or a thrown error below, leaves them hidden. Fail closed.
     if ($w("#btnSecretaryDashboard").id) $w("#btnSecretaryDashboard").collapse();
-    if ($w("#btnParentHubV2").id) $w("#btnParentHubV2").collapse();
 
     // 1. Initial check when page loads
     const isLoggedIn = authentication.loggedIn();
@@ -81,7 +52,6 @@ $w.onReady(async function () {
     if (isLoggedIn) {
         runSecureSync();
         updateSecretaryButton();
-        updateBetaHubButton();
     }
 
     // 2. Listener for the exact moment they log in
@@ -89,7 +59,6 @@ $w.onReady(async function () {
         console.log("Login event detected.");
         runSecureSync();
         updateSecretaryButton();
-        updateBetaHubButton();
     });
 
 });
